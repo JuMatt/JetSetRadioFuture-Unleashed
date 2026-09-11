@@ -12,6 +12,7 @@
 #if defined(_WIN32)
 #define COBJMACROS
 #include <windows.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 

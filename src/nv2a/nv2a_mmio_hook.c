@@ -6,6 +6,7 @@
  */
 
 #include "nv2a_mmio_hook.h"
+#include <string.h>
 #include "nv2a_state.h"
 #include <stdio.h>
 

@@ -16,6 +16,9 @@
 #include "win32_compat.h"
 
 #include <pthread.h>
+#include <sys/time.h>
+#include <signal.h>
+#include <sched.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -29,7 +32,10 @@
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
 #include <sys/stat.h>
+#include <sys/proc.h>
+#include <fcntl.h>
 #include <mach/mach.h>
+#include <mach/mach_host.h>
 #else
 #include <sys/sysinfo.h>
 #endif
@@ -75,6 +81,32 @@ VOID InitializeCriticalSection(LPCRITICAL_SECTION cs)
     pthread_mutexattr_t attr;
     pthread_mutexattr_init(&attr);
     pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    /*
+     * RECOMP_LOCK_FAIR=1: hand the lock to whoever has been waiting longest.
+     *
+     * Darwin's default mutex policy lets a thread that releases a lock and
+     * immediately asks for it again jump the queue. That is usually the right
+     * trade -- it saves a context switch -- and it is the wrong one for the
+     * guest scheduler lock, which is released and re-taken every time slice
+     * by whichever thread is running. Under that pattern a barging mutex can
+     * leave a waiting thread waiting more or less indefinitely, and a
+     * sampling profile found the game's main thread doing exactly that for
+     * every one of twelve seconds' worth of samples while other guest threads
+     * ran.
+     *
+     * Behind a switch and off by default until it is measured, because
+     * fairness is not free: every handover becomes a real context switch.
+     */
+    { static int fair = -1;
+      if (fair < 0) fair = getenv("RECOMP_LOCK_FAIR") ? 1 : 0;
+#if defined(__APPLE__) && defined(PTHREAD_MUTEX_POLICY_FAIRSHARE_NP)
+      if (fair)
+          pthread_mutexattr_setpolicy_np(&attr,
+                                         PTHREAD_MUTEX_POLICY_FAIRSHARE_NP);
+#else
+      (void)fair;
+#endif
+    }
     pthread_mutex_init(m, &attr);
     pthread_mutexattr_destroy(&attr);
     cs->LockSemaphore = m;
@@ -204,8 +236,17 @@ typedef struct w32_object {
     DWORD           tid;
     int             exited;
     DWORD           exit_code;
-    int             suspend_count;
+    volatile int    suspend_count;
     pthread_cond_t  gate;
+    /* Parked in SuspendThread right now, and since when: a resume waits for
+     * the parked thread to leave, and the stall report needs to say which
+     * thread has been parked and for how long. */
+    volatile int    parked;
+    long long       park_since;
+    pthread_cond_t  left_gate;
+    /* A wake-up that arrived before the park it was meant for. Separate from
+     * suspend_count on purpose -- see ResumeThread. */
+    volatile int    pending_resume;
     LPTHREAD_START_ROUTINE start;
     LPVOID          start_param;
     int             priority;
@@ -243,8 +284,98 @@ DWORD GetCurrentThreadId(void)
 }
 
 DWORD GetCurrentProcessId(void) { return (DWORD)getpid(); }
-HANDLE GetCurrentThread(void)   { return t_self_obj ? (HANDLE)t_self_obj : PSEUDO_CURRENT_THREAD; }
+static w32_object *obj_alloc(w32_kind kind);
+/* Threads not created through CreateThread (the host's main thread) get a
+ * thread object on first use, so the self-suspend hand-off and priority
+ * tracking work from them too. */
+static w32_object *self_obj(void)
+{
+    if (!t_self_obj) {
+        w32_object *o = obj_alloc(K_THREAD);
+        o->thread   = pthread_self();
+        o->refcount = 1;
+        t_self_obj  = o;
+    }
+    return t_self_obj;
+}
+HANDLE GetCurrentThread(void)   { return (HANDLE)self_obj(); }
 HANDLE GetCurrentProcess(void)  { return PSEUDO_CURRENT_PROCESS; }
+
+/* Every object this layer has allocated.
+ *
+ * A HANDLE crossing back from the guest is a 32-bit value the guest kept, and
+ * the bridge passes an unrecognised one through as though it were a pointer.
+ * Dereferencing it then faults inside this file on an address that belongs to
+ * the guest, not the host -- SuspendThread reading ->kind off 0x00050790,
+ * which is a guest RAM address, is what that looks like. The title is not
+ * doing anything wrong: it has a value it believes is a thread, and the
+ * translation lost it somewhere upstream.
+ *
+ * Upstream is worth fixing on its own, but no amount of fixing it makes
+ * dereferencing an arbitrary integer safe. So every object is registered when
+ * it is created, and a handle is only followed if it is in the set. A stale
+ * or bogus handle then returns an error the way Win32 would, instead of
+ * taking the process down.
+ *
+ * A flat open-addressed set: allocation is rare, lookup is on every handle
+ * use, and the whole thing has to work while several guest threads are inside
+ * it at once. */
+#define W32_OBJ_SET 8192
+static void *g_obj_set[W32_OBJ_SET];
+static pthread_mutex_t g_obj_set_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static size_t obj_hash(const void *p)
+{
+    uintptr_t v = (uintptr_t)p >> 4;
+    v ^= v >> 17; v *= 0x9E3779B1u; v ^= v >> 13;
+    return (size_t)(v & (W32_OBJ_SET - 1));
+}
+
+static void obj_set_add(void *p)
+{
+    size_t i, h = obj_hash(p);
+    pthread_mutex_lock(&g_obj_set_lock);
+    for (i = 0; i < W32_OBJ_SET; i++) {
+        size_t k = (h + i) & (W32_OBJ_SET - 1);
+        if (!g_obj_set[k] || g_obj_set[k] == p) { g_obj_set[k] = p; break; }
+    }
+    pthread_mutex_unlock(&g_obj_set_lock);
+}
+
+/* Is this handle one of ours at all? NULL if not. */
+static w32_object *obj_any(HANDLE h)
+{
+    size_t i, hh;
+    w32_object *found = NULL;
+    if (!h || h == INVALID_HANDLE_VALUE) return NULL;
+    hh = obj_hash((void *)h);
+    pthread_mutex_lock(&g_obj_set_lock);
+    for (i = 0; i < W32_OBJ_SET; i++) {
+        size_t k = (hh + i) & (W32_OBJ_SET - 1);
+        if (!g_obj_set[k]) break;
+        if (g_obj_set[k] == (void *)h) { found = (w32_object *)h; break; }
+    }
+    pthread_mutex_unlock(&g_obj_set_lock);
+    return found;
+}
+
+/* Is this handle one of ours, and of the kind expected? NULL if not. */
+static w32_object *obj_check(HANDLE h, w32_kind kind)
+{
+    size_t i, hh;
+    w32_object *found = NULL;
+    if (!h || h == INVALID_HANDLE_VALUE) return NULL;
+    hh = obj_hash((void *)h);
+    pthread_mutex_lock(&g_obj_set_lock);
+    for (i = 0; i < W32_OBJ_SET; i++) {
+        size_t k = (hh + i) & (W32_OBJ_SET - 1);
+        if (!g_obj_set[k]) break;
+        if (g_obj_set[k] == (void *)h) { found = (w32_object *)h; break; }
+    }
+    pthread_mutex_unlock(&g_obj_set_lock);
+    if (found && found->kind != kind) return NULL;
+    return found;
+}
 
 static w32_object *obj_alloc(w32_kind kind)
 {
@@ -254,6 +385,8 @@ static w32_object *obj_alloc(w32_kind kind)
     pthread_mutex_init(&o->lock, NULL);
     pthread_cond_init(&o->cond, NULL);
     pthread_cond_init(&o->gate, NULL);
+    pthread_cond_init(&o->left_gate, NULL);
+    obj_set_add(o);
     return o;
 }
 
@@ -284,13 +417,13 @@ HANDLE w32_open_handle(int fd, const char *host_path)
 
 int w32_handle_fd(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_any(h);
     return (o && o->kind == K_FILE) ? o->fd : -1;
 }
 
 const char *w32_handle_path(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_any(h);
     return (o && o->kind == K_FILE) ? o->file_path : NULL;
 }
 
@@ -299,7 +432,7 @@ BOOL CloseHandle(HANDLE h)
     if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS ||
         h == INVALID_HANDLE_VALUE)
         return TRUE;
-    obj_release((w32_object *)h);
+    { w32_object *o = obj_any(h); if (o) obj_release(o); }
     return TRUE;
 }
 
@@ -397,7 +530,8 @@ DWORD WaitForSingleObject(HANDLE h, DWORD ms)
 {
     if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS)
         return WAIT_OBJECT_0;
-    return wait_single((w32_object *)h, ms);
+    { w32_object *o = obj_any(h);
+      return o ? wait_single(o, ms) : WAIT_FAILED; }
 }
 
 DWORD WaitForSingleObjectEx(HANDLE h, DWORD ms, BOOL alertable)
@@ -469,7 +603,7 @@ HANDLE CreateEventW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, BOOL initialStat
 
 BOOL SetEvent(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_any(h);
     if (!o || o->kind != K_EVENT) return FALSE;
     pthread_mutex_lock(&o->lock);
     o->signaled = 1;
@@ -480,7 +614,7 @@ BOOL SetEvent(HANDLE h)
 
 BOOL ResetEvent(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_any(h);
     if (!o || o->kind != K_EVENT) return FALSE;
     pthread_mutex_lock(&o->lock);
     o->signaled = 0;
@@ -490,7 +624,7 @@ BOOL ResetEvent(HANDLE h)
 
 BOOL PulseEvent(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_any(h);
     if (!o || o->kind != K_EVENT) return FALSE;
     pthread_mutex_lock(&o->lock);
     o->signaled = 1;
@@ -520,7 +654,7 @@ HANDLE CreateSemaphoreW(LPSECURITY_ATTRIBUTES sa, LONG initial, LONG maximum, LP
 
 BOOL ReleaseSemaphore(HANDLE h, LONG releaseCount, PLONG previousCount)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_any(h);
     if (!o || o->kind != K_SEM) return FALSE;
     pthread_mutex_lock(&o->lock);
     if (previousCount) *previousCount = (LONG)o->sem_count;
@@ -550,7 +684,7 @@ HANDLE CreateMutexW(LPSECURITY_ATTRIBUTES sa, BOOL initialOwner, LPCWSTR name)
 
 BOOL ReleaseMutex(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_any(h);
     if (!o || o->kind != K_MUTEX) {
         SetLastError(ERROR_INVALID_HANDLE);
         return FALSE;
@@ -647,7 +781,7 @@ VOID ExitThread(DWORD exitCode)
 
 BOOL GetExitCodeThread(HANDLE h, LPDWORD exitCode)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_any(h);
     if (!o || o->kind != K_THREAD || !exitCode) return FALSE;
     pthread_mutex_lock(&o->lock);
     *exitCode = o->exited ? o->exit_code : STILL_ACTIVE;
@@ -655,34 +789,399 @@ BOOL GetExitCodeThread(HANDLE h, LPDWORD exitCode)
     return TRUE;
 }
 
+/* A resume that arrives before its suspend is remembered, not discarded.
+ *
+ * Win32 clamps the suspend count at zero, so a ResumeThread with nothing to
+ * resume does nothing. That is faithful, and on this host it is a hang: the
+ * title parks a worker with SuspendThread(GetCurrentThread()) and wakes it
+ * with ResumeThread from another thread, and the console's single CPU makes
+ * the order reliable in a way that a real multi-core host does not. When the
+ * resume lands first it is swallowed, the worker then suspends into a wake-up
+ * that already happened, and everything waiting on it waits forever -- which
+ * is what a thread sitting inside NtSuspendThread while another spins on a
+ * critical section ninety-eight thousand times looks like.
+ *
+ * So the count may go to -1: one pending resume, which the next suspend
+ * consumes instead of blocking. Bounded at one because this is a hand-off,
+ * not a counter -- letting it run further negative would turn a title that
+ * genuinely resumes more often than it suspends into one that can never
+ * suspend at all.
+ */
+/* ── the suspend/resume hand-off, recorded ────────────────────────────────
+ *
+ * A title that parks a worker with SuspendThread(GetCurrentThread()) and wakes
+ * it with ResumeThread from another thread is relying on the console's single
+ * CPU to order the two. On a real multi-core host the order is not guaranteed,
+ * and when it goes wrong the symptom is a permanent stall with one thread
+ * inside NtSuspendThread and another spinning on a critical section several
+ * hundred thousand times.
+ *
+ * The bank of one pending resume (see ResumeThread) fixes the simple race.
+ * When it is not enough, the only way to say what happened is to have kept the
+ * last few hand-offs -- so keep them, and print them when a park has clearly
+ * gone unanswered. Sixty-four entries is a few hundred bytes and covers far
+ * more history than the stall needs.
+ */
+#define W32_HANDOFF_LOG 64
+typedef struct {
+    long long ms;
+    DWORD     by;          /* thread that made the call */
+    DWORD     target;      /* thread it acted on */
+    char      op;          /* S park, s suspend-other, R resume, r banked */
+    int       count;       /* suspend count afterwards */
+} w32_handoff;
+static w32_handoff     g_handoff[W32_HANDOFF_LOG];
+static int             g_handoff_n;
+static pthread_mutex_t g_handoff_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void handoff_note(char op, DWORD target, int count)
+{
+    pthread_mutex_lock(&g_handoff_lock);
+    g_handoff[g_handoff_n % W32_HANDOFF_LOG].ms     = (long long)GetTickCount64();
+    g_handoff[g_handoff_n % W32_HANDOFF_LOG].by     = GetCurrentThreadId();
+    g_handoff[g_handoff_n % W32_HANDOFF_LOG].target = target;
+    g_handoff[g_handoff_n % W32_HANDOFF_LOG].op     = op;
+    g_handoff[g_handoff_n % W32_HANDOFF_LOG].count  = count;
+    g_handoff_n++;
+    pthread_mutex_unlock(&g_handoff_lock);
+}
+
+/* Printed by the stall report. Oldest first, newest last. */
+void w32_handoff_report(void)
+{
+    int i, first, n;
+    long long now = (long long)GetTickCount64();
+    pthread_mutex_lock(&g_handoff_lock);
+    n = g_handoff_n < W32_HANDOFF_LOG ? g_handoff_n : W32_HANDOFF_LOG;
+    first = g_handoff_n < W32_HANDOFF_LOG ? 0 : g_handoff_n % W32_HANDOFF_LOG;
+    fprintf(stderr, "  [HANDOFF] last %d suspend/resume calls "
+                    "(S=parked self, s=suspended another, R=resumed, "
+                    "r=resume banked for a suspend that had not happened):\n", n);
+    for (i = 0; i < n; i++) {
+        w32_handoff *e = &g_handoff[(first + i) % W32_HANDOFF_LOG];
+        fprintf(stderr, "  [HANDOFF]   -%6lldms  tid %lu  %c  thread %lu"
+                        "  count now %d\n",
+                now - e->ms, (unsigned long)e->by, e->op,
+                (unsigned long)e->target, e->count);
+    }
+    pthread_mutex_unlock(&g_handoff_lock);
+    fflush(stderr);
+}
+
 DWORD ResumeThread(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
-    if (!o || o->kind != K_THREAD) return (DWORD)-1;
+    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : obj_check(h, K_THREAD);
+    if (!o) return (DWORD)-1;
     pthread_mutex_lock(&o->lock);
     DWORD prev = (DWORD)o->suspend_count;
-    if (o->suspend_count > 0 && --o->suspend_count == 0)
-        pthread_cond_broadcast(&o->gate);
-    pthread_mutex_unlock(&o->lock);
+    if (o->suspend_count > 0) {
+        if (--o->suspend_count == 0) {
+            pthread_cond_broadcast(&o->gate);
+            /*
+             * Wait for the parked thread to actually leave the gate.
+             *
+             * On the console a resume is a hand-off: one CPU, and the thread
+             * being woken runs before the thread that woke it does anything
+             * else. Here both are real threads on real cores, so without this
+             * the resumer can run all the way round its loop and issue a
+             * second resume before the first has been consumed -- and the
+             * second one lands on a thread whose count is already zero, where
+             * it is banked (once) or lost. Bounded, because a stall is better
+             * than a hang if this reasoning is ever wrong.
+             */
+            /* Polled rather than waited on, because there are two kinds of
+             * park and only one of them can signal: a thread that parked
+             * itself is in pthread_cond_wait and will signal left_gate, but a
+             * thread stopped by the suspend signal is inside a signal handler,
+             * where signalling a condition variable is not safe. Both clear
+             * ->parked, so watch that. Bounded: a stall is better than a hang
+             * if this reasoning is ever wrong. */
+            { int spins = 0;
+              while (o->parked && spins++ < 2000) {
+                  pthread_mutex_unlock(&o->lock);
+                  sched_yield();
+                  pthread_mutex_lock(&o->lock);
+              } }
+        }
+    } else {
+        /* Nothing to resume yet: bank the wake-up for the park it was meant
+         * for. Kept in its own field, not as a negative suspend count.
+         *
+         * Sharing the field was a bug with teeth: once the count went to -1,
+         * every later SuspendThread on that thread consumed the bank instead
+         * of suspending, and every ResumeThread put it back -- so a title that
+         * drives a worker with alternating Suspend and Resume, which is what
+         * JSRF's loader does, could never suspend that worker again. The
+         * hand-off log shows exactly that, four Suspend/Resume pairs in one
+         * millisecond with the count flipping -1, 0, -1, 0 and the worker
+         * never once stopping.
+         *
+         * Counted, not a flag. There are two producer threads feeding this
+         * title's loader worker, and with a flag a second wake-up arriving
+         * before the worker parks was silently merged into the first -- so the
+         * worker parked once too often and the item that second wake-up was
+         * announcing waited for whatever came next. That shows up as a loading
+         * screen that needs thirteen thousand frames where the console needs
+         * fifteen hundred. Skipping a park the title did not strictly need
+         * costs one wasted trip round the worker's loop; missing one costs the
+         * item. The cap keeps a title that resumes far more often than it
+         * suspends from being unable to park at all. */
+        if (o->pending_resume < 16) o->pending_resume++;
+        pthread_mutex_unlock(&o->lock);
+        handoff_note('r', o->tid, 0);
+        return prev;
+    }
+    { int c = o->suspend_count;
+      pthread_mutex_unlock(&o->lock);
+      handoff_note('R', o->tid, c); }
     return prev;
+}
+
+/* ── suspending a thread other than the caller ────────────────────────────
+ *
+ * POSIX has no way to stop a running thread from outside, so this used to
+ * track the count and let the target keep running. That is not a small gap:
+ * JSRF's loader uses SuspendThread/ResumeThread on its worker threads as a
+ * control mechanism, and a worker that does not stop when it is told to runs
+ * its queue in an order the title never expects. The symptom is the loading
+ * screen never ending, with two threads waiting on an event and a third
+ * parked with nobody left to wake it.
+ *
+ * So the target stops itself instead, at the next checkpoint. The recompiler
+ * already calls a hook on entry to every recompiled function, which is a few
+ * microseconds apart in practice -- close enough to "immediately" for a title
+ * that suspends a worker to keep it away from shared state, and cooperative,
+ * which means no signals and no stopping a thread in the middle of a malloc.
+ *
+ * The checkpoint runs with the guest lock released, always: a thread that
+ * parked while holding the lock that serialises guest execution would take
+ * every other guest thread down with it.
+ */
+/* Stopping a thread that never reaches a checkpoint.
+ *
+ * The cooperative checkpoint below runs on entry to every recompiled function,
+ * which is often enough for any thread that is calling functions. JSRF has one
+ * that is not: a worker whose whole body is a loop with no calls in it, which
+ * the title suspends and resumes constantly. Under a cooperative scheme that
+ * thread never stops -- and a title that suspends a thread is usually doing it
+ * to keep that thread away from state it is about to touch, so not stopping is
+ * not a missing optimisation, it is a data race. A wild pointer several
+ * hundred thousand instructions later is what that looks like.
+ *
+ * So: a signal, which interrupts the thread wherever it is, and a handler that
+ * waits for the count to fall. The wait is a spin with sched_yield rather than
+ * a condition variable because almost nothing is safe to call from a signal
+ * handler and sched_yield is; a suspended guest thread burning a core for the
+ * few hundred microseconds a title holds a suspend is a fair trade for the
+ * suspend meaning what it says. SA_RESTART so that a thread signalled inside a
+ * blocking call resumes it rather than failing with EINTR.
+ */
+#define W32_SUSPEND_SIGNAL SIGUSR2
+
+static void w32_suspend_signal(int sig)
+{
+    w32_object *o = t_self_obj;
+    struct timespec t0, now;
+    (void)sig;
+    if (!o) return;
+    clock_gettime(CLOCK_MONOTONIC, &t0);   /* async-signal-safe, unlike most */
+    o->parked = 1;
+    while (o->suspend_count > 0) {
+        sched_yield();
+        /*
+         * A safety valve, and an admission.
+         *
+         * Making a suspend real means the target genuinely stops, and a
+         * thread that stops and is never resumed stops the whole title --
+         * which is worse than the gap it was fixing, because before this the
+         * target simply carried on. A resume can go missing here for reasons
+         * that are the emulation's fault rather than the title's, and there
+         * is no way to be sure it cannot.
+         *
+         * So: honour the suspend for as long as any plausible suspend lasts,
+         * and then carry on rather than hang. A title whose worker resumes a
+         * quarter of a second late sees a thread that was stopped for a
+         * quarter of a second, which is the emulation being slow. A title
+         * whose resume is lost sees the behaviour it had yesterday. Neither
+         * is a frozen game.
+         *
+         * write() rather than fprintf: almost nothing is safe to call from a
+         * signal handler, and this one already spends its time in sched_yield
+         * for the same reason.
+         */
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if ((now.tv_sec - t0.tv_sec) * 1000000000LL
+          + (now.tv_nsec - t0.tv_nsec) > 250000000LL) {
+            static const char msg[] =
+                "  [THREAD] a suspended thread waited a quarter of a second "
+                "for a resume that did not come, and has carried on\n";
+            ssize_t ignored = write(2, msg, sizeof msg - 1);
+            (void)ignored;
+            break;
+        }
+    }
+    o->parked = 0;
+}
+
+static void w32_suspend_signal_install(void)
+{
+    static int done;
+    struct sigaction sa;
+    if (done) return;
+    done = 1;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = w32_suspend_signal;
+    sa.sa_flags = SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    sigaction(W32_SUSPEND_SIGNAL, &sa, NULL);
+}
+
+int w32_suspend_pending(void)
+{
+    const w32_object *o = t_self_obj;
+    return o && o->suspend_count > 0 && !o->parked;
+}
+
+void w32_suspend_checkpoint(void)
+{
+    w32_object *o = t_self_obj;
+    if (!o) return;
+    pthread_mutex_lock(&o->lock);
+    if (o->suspend_count > 0) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "  [THREAD] a thread suspended by another thread "
+                            "has stopped at a checkpoint (this used not to "
+                            "stop at all)\n");
+        o->parked = 1;
+        o->park_since = (long long)GetTickCount64();
+        while (o->suspend_count > 0)
+            pthread_cond_wait(&o->gate, &o->lock);
+        o->parked = 0;
+        pthread_cond_broadcast(&o->left_gate);
+    }
+    pthread_mutex_unlock(&o->lock);
 }
 
 DWORD SuspendThread(HANDLE h)
 {
-    /* True mid-run suspension is not supported on POSIX; only the
-     * CREATE_SUSPENDED start gate is. Track the count for ResumeThread. */
-    w32_object *o = (w32_object *)h;
-    if (!o || o->kind != K_THREAD) return (DWORD)-1;
+    /* Suspending ANOTHER thread mid-run is not supported on POSIX; only the
+     * CREATE_SUSPENDED start gate is, so for those the count is tracked and
+     * nothing stops. Suspending the CALLING thread is supported properly:
+     * it blocks on the same gate until a ResumeThread brings the count back
+     * to zero. Titles use SuspendThread(GetCurrentThread()) + ResumeThread
+     * from another thread as a hand-off primitive (JSRF's loader threads
+     * do), and a non-blocking version turns that into a busy spin. */
+    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? self_obj() : obj_check(h, K_THREAD);
+    if (!o) return (DWORD)-1;
     pthread_mutex_lock(&o->lock);
     DWORD prev = (DWORD)o->suspend_count;
+    if (o->pending_resume && o == self_obj()) {
+        /* A resume got here first: consume it and carry on without parking.
+         *
+         * Only for a thread parking ITSELF. That is the race this exists for
+         * -- the console's single CPU orders "give the worker work, resume it"
+         * against "worker finishes and parks" in a way real cores do not. A
+         * SuspendThread aimed at another thread is not that race; it is an
+         * instruction to stop, and consuming a bank instead would mean the
+         * target never stops at all. */
+        static int said;
+        o->pending_resume--;
+        if (!said++)
+            fprintf(stderr, "  [THREAD] a resume arrived before its suspend "
+                            "and was held; the worker did not park\n");
+        pthread_mutex_unlock(&o->lock);
+        handoff_note('r', o->tid, 0);
+        return prev;
+    }
     o->suspend_count++;
+    if (o == self_obj()) {
+        o->parked = 1;
+        o->park_since = (long long)GetTickCount64();
+        pthread_mutex_unlock(&o->lock);
+        handoff_note('S', o->tid, 1);
+        pthread_mutex_lock(&o->lock);
+        /*
+         * Parked, but not forever.
+         *
+         * A title that hands work between threads with SuspendThread(self) +
+         * ResumeThread(worker) is relying on a single CPU to order the two,
+         * and here they race: measured on this title, about one suspend in
+         * seven waits for a resume that never arrives. An untimed wait turns
+         * that into a thread stopped for the rest of the run -- and a
+         * sampling profile of a session that had stopped responding found
+         * exactly that, one worker parked here for the whole twelve seconds
+         * it was watched.
+         *
+         * Releasing it after a while is the lesser wrong. A thread that
+         * carries on a quarter-second late is a hitch; a thread that never
+         * carries on is the game. The count says how often it happens, so
+         * this cannot quietly become normal.
+         */
+        {
+            long long park0 = (long long)GetTickCount64();
+            int timed_out = 0;
+            while (o->suspend_count > 0) {
+                struct timespec ts;
+                clock_gettime(CLOCK_REALTIME, &ts);
+                ts.tv_nsec += 50 * 1000 * 1000;      /* 50 ms */
+                if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+                pthread_cond_timedwait(&o->gate, &o->lock, &ts);
+                if ((long long)GetTickCount64() - park0 >= 400) { timed_out = 1; break; }
+            }
+            if (timed_out) {
+                static unsigned long n;
+                o->suspend_count = 0;
+                if (++n <= 8 || (n % 256) == 0)
+                    fprintf(stderr, "  [THREAD] thread %u waited %lld ms for a "
+                            "resume that did not come and was released "
+                            "(%lu so far)\n",
+                            (unsigned)o->tid,
+                            (long long)GetTickCount64() - park0, n);
+            }
+        }
+        o->parked = 0;
+        pthread_cond_broadcast(&o->left_gate);
+        pthread_mutex_unlock(&o->lock);
+        return prev;
+    }
     pthread_mutex_unlock(&o->lock);
+    /*
+     * RECOMP_SUSPEND_REAL=1 makes a suspend aimed at another thread actually
+     * stop it, by signalling the target wherever it is. Off by default, and
+     * that is a retreat from a change made earlier today.
+     *
+     * The gap is real: POSIX cannot stop a running thread from outside, so
+     * this layer has always tracked the count and let the target carry on, and
+     * a title that suspends a worker to keep it away from shared state does
+     * not get what it asked for. Making it real seemed clearly better.
+     *
+     * Measured, it is not. Across a forty-five second run the target waited
+     * for a resume that never arrived thirty-eight times -- fourteen per cent
+     * of all suspends -- and each of those is a thread stopped dead until a
+     * timeout releases it. One run in four hung outright before the timeout
+     * existed. Whether those resumes are lost by the title or by this
+     * emulation is not yet known, and until it is, a thread that keeps running
+     * when it should have stopped is a smaller and better-understood wrong
+     * than a thread that stops and never starts.
+     *
+     * The evidence for the crash fix that landed alongside this points at the
+     * banked-resume counter, not at this. So this stays, behind a switch, for
+     * when the lost resumes are understood.
+     */
+    { static int real = -1;
+      if (real < 0) real = getenv("RECOMP_SUSPEND_REAL") ? 1 : 0;
+      if (real) {
+          w32_suspend_signal_install();
+          if (o->thread) pthread_kill(o->thread, W32_SUSPEND_SIGNAL);
+      } }
+    handoff_note('s', o->tid, (int)prev + 1);
     return prev;
 }
 
 BOOL TerminateThread(HANDLE h, DWORD exitCode)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_any(h);
     if (!o || o->kind != K_THREAD) return FALSE;
     pthread_cancel(o->thread);
     pthread_mutex_lock(&o->lock);
@@ -696,14 +1195,14 @@ BOOL TerminateThread(HANDLE h, DWORD exitCode)
 
 BOOL SetThreadPriority(HANDLE h, int priority)
 {
-    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
+    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : obj_check(h, K_THREAD);
     if (o && o->kind == K_THREAD) o->priority = priority;
     return TRUE;   /* real RT priorities need privileges; tracked only */
 }
 
 int GetThreadPriority(HANDLE h)
 {
-    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
+    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : obj_check(h, K_THREAD);
     return (o && o->kind == K_THREAD) ? o->priority : THREAD_PRIORITY_NORMAL;
 }
 
@@ -711,7 +1210,7 @@ VOID SwitchToThread(void) { sched_yield(); }
 
 DWORD QueueUserAPC(PAPCFUNC func, HANDLE thread, ULONG_PTR data)
 {
-    w32_object *o = (thread == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)thread;
+    w32_object *o = (thread == PSEUDO_CURRENT_THREAD) ? t_self_obj : obj_check(thread, K_THREAD);
     if (!o || o->kind != K_THREAD) return 0;
     pthread_mutex_lock(&o->lock);
     DWORD ok = 0;
@@ -897,6 +1396,113 @@ static int prot_from_page(DWORD protect)
     }
 }
 
+/* ---- the guest address reservation -------------------------------------- */
+
+/*
+ * A range this process owns and can hand out at exact addresses.
+ *
+ * Placing a mapping by hint and checking where it landed is the right
+ * behaviour when the address might belong to someone else -- it is what stops
+ * a probe from destroying the C library. But the guest address space is not
+ * someone else's: the console's RAM mirrors, its tiled aperture at
+ * 0xF0000000 and its device windows all have to sit at exact offsets from the
+ * base, and asking the kernel nicely for each one in turn means any of them
+ * can be refused for reasons that have nothing to do with the emulation. On
+ * macOS the tiled aperture was refused every run, and every render target
+ * write then faulted.
+ *
+ * So the layout reserves the whole four gigabytes up front as unreadable
+ * pages, and mappings that land inside it may use MAP_FIXED: replacing our
+ * own reservation is exactly what it is for. Outside it, nothing changes.
+ */
+#define W32_MAX_RESERVATIONS 8
+static struct { void *base; size_t size; } g_reserved[W32_MAX_RESERVATIONS];
+static int g_reserved_n;
+
+static int inside_reservation(const void *addr, size_t len)
+{
+    uintptr_t a = (uintptr_t)addr;
+    int i;
+    if (!addr) return 0;
+    for (i = 0; i < g_reserved_n; i++) {
+        uintptr_t b = (uintptr_t)g_reserved[i].base;
+        if (a >= b && a + len > a && a + len <= b + g_reserved[i].size)
+            return 1;
+    }
+    return 0;
+}
+
+void *win32_reserve_address_space(void *base, size_t size)
+{
+    void *p;
+    if (g_reserved_n >= W32_MAX_RESERVATIONS) return NULL;
+    p = mmap(base, size, PROT_NONE,
+             MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (p == MAP_FAILED) return NULL;
+    if (base && p != base) { munmap(p, size); return NULL; }
+    g_reserved[g_reserved_n].base = p;
+    g_reserved[g_reserved_n].size = size;
+    g_reserved_n++;
+    return p;
+}
+
+/* ---- host page granularity ----------------------------------------------
+ *
+ * The console's pages are 4 KB and so are Windows'. Apple Silicon's are 16 KB,
+ * and mprotect rounds outward: a guest asking to protect one 4 KB page there
+ * changes the protection of the 16 KB around it, including up to three pages
+ * that belong to something else. JSRF makes exactly that call and then faults
+ * on a neighbouring heap page a moment later -- as SIGBUS rather than SIGSEGV,
+ * because Darwin reports a protection failure that way, which is why it did
+ * not look like a protection problem at all.
+ *
+ * A protection finer than the host can express is therefore not applied. That
+ * loses a fault the guest was expecting to take; applying it anyway loses
+ * memory the guest was still using, and only one of those two is recoverable.
+ */
+static size_t w32_host_page_size(void)
+{
+    static size_t ps;
+    if (!ps) {
+        long v = sysconf(_SC_PAGESIZE);
+        ps = v > 0 ? (size_t)v : 4096;
+    }
+    return ps;
+}
+
+/* Apply a protection at the host's granularity, rounding in the direction
+ * that cannot lose anything.
+ *
+ * Which direction that is depends on what the protection does. Granting
+ * access -- a guest committing a page it is about to use -- is safe to round
+ * outward: the neighbours become readable or writable when they did not need
+ * to be, which costs a fault the guest was not going to take anyway. Removing
+ * access is not: rounding outward there makes up to three pages belonging to
+ * something else unwritable, and the something else then dies on an ordinary
+ * store to memory it legitimately owns.
+ *
+ * Both halves of that were observed here, one after the other. Rounding
+ * outward for everything made JSRF fault on a byte store 22 MB into its heap.
+ * Rounding inward for everything left pages the guest had just committed
+ * still unmapped, and it hung waiting on memory it thought it had. The rule
+ * has to depend on the direction of the change, which is what this does. */
+static int protect_within_host_pages(void *addr, size_t size, int prot)
+{
+    size_t ps = w32_host_page_size();
+    uintptr_t a = (uintptr_t)addr, lo, hi;
+    int grants = (prot & (PROT_READ | PROT_WRITE)) != 0;
+
+    if (grants) {
+        lo = a & ~(uintptr_t)(ps - 1);
+        hi = (a + size + ps - 1) & ~(uintptr_t)(ps - 1);
+    } else {
+        lo = (a + ps - 1) & ~(uintptr_t)(ps - 1);
+        hi = (a + size) & ~(uintptr_t)(ps - 1);
+        if (hi <= lo) return 0;    /* finer than the host can express: skip */
+    }
+    return mprotect((void *)lo, (size_t)(hi - lo), prot);
+}
+
 LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD protect)
 {
     int prot  = prot_from_page(protect);
@@ -905,24 +1511,33 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD pro
     /* MEM_COMMIT on a region already reserved by a prior VirtualAlloc:
      * just adjust protection. */
     if ((allocationType & MEM_COMMIT) && !(allocationType & MEM_RESERVE) && address) {
-        if (mprotect(address, size, prot) == 0)
+        if (protect_within_host_pages(address, size, prot) == 0)
             return address;
         /* fall through to a fresh mapping */
     }
 
+    int owned = inside_reservation(address, size);
+    if (owned) flags |= MAP_FIXED;
 #if defined(MAP_FIXED_NOREPLACE)
-    if (address) flags |= MAP_FIXED_NOREPLACE;
-#elif defined(__APPLE__)
-    /* TODO: mach_vm_map with VM_FLAGS_FIXED (which does fail rather than replace),
-     * or a mach_vm_region probe before an MAP_FIXED call. */
+    else if (address) flags |= MAP_FIXED_NOREPLACE;
 #endif
     void *p = mmap(address, size, prot ? prot : PROT_READ | PROT_WRITE,
                    flags, -1, 0);
     if (p == MAP_FAILED) { SetLastError(8); return NULL; }
 #if !defined(MAP_FIXED_NOREPLACE)
-    /* TODO: Without MAP_FIXED_NOREPLACE (macOS or older kernels) plain
-     * MAP_FIXED would silently unmap whatever already lives there. Getting a
-     * different address means the range was taken: fail as Linux does. */
+    if (owned) return p;
+    /* Without MAP_FIXED_NOREPLACE -- Darwin, and older Linux -- a requested
+     * address is only a hint, and the kernel is free to place the mapping
+     * somewhere else entirely. MAP_FIXED is not the answer: it would take the
+     * address by unmapping whatever already lives there, which for a caller
+     * probing a list of candidate bases means silently destroying the mapping
+     * it was about to reject. Placing it and checking gives Linux's semantics
+     * exactly: the address, or failure. */
+    if (address && p != address) {
+        munmap(p, size);
+        SetLastError(ERROR_INVALID_ADDRESS);
+        return NULL;
+    }
 #endif
     return p;
 }
@@ -935,15 +1550,19 @@ BOOL VirtualFree(LPVOID address, SIZE_T size, DWORD freeType)
         if (size == 0) return TRUE;
         return munmap(address, size) == 0;
     }
-    if (freeType & MEM_DECOMMIT)
-        return mprotect(address, size, PROT_NONE) == 0;
+    if (freeType & MEM_DECOMMIT) {
+        if (getenv("JSRF_DBG")) fprintf(stderr, "  [VM] DECOMMIT %p size 0x%zx\n", address, size);
+        return protect_within_host_pages(address, size, PROT_NONE) == 0;
+    }
     return TRUE;
 }
 
 BOOL VirtualProtect(LPVOID address, SIZE_T size, DWORD newProtect, PDWORD oldProtect)
 {
     if (oldProtect) *oldProtect = PAGE_READWRITE;
-    return mprotect(address, size, prot_from_page(newProtect)) == 0;
+    if (getenv("JSRF_DBG")) fprintf(stderr, "  [VM] PROTECT %p size 0x%zx -> 0x%x\n", address, size, (unsigned)newProtect);
+    return protect_within_host_pages(address, size,
+                                     prot_from_page(newProtect)) == 0;
 }
 
 /* ===================================================================== */
@@ -1029,8 +1648,17 @@ VOID ExitProcess(UINT exitCode) { exit((int)exitCode); }
 BOOL IsDebuggerPresent(void)
 {
 #if defined(__APPLE__)
-    /* TODO: Darwin: KERN_PROC_PID reports P_TRACED when a debugger is attached. */
-    return FALSE;
+    /* The documented Darwin test: ask the kernel for this process's own proc
+     * entry and look at P_TRACED. */
+    {
+        struct kinfo_proc info;
+        size_t len = sizeof info;
+        int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, 0 };
+        mib[3] = getpid();
+        memset(&info, 0, sizeof info);
+        if (sysctl(mib, 4, &info, &len, NULL, 0) != 0) return FALSE;
+        return (info.kp_proc.p_flag & P_TRACED) ? TRUE : FALSE;
+    }
 #else
     /* TODO: On Linux a non-zero TracerPid in /proc/self/status means ptrace is attached. */
     return FALSE;
@@ -1044,7 +1672,14 @@ VOID DebugBreak(void) {
 VOID SecureZeroMemory(PVOID ptr, SIZE_T cnt)
 {
 #if defined(__APPLE__)
-    // TODO: Darwin explicit_bzero equivalent is memset_s.
+    /* Darwin's memset_s is only declared when __STDC_WANT_LIB_EXT1__ is set
+     * before every string.h in the translation unit, which is not something a
+     * compat header can promise. A volatile store cannot be optimised away
+     * either, and needs no cooperation from libc. */
+    {
+        volatile unsigned char *q = (volatile unsigned char *)ptr;
+        while (cnt--) *q++ = 0;
+    }
 #else
     explicit_bzero(ptr, cnt);
 #endif
@@ -1296,8 +1931,38 @@ static size_t view_take(const void *addr)
 static int anon_map_fd(const char *name)
 {
 #if defined(__APPLE__)
-    // TODO: use shm_open on macOS 10.12+ or mkstemp + unlink for older versions
-    return 0;
+    /* Darwin has no memfd_create. POSIX shared memory is the closest thing:
+     * shm_open gives a descriptor that ftruncate and MAP_SHARED both accept,
+     * and unlinking the name immediately leaves an object that lives only as
+     * long as the descriptor -- which is the whole point of memfd_create.
+     *
+     * The name must be unique and under SHM_NAME_MAX, and it must not survive
+     * a crash, or the next run inherits a stale object of the wrong size.
+     * Hence pid and a counter, and the unlink before anything else happens.
+     *
+     * shm_open is unavailable to sandboxed iOS apps, so fall back to a temp
+     * file in whatever directory the process is allowed to write to. Unlinked
+     * at once for the same reason. */
+    {
+        static int seq;
+        char nm[64];
+        int fd;
+        snprintf(nm, sizeof nm, "/xbr.%d.%d", (int)getpid(), seq++);
+        fd = shm_open(nm, O_RDWR | O_CREAT | O_EXCL, 0600);
+        if (fd >= 0) { shm_unlink(nm); return fd; }
+
+        {
+            const char *tmp = getenv("TMPDIR");
+            char path[512];
+            snprintf(path, sizeof path, "%s%sxbr.%d.%d.XXXXXX",
+                     tmp ? tmp : "/tmp",
+                     (tmp && tmp[0] && tmp[strlen(tmp) - 1] == '/') ? "" : "/",
+                     (int)getpid(), seq++);
+            fd = mkstemp(path);
+            if (fd >= 0) unlink(path);
+            return fd;
+        }
+    }
 #else
     return memfd_create(name ? name : "xbox_map", 0);
 #endif
@@ -1340,10 +2005,29 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
     off_t  off = ((off_t)offHigh << 32) | offLow;
     SIZE_T len = count ? count : (o->map_size - (SIZE_T)off);
     int prot   = PROT_READ | ((access != FILE_MAP_READ) ? PROT_WRITE : 0);
-    int flags  = MAP_SHARED | (baseAddr ? MAP_FIXED : 0);
 
-    void *p = mmap(baseAddr, len, prot, flags, o->fd, off);
+    /* A requested address is passed as a hint, not with MAP_FIXED.
+     *
+     * MAP_FIXED takes the range by unmapping whatever is already there, and
+     * both callers of this function ask for an address they do not yet own:
+     * the base view walks a list of candidate addresses expecting failure to
+     * mean "taken", and the RAM mirrors ask for the aliases above it. Under
+     * MAP_FIXED the walk cannot fail, so it stops at its first candidate
+     * having destroyed whatever occupied it -- on a host where that address
+     * is the C library or the thread stack, the crash arrives much later and
+     * looks like anything but a mapping bug.
+     *
+     * A hint plus a check gives what the callers actually mean: the kernel
+     * honours it when the range is free, and anything else is a refusal. */
+    int owned = inside_reservation(baseAddr, len);
+    void *p = mmap(baseAddr, len, prot,
+                   MAP_SHARED | (owned ? MAP_FIXED : 0), o->fd, off);
     if (p == MAP_FAILED) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
+    if (!owned && baseAddr && p != baseAddr) {
+        munmap(p, len);
+        SetLastError(ERROR_INVALID_ADDRESS);
+        return NULL;
+    }
     view_register(p, len);
     return p;
 }
@@ -1380,8 +2064,35 @@ SIZE_T VirtualQuery(LPCVOID address, PMEMORY_BASIC_INFORMATION buffer, SIZE_T le
 BOOL GlobalMemoryStatusEx(LPMEMORYSTATUSEX b)
 {
 #if defined(__APPLE__)
-    /* TODO: Darwin has no sysinfo(2): physical memory comes from sysctl, the free
-     * page count from the Mach VM statistics, swap from vm.swapusage. */
+    /* Darwin has no sysinfo(2). Physical memory is a sysctl; the free page
+     * count comes from the Mach VM statistics, where "available" has to
+     * include the inactive and purgeable pages -- counting only the free list
+     * reports a few hundred megabytes on a machine with tens of gigabytes
+     * spare, because Darwin keeps almost everything in the file cache. */
+    {
+        uint64_t memsize = 0;
+        size_t len = sizeof memsize;
+        vm_statistics64_data_t vm;
+        mach_msg_type_number_t cnt = HOST_VM_INFO64_COUNT;
+        vm_size_t page = 0;
+
+        if (!b) return FALSE;
+        if (sysctlbyname("hw.memsize", &memsize, &len, NULL, 0) != 0) return FALSE;
+        b->ullTotalPhys = memsize;
+        b->ullAvailPhys = memsize;
+
+        if (host_page_size(mach_host_self(), &page) == KERN_SUCCESS
+            && host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                                 (host_info64_t)&vm, &cnt) == KERN_SUCCESS) {
+            b->ullAvailPhys = (ULONGLONG)(vm.free_count + vm.inactive_count
+                                          + vm.purgeable_count) * page;
+        }
+        /* No swap figure: vm.swapusage is a sysctl of its own and nothing
+         * here needs it. Reporting page file as physical is honest enough for
+         * a caller asking "how much room is there". */
+        b->ullTotalPageFile = b->ullTotalPhys;
+        b->ullAvailPageFile = b->ullAvailPhys;
+    }
 #else
     struct sysinfo si;
     if (!b) return FALSE;
@@ -1519,3 +2230,38 @@ PVOID AddVectoredExceptionHandler(ULONG First, PVECTORED_EXCEPTION_HANDLER Handl
 ULONG RemoveVectoredExceptionHandler(PVOID h) { (void)h; return 1; }
 
 #endif /* !_WIN32 */
+
+/* ---- SRWLOCK / INIT_ONCE (added for the POSIX build) ------------------- */
+static pthread_mutex_t g_srw_boot = PTHREAD_MUTEX_INITIALIZER;
+static pthread_rwlock_t *srw_get(PSRWLOCK l)
+{
+    if (!l->Ptr) {
+        pthread_mutex_lock(&g_srw_boot);
+        if (!l->Ptr) {
+            pthread_rwlock_t *rw = (pthread_rwlock_t *)malloc(sizeof(*rw));
+            pthread_rwlock_init(rw, NULL);
+            l->Ptr = rw;
+        }
+        pthread_mutex_unlock(&g_srw_boot);
+    }
+    return (pthread_rwlock_t *)l->Ptr;
+}
+VOID AcquireSRWLockShared(PSRWLOCK l)    { pthread_rwlock_rdlock(srw_get(l)); }
+VOID ReleaseSRWLockShared(PSRWLOCK l)    { pthread_rwlock_unlock(srw_get(l)); }
+VOID AcquireSRWLockExclusive(PSRWLOCK l) { pthread_rwlock_wrlock(srw_get(l)); }
+VOID ReleaseSRWLockExclusive(PSRWLOCK l) { pthread_rwlock_unlock(srw_get(l)); }
+BOOL InitOnceExecuteOnce(PINIT_ONCE o, PINIT_ONCE_FN fn, PVOID param, PVOID *ctx)
+{
+    pthread_mutex_lock(&g_srw_boot);
+    if (!o->Ptr) { fn(o, param, ctx); o->Ptr = (PVOID)1; }
+    pthread_mutex_unlock(&g_srw_boot);
+    return TRUE;
+}
+
+BOOL GetFileSizeEx(HANDLE h, PLARGE_INTEGER size)
+{
+    DWORD hi = 0, lo = GetFileSize(h, &hi);
+    if (lo == 0xFFFFFFFFu && GetLastError() != 0) return FALSE;
+    size->QuadPart = ((LONGLONG)hi << 32) | lo;
+    return TRUE;
+}

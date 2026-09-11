@@ -46,6 +46,11 @@ add_subdirectory(src/apu)
 # GPU: NV2A hardware emulation (register handlers, MMIO, push buffer)
 add_subdirectory(src/nv2a)
 
+# NV2A -> OpenGL translation (POSIX only for now: it needs EGL)
+if(NOT WIN32)
+    add_subdirectory(src/nv2a_gl)
+endif()
+
 # USB: MCPX OHCI host controllers. A title's XAPI is statically linked and
 # drives these registers directly, so a pad only exists if they do.
 add_subdirectory(src/usb)
@@ -68,6 +73,7 @@ target_link_libraries(xboxrecomp INTERFACE
     xbox_usb
     xbox_apu
     xbox_nv2a
+    $<$<NOT:$<BOOL:${WIN32}>>:xbox_nv2a_gl>
     xbox_video
 )
 

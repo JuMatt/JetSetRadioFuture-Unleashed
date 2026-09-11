@@ -163,9 +163,11 @@ def _fmt_mem_read(op):
 
 def _fmt_mem_write(op, value_expr):
     """Format writing to a memory operand."""
-    accessor = _mem_accessor(op.mem_size)
+    # Stores go through MEMWxx so a device-register address can reach its
+    # model (see recomp_types.h); MEMxx(...) = v only reaches RAM.
+    accessor = {1: "MEMW8", 2: "MEMW16", 4: "MEMW32"}.get(op.mem_size, "MEMW32")
     addr = _fmt_mem(op)
-    return f"{accessor}({addr}) = {value_expr};"
+    return f"{accessor}({addr}, {value_expr});"
 
 
 _REG_WIDTH = {
@@ -261,15 +263,14 @@ _EFLAGS_SETTERS = frozenset({
     "shld", "shrd", "rol", "ror", "rcl", "rcr",  # Shifts/rotates set CF
     "bsf", "bsr",       # Bit scan sets ZF
     "bt", "bts", "btr", "btc",  # Bit test sets CF
-    "cmpxchg",           # Compare-and-exchange sets ZF
-    "xadd",              # Exchange-and-add sets flags
+    "cmpxchg", "lock cmpxchg",   # Compare-and-exchange sets ZF
+    "xadd", "lock xadd",         # Exchange-and-add sets flags from the sum
 })
 
 # Instructions with undefined/unpredictable flags (clear tracking)
 _FLAGS_UNDEFINED = frozenset({
     "mul", "div", "idiv",  # Flags partially undefined
     "rdtsc", "cpuid",      # Special instructions
-    "lock xadd",           # Lock prefix - complex flag behavior
 })
 
 # Instructions that do NOT modify EFLAGS (preserve flag tracking)
@@ -348,9 +349,18 @@ def _make_condition(jcc, flag_setter, flag_ops):
     # comparison happens. Use those rather than re-reading registers that may
     # since have changed.
     SIGNED = {"CMP_L", "CMP_LE", "CMP_G", "CMP_GE", "TEST_S"}
+    RESULT_SNAPSHOT = {"add", "sub", "and", "or", "xor", "inc", "dec", "neg",
+                       "shl", "sal", "shr", "sar", "shld", "shrd", "adc", "sbb"}
     if flag_setter in ("cmp", "test", "bsf", "bsr") and len(flag_ops) >= 2:
         signed = (cmp_macro in SIGNED) or (test_macro in SIGNED)
         lhs, rhs = ("_fas", "_fbs") if signed else ("_fa", "_fb")
+    elif flag_setter in RESULT_SNAPSHOT and len(flag_ops) >= 1:
+        # The lifter snapshotted the result into _fa/_fas and the source
+        # operand into _fb/_fbs at the instruction (see lift_instruction).
+        # The per-setter rules below spell (int32_t)lhs for the signed
+        # view; _fas already is that, so hand out the signed name where the
+        # cast would be applied and the unsigned one elsewhere.
+        lhs, rhs = "_fa", ("_fb" if len(flag_ops) >= 2 else None)
     elif len(flag_ops) >= 2:
         lhs = _fmt_operand_read(flag_ops[0])
         rhs = _fmt_operand_read(flag_ops[1])
@@ -360,6 +370,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
     else:
         lhs = None
         rhs = None
+    # Signed view of the left operand: the snapshot's _fas when one exists,
+    # otherwise the 32-bit cast the rules below always used.
+    lhs_s = "_fas" if lhs == "_fa" else (f"(int32_t){lhs}" if lhs else None)
 
     # ── FPU compare-to-EFLAGS and sahf: no standard operands ──
     if flag_setter in ("fcompi", "fcomip", "fucomi", "fucompi",
@@ -512,9 +525,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({lhs_s} < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({lhs_s} >= 0)", desc
         # Ordered: reconstruct original a = result + b
         if cmp_macro and rhs:
             return f"{cmp_macro}((uint32_t){lhs} + (uint32_t){rhs}, (uint32_t){rhs})", desc
@@ -523,13 +536,13 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jae", "jnb"):
             return f"((uint32_t){lhs} + (uint32_t){rhs} >= (uint32_t){rhs})", desc
         if jcc in ("jl", "jnge"):
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({lhs_s} < 0)", desc
         if jcc in ("jge", "jnl"):
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({lhs_s} >= 0)", desc
         if jcc in ("jle", "jng"):
-            return f"((int32_t){lhs} <= 0)", desc
+            return f"({lhs_s} <= 0)", desc
         if jcc in ("jg", "jnle"):
-            return f"((int32_t){lhs} > 0)", desc
+            return f"({lhs_s} > 0)", desc
         return None
 
     # ── add: a = a + b, flags from result ──
@@ -539,21 +552,21 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({lhs_s} < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({lhs_s} >= 0)", desc
         if jcc in ("jb", "jnae", "jc"):
             return f"({lhs} < (uint32_t){rhs})", desc
         if jcc in ("jae", "jnb", "jnc"):
             return f"({lhs} >= (uint32_t){rhs})", desc
         if jcc in ("jl", "jnge"):
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({lhs_s} < 0)", desc
         if jcc in ("jge", "jnl"):
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({lhs_s} >= 0)", desc
         if jcc in ("jle", "jng"):
-            return f"((int32_t){lhs} <= 0)", desc
+            return f"({lhs_s} <= 0)", desc
         if jcc in ("jg", "jnle"):
-            return f"((int32_t){lhs} > 0)", desc
+            return f"({lhs_s} > 0)", desc
         return None
 
     # ── adc/sbb: result-based (like add/sub but with carry) ──
@@ -563,9 +576,23 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({lhs_s} < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({lhs_s} >= 0)", desc
+        return None
+
+    # ── zf_result: a join of result-based setters on one destination ──
+    # (see FunctionTranslator._flag_states_result_merge). Only what every
+    # member defines from the result: ZF and SF.
+    if flag_setter == "zf_result":
+        if jcc in ("je", "jz"):
+            return f"({lhs} == 0)", desc
+        if jcc in ("jne", "jnz"):
+            return f"({lhs} != 0)", desc
+        if jcc == "js":
+            return f"({_sf_cast}({lhs}) < 0)", desc
+        if jcc == "jns":
+            return f"({_sf_cast}({lhs}) >= 0)", desc
         return None
 
     # ── and/or/xor: result-based, CF=0, OF=0 ──
@@ -575,13 +602,13 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc in ("js", "jl"):
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({lhs_s} < 0)", desc
         if jcc in ("jns", "jge"):
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({lhs_s} >= 0)", desc
         if jcc == "jle":
-            return f"((int32_t){lhs} <= 0)", desc
+            return f"({lhs_s} <= 0)", desc
         if jcc == "jg":
-            return f"((int32_t){lhs} > 0)", desc
+            return f"({lhs_s} > 0)", desc
         if jcc in ("jb", "jnae", "jbe", "jna"):
             return "0", desc  # CF=0 after and/or/xor
         if jcc in ("jae", "jnb", "ja", "jnbe"):
@@ -595,9 +622,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({lhs_s} < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({lhs_s} >= 0)", desc
         if jcc in ("jl", "jle", "jg", "jge"):
             cast = "(int32_t)" + lhs
             op = {"jl": "<", "jle": "<=", "jg": ">", "jge": ">="}[jcc]
@@ -616,17 +643,17 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jae", "jnb", "jnc"):
             return f"({lhs} == 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({lhs_s} < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({lhs_s} >= 0)", desc
         if jcc in ("jg", "jnle"):
-            return f"((int32_t){lhs} > 0)", desc
+            return f"({lhs_s} > 0)", desc
         if jcc in ("jge", "jnl"):
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({lhs_s} >= 0)", desc
         if jcc in ("jl", "jnge"):
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({lhs_s} < 0)", desc
         if jcc in ("jle", "jng"):
-            return f"((int32_t){lhs} <= 0)", desc
+            return f"({lhs_s} <= 0)", desc
         return None
 
     # ── shift: result-based ──
@@ -636,9 +663,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({lhs_s} < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({lhs_s} >= 0)", desc
         return None
 
     # ── shld/shrd: double-precision shift, result-based ──
@@ -648,9 +675,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({lhs_s} < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({lhs_s} >= 0)", desc
         return None
 
     # ── rol/ror/rcl/rcr: rotation, only CF/OF affected ──
@@ -686,7 +713,7 @@ def _make_condition(jcc, flag_setter, flag_ops):
         return None
 
     # ── cmpxchg: compares accumulator with dest, sets ZF on match ──
-    if flag_setter == "cmpxchg":
+    if flag_setter in ("cmpxchg", "lock cmpxchg"):
         # ZF comes from the compare the instruction already did, and the lift
         # snapshots it into _fa/_fb. Re-reading eax here would test a value
         # cmpxchg may have just replaced.
@@ -697,11 +724,28 @@ def _make_condition(jcc, flag_setter, flag_ops):
         return None
 
     # ── xadd: exchange and add, flags from addition ──
-    if flag_setter == "xadd":
+    # The lift snapshots the sum into _fa (and _fas) -- the destination is
+    # memory that another thread may already have changed, and the source
+    # register now holds the OLD value, so neither can be re-read here.
+    # InterlockedDecrement's "jne skip_delete" is the customer: with the
+    # flags marked undefined every Release() deleted its object.
+    if flag_setter in ("xadd", "lock xadd"):
         if jcc in ("je", "jz"):
-            return f"({lhs} == 0)", desc
+            return "(_fa == 0)", desc
         if jcc in ("jne", "jnz"):
-            return f"({lhs} != 0)", desc
+            return "(_fa != 0)", desc
+        if jcc in ("js",):
+            return "(_fas < 0)", desc
+        if jcc in ("jns",):
+            return "(_fas >= 0)", desc
+        if jcc in ("jle", "jng"):
+            return "(_fas <= 0)", desc
+        if jcc in ("jg", "jnle"):
+            return "(_fas > 0)", desc
+        if jcc in ("jl", "jnge"):
+            return "(_fas < 0)", desc
+        if jcc in ("jge", "jnl"):
+            return "(_fas >= 0)", desc
         return None
 
     # ── repe cmpsb / repne scasb: string comparison ──
@@ -986,7 +1030,36 @@ class Lifter:
         self.referenced_calls[addr] = name
         return name
 
+    # Arithmetic whose flags a later jcc reads from the RESULT. The condition
+    # used to re-read the destination register at the jcc, which is wrong the
+    # moment anything between the two rewrites it -- `dec ecx; mov [..], ecx;
+    # mov ecx, [..]; jne` is MSVC's ordinary loop shape, and CRI's ADX
+    # decoder in JSRF has exactly that: the reloaded ecx was a pointer, never
+    # zero, so the inner loop never ended and wrote PCM over 50 MB of RAM.
+    # Snapshot the result (and the right-hand operand, for the ordered
+    # compares that reconstruct the original) at the instruction instead.
+    _RESULT_SNAPSHOT = frozenset({
+        "add", "sub", "and", "or", "xor", "inc", "dec", "neg",
+        "shl", "sal", "shr", "sar", "shld", "shrd", "adc", "sbb",
+    })
+
     def lift_instruction(self, insn):
+        out = self._lift_instruction_inner(insn)
+        m = insn.mnemonic
+        if m in self._RESULT_SNAPSHOT and insn.operands and insn.operands[0].type in ("reg", "mem"):
+            ops = insn.operands
+            size = _operand_width(ops[0]) or 4
+            mask = self._SNAP_MASK.get(size, "0xFFFFFFFFu")
+            sx = self._SNAP_SX.get(size, "(int32_t)")
+            pre = []
+            if len(ops) >= 2 and m in ("add", "sub", "adc", "sbb", "and", "or", "xor"):
+                pre.append(f"_fb = (uint32_t)({_fmt_operand_read(ops[1])}) & {mask}; _fbs = (int32_t){sx}(_fb);")
+            post = [f"_fa = (uint32_t)({_fmt_operand_read(ops[0])}) & {mask}; _fas = (int32_t){sx}(_fa);"
+                    f" /* flags snapshot: {m} */"]
+            return pre + list(out) + post
+        return out
+
+    def _lift_instruction_inner(self, insn):
         """
         Translate a single x86 instruction to one or more C statements.
         Returns a list of C statement strings.
@@ -1045,6 +1118,8 @@ class Lifter:
             return self._lift_sar(insn, ops)
         if m in ("rol", "ror"):
             return self._lift_rotate(insn, ops, m)
+        if m in ("rcl", "rcr"):
+            return self._lift_rotate_carry(insn, ops, m)
 
         # ── Comparison / test (standalone, not part of cmp+jcc pattern) ──
         if m == "cmp":
@@ -1334,9 +1409,13 @@ class Lifter:
                 src = _fmt_operand_read(ops[1])
                 if atomic_m == "xadd":
                     # dst = dst + src, and src receives dst's old value.
+                    # Snapshot the sum for the jcc that follows (see the
+                    # xadd case in _make_jcc_condition).
                     return [
                         "{ uint32_t _old = RECOMP_ATOMIC_ADD32("
                         f"XBOX_PTR({addr}), {src});",
+                        f"  _fa = _old + ({src}); _fb = 0; "
+                        "_fas = (int32_t)_fa; _fbs = 0;",
                         "  " + _fmt_operand_write(ops[1], "_old") + " }"
                         f"  /* {m} */",
                     ]
@@ -1645,6 +1724,27 @@ class Lifter:
         func = "ROL32" if m == "rol" else "ROR32"
         return [_fmt_operand_write(ops[0], f"{func}({dst}, {cnt})")]
 
+    def _lift_rotate_carry(self, insn, ops, m):
+        """rcl/rcr: rotate through CF. The 64-bit division helpers
+        (_aulldvrm and friends) shift edx:eax right with `shr edx,1; rcr eax,1`
+        -- a no-op here silently corrupted every 64-bit divide."""
+        if len(ops) < 2:
+            return [f"/* {m}: bad operands */"]
+        dst = _fmt_operand_read(ops[0])
+        cnt = _fmt_operand_read(ops[1])
+        w = (_operand_width(ops[0]) or 4) * 8
+        mask = {8: "0xFFu", 16: "0xFFFFu", 32: "0xFFFFFFFFu"}[w]
+        if m == "rcr":
+            body = (f"_rv = ((_rv >> 1) | ((uint32_t)_cf << {w - 1})) & {mask};"
+                    f" _cf = (int)(_ro & 1); _ro = _rv;")
+        else:
+            body = (f"_rv = ((_rv << 1) | (uint32_t)_cf) & {mask};"
+                    f" _cf = (int)((_ro >> {w - 1}) & 1); _ro = _rv;")
+        return [f"{{ uint32_t _ro = (uint32_t)({dst}) & {mask}, _rv = _ro;"
+                f" uint32_t _rn = ((uint32_t)({cnt})) % {w + 1}u;"
+                f" while (_rn--) {{ {body} }}"
+                f" {_fmt_operand_write(ops[0], '_rv')} }} /* {m} */"]
+
     # ── Compare / Test (standalone) ──
 
     # Widths for the flag snapshot below.
@@ -1897,12 +1997,18 @@ class Lifter:
         if offset is None:
             return []
         targets = []
+        # MSVC indexes some tables from 1 (`jmp [eax*4 + base]` with eax in
+        # 1..n, table stored at base+4), so entry 0 is whatever precedes the
+        # table. Tolerate one junk leading entry; keep index alignment by
+        # recording it as 0 so callers see real targets at their true index.
         for i in range(max_entries):
             o = offset + i * 4
             if o + 4 > len(self.xbe_data):
                 break
             val = struct.unpack_from('<I', self.xbe_data, o)[0]
             if not is_code_address(val):
+                if i == 0:
+                    continue
                 break
             targets.append(val)
         return targets
@@ -2347,7 +2453,7 @@ class Lifter:
                 if dst.type == "mem":
                     return ([f"MMX_STORE({_fmt_mem(dst)}, {ops[1].reg}); /* movq */"]
                             if wide else
-                            [f"MEM32({_fmt_mem(dst)}) = {ops[1].reg}.ud[0];"
+                            [f"MEMW32({_fmt_mem(dst)}, {ops[1].reg}.ud[0]);"
                              " /* movd */"])
                 if dst.type == "reg":
                     return [f"{dst.reg} = {ops[1].reg}.ud[0]; /* movd */"]
@@ -2396,8 +2502,8 @@ class Lifter:
                 return f"{op.reg} = {val};"
             elif op.type == "mem":
                 if op.mem_size == 8:
-                    return f"MEMD({_fmt_mem(op)}) = {val};"
-                return f"MEMF({_fmt_mem(op)}) = {val};"
+                    return f"MEMWD({_fmt_mem(op)}, {val});"
+                return f"MEMWF({_fmt_mem(op)}, {val});"
             return f"/* sse_write? */;"
 
         # ── Packed (128-bit) access ──
@@ -2742,9 +2848,9 @@ class Lifter:
             if len(ops) >= 1 and ops[0].type == "mem":
                 pop = " fp_pop();" if m == "fstp" else ""
                 if ops[0].mem_size == 4:
-                    return [f"MEMF({_fmt_mem(ops[0])}) = (float)fp_top();{do_pop} /* {m} */"]
+                    return [f"MEMWF({_fmt_mem(ops[0])}, (float)fp_top());{do_pop} /* {m} */"]
                 elif ops[0].mem_size == 8:
-                    return [f"MEMD({_fmt_mem(ops[0])}) = fp_top();{do_pop} /* {m} */"]
+                    return [f"MEMWD({_fmt_mem(ops[0])}, fp_top());{do_pop} /* {m} */"]
             # fst/fstp st(i): copy st0 to st(i); fstp then pops. This used to be
             # a bare comment -- a no-op -- which LEAKS the FPU stack. `fstp st(0)`
             # is the common idiom for "pop the value fptan/fsincos just pushed";
@@ -2777,8 +2883,12 @@ class Lifter:
                 int_type = {2: "int16_t", 4: "int32_t", 8: "int64_t"}.get(
                     size, "int32_t")
                 pop = " fp_pop();" if m == "fistp" else ""
+                cvt = {2: "recomp_fist16", 4: "recomp_fist32", 8: "recomp_fist64"}.get(size, "recomp_fist32")
+                wacc = {2: "MEMW16", 4: "MEMW32"}.get(size)
+                if wacc:
+                    return [f"{wacc}({_fmt_mem(ops[0])}, ({int_type}){cvt}(fp_top()));{pop} /* {m} */"]
                 return [f"{mem_acc}({_fmt_mem(ops[0])}) = "
-                        f"({int_type})llrint(fp_top());{pop} /* {m} */"]
+                        f"({int_type}){cvt}(fp_top());{pop} /* {m} */"]
             return [f"/* {m} {insn.op_str} */"]
 
         if m in ("fadd", "faddp", "fsub", "fsubp", "fsubr", "fsubrp",
@@ -2902,6 +3012,8 @@ class Lifter:
             return [f"fp_top() = {fn}(fp_top(), fp_st1()); /* {m} */"]
         if m == "fscale":
             return [f"fp_top() = ldexp(fp_top(), (int)fp_st1()); /* fscale */"]
+        if m in ("fnclex", "fclex"):
+            return ["/* fnclex: clear x87 exception flags (nothing tracked) */"]
         if m == "frndint":
             return [f"fp_top() = rint(fp_top()); /* frndint */"]
         if m == "fldpi":
@@ -2985,7 +3097,7 @@ class Lifter:
                 return [f"eax = (eax & 0xFFFF0000u) | (uint32_t){status};"
                         " /* fnstsw ax <- fpu status */"]
             if ops and ops[0].type == "mem":
-                return [f"MEM16({_fmt_mem(ops[0])}) = {status};"
+                return [f"MEMW16({_fmt_mem(ops[0])}, {status});"
                         f" /* fnstsw {insn.op_str} */"]
             if ops and ops[0].type == "reg":
                 return [_fmt_set_reg(ops[0].reg, status)
@@ -2995,7 +3107,7 @@ class Lifter:
             # The CRT reads the control word back to decide whether an
             # exception is masked, so it must be stored, not dropped.
             if ops and ops[0].type == "mem":
-                return [f"MEM16({_fmt_mem(ops[0])}) = g_fp_control_word;"
+                return [f"MEMW16({_fmt_mem(ops[0])}, g_fp_control_word);"
                         f" /* fnstcw {insn.op_str} */"]
             if ops and ops[0].type == "reg":
                 return [_fmt_set_reg(ops[0].reg, "g_fp_control_word")
@@ -3114,6 +3226,22 @@ def lift_basic_block(lifter, bb, flag_state=None):
                 i += 1
                 continue
 
+        # fcmovcc st(0), st(i): conditional x87 move on the integer flags.
+        # MSVC's fmin/fmax intrinsics are "fcom; fnstsw ax; test ah,1;
+        # fcmovne" -- as a bare comment they returned the wrong operand.
+        if curr.mnemonic.startswith("fcmov") and last_flag_setter:
+            fcc = curr.mnemonic[5:]
+            jcc = {"e": "je", "ne": "jne", "b": "jb", "nb": "jae",
+                   "be": "jbe", "nbe": "ja", "u": "jp", "nu": "jnp"}.get(fcc)
+            cond = _make_condition(jcc, last_flag_setter, last_flag_ops) if jcc else None
+            if cond:
+                mm = re.search(r"st\(?(\d+)\)?\s*$", curr.op_str)
+                idx = int(mm.group(1)) if mm else 1
+                stmts.append(f"if ({cond[0]}) fp_top() = fp_st({idx});"
+                             f" /* {curr.mnemonic} {curr.op_str} */")
+                i += 1
+                continue
+
         # NEG sets CF when its operand is nonzero. Preserve that value when
         # a later SBB/ADC consumes it, skipping over EFLAGS-preserving
         # instructions (e.g. neg eax; push edi; sbb eax, eax).
@@ -3169,10 +3297,14 @@ def lift_basic_block(lifter, bb, flag_state=None):
             # repe cmpsb/repne scasb = comparison, sets flags
             rest = curr.op_str.strip() if hasattr(curr, 'op_str') else ""
             raw_m = curr.mnemonic
-            if "cmpsb" in raw_m or "scasb" in raw_m:
+            # All widths: `repe cmpsd` is how MSVC compares GUIDs, and the
+            # `sete` after it read stale flags when only the byte forms were
+            # tracked -- DirectSound's QueryInterface then handed back the
+            # wrong interface for every IID.
+            if any(k in raw_m for k in ("cmps", "scas")):
                 last_flag_setter = raw_m
                 last_flag_ops = list(curr.operands)
-            elif "cmpsb" in rest or "scasb" in rest:
+            elif any(k in rest for k in ("cmps", "scas")):
                 last_flag_setter = raw_m
                 last_flag_ops = list(curr.operands)
             else:

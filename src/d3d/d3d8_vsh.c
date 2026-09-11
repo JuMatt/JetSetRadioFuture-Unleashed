@@ -18,6 +18,7 @@
  */
 
 #include "d3d8_internal.h"
+#include <stdlib.h>
 #include "d3d8_vsh.h"
 #include <d3dcompiler.h>
 #include <string.h>

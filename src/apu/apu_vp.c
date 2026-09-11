@@ -20,6 +20,7 @@
  */
 
 #include "apu_state.h"
+#include <string.h>
 #include "fpconv.h"
 
 /* #define DEBUG_MCPX */
@@ -180,6 +181,37 @@ static void set_hrir_coeff_tar(MCPXAPUState *d, int channel, int coeff_idx,
 
 static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 {
+    /* RECOMP_APU_TRACE=1: what the title is asking the audio hardware to do.
+     *
+     * "There is no sound" splits at this line. If VOICE_ON never appears, the
+     * title never asked for a sound and the bug is upstream of the hardware
+     * entirely; if it appears and the mix is still silent, the bug is in this
+     * file. Counted rather than printed per call -- DirectSound issues these
+     * by the thousand. */
+    {
+        static int trace = -1;
+        static int64_t last_ms;
+        static unsigned n_on, n_off, n_cfg, n_other, n_total;
+        if (trace < 0) trace = getenv("RECOMP_APU_TRACE") ? 1 : 0;
+        if (trace) {
+            int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+            n_total++;
+            if (method == NV1BA0_PIO_VOICE_ON) n_on++;
+            else if (method == NV1BA0_PIO_VOICE_OFF) n_off++;
+            else if (method >= NV1BA0_PIO_SET_VOICE_CFG_VBIN
+                  && method < NV1BA0_PIO_SET_VOICE_CFG_VBIN + 0x100) n_cfg++;
+            else n_other++;
+            if (!last_ms) last_ms = now;
+            if (now - last_ms >= 2000) {
+                fprintf(stderr, "  [APU-FE] %u methods: VOICE_ON %u, VOICE_OFF "
+                        "%u, voice cfg %u, other %u\n",
+                        n_total, n_on, n_off, n_cfg, n_other);
+                fflush(stderr);
+                last_ms = now;
+            }
+        }
+    }
+
     unsigned int slot;
 
     d->regs[NV_PAPU_FEDECMETH] = method;
@@ -578,9 +610,33 @@ void mcpx_apu_vp_write(void *opaque, hwaddr addr, uint64_t val,
 static hwaddr get_data_ptr(hwaddr sge_base, unsigned int max_sge, uint32_t addr)
 {
     unsigned int entry = addr / TARGET_PAGE_SIZE;
+    uint32_t prd_address;
     assert(entry <= max_sge);
-    uint32_t prd_address =
-        ldl_le_phys(address_space_memory, sge_base + entry * 4 * 2);
+    prd_address = ldl_le_phys(address_space_memory, sge_base + entry * 4 * 2);
+
+    /*
+     * RECOMP_APU_ADDR=1: what a voice's buffer address actually translates to.
+     *
+     * A voice's base address is virtual and goes through this scatter-gather
+     * table. If the table is empty -- because the base register was never set,
+     * or the title filled it somewhere this emulation does not see -- then
+     * every lookup returns zero and the voice plays whatever is at physical
+     * zero. That is not silence: it is the kernel data area, which has enough
+     * structure in it to come out as a constant-amplitude buzz with a short
+     * repeating period. Which is exactly what this title's one active voice
+     * sounds like.
+     */
+    { static int on = -1, said;
+      if (on < 0) on = getenv("RECOMP_APU_ADDR") ? 1 : 0;
+      if (on && said < 8) {
+          said++;
+          fprintf(stderr, "  [APU-ADDR] sge table at %08X, entry %u -> "
+                  "%08X, virtual %08X -> physical %08X%s\n",
+                  (unsigned)sge_base, entry, prd_address, addr,
+                  (unsigned)(prd_address + addr % TARGET_PAGE_SIZE),
+                  prd_address ? "" : "   <- the table is empty here");
+          fflush(stderr);
+      } }
     return prd_address + addr % TARGET_PAGE_SIZE;
 }
 
@@ -770,6 +826,55 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
     uint32_t adpcm_block[36 * 2 / 4];
     int16_t adpcm_decoded[65 * 2];
 
+    /* RECOMP_APU_VOICE=1: what this voice is pointed at.
+     *
+     * A voice that decodes silence has either been given no data or been given
+     * an address this decoder reads wrongly, and the two look the same from
+     * the mix. The base address plus a peak of the bytes actually there tells
+     * them apart in one line. */
+    {
+        static int trace = -1;
+        static int64_t last_ms[MCPX_HW_MAX_VOICES];
+        if (trace < 0) trace = getenv("RECOMP_APU_VOICE") ? 1 : 0;
+        if (trace && v < MCPX_HW_MAX_VOICES) {
+            int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+            if (now - last_ms[v] >= 1000) {
+                uint32_t base = (uint32_t)(ba & 0x03FFFFFF);
+                int k, pk = 0;
+                for (k = 0; k < 256; k++) {
+                    int a = (int16_t)((uint16_t)d->ram_ptr[base + 2 * k]
+                          | ((uint16_t)d->ram_ptr[base + 2 * k + 1] << 8));
+                    if (a < 0) a = -a;
+                    if (a > pk) pk = a;
+                }
+                fprintf(stderr, "  [VOICE %3u] ba=%08X cbo=%u ebo=%u %s%s"
+                        "  bytes-at-ba peak %d  fmt: %s %s %uch spb=%u%s\n",
+                        v, (unsigned)ba, cbo, ebo,
+                        stream ? "stream" : "buffer", paused ? " PAUSED" : "",
+                        pk,
+                        /* The three fields that decide how the bytes at ba are
+                         * read. A voice decoded in the wrong container size or
+                         * the wrong sample type produces full-scale noise at a
+                         * constant amplitude, which is exactly what this one
+                         * produces -- 737 distinct values in 8192 samples,
+                         * repeating every 256. */
+                        (voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_CFG_FMT,
+                                        NV_PAVS_VOICE_CFG_FMT_DATA_TYPE)
+                         ? "adpcm" : "pcm"),
+                        (const char *[]){ "8-bit", "16-bit", "adpcm-container", "32-bit" }
+                          [voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_CFG_FMT,
+                                          NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE) & 3],
+                        (unsigned)(1 + voice_get_mask(d, (uint16_t)v,
+                                        NV_PAVS_VOICE_CFG_FMT,
+                                        NV_PAVS_VOICE_CFG_FMT_MULTIPASS)),
+                        samples_per_block,
+                        loop ? " loop" : "");
+                fflush(stderr);
+                last_ms[v] = now;
+            }
+        }
+    }
+
     voice_set_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_STATE,
                    NV_PAVS_VOICE_PAR_STATE_NEW_VOICE, 0);
 
@@ -869,6 +974,41 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
             }
         } else {
             hwaddr addr;
+            /* RECOMP_APU_SRC=<file>: the bytes this voice is reading, once.
+             *
+             * The mixed output is noise, the address translation is correct,
+             * and the voice's format says plain 16-bit PCM. That leaves two
+             * possibilities that look identical from the speakers: the title
+             * wrote nonsense into its ring buffer -- which would make this a
+             * recompilation bug in the title's own audio decoder rather than
+             * anything to do with the emulated APU -- or it wrote audio and
+             * this reads it with the wrong stride. Dumping what is actually
+             * there separates them: audio is smooth from one sample to the
+             * next, and nothing else is. */
+            { static int done; const char *pth;
+              if (!done) {
+                  pth = getenv("RECOMP_APU_SRC");
+                  if (pth && !stream && ebo > 4096) {
+                      done = 1;
+                      FILE *f = fopen(pth, "wb");
+                      if (f) {
+                          uint32_t q;
+                          for (q = 0; q < 65536; q += 2) {
+                              hwaddr a = get_data_ptr(d->regs[NV_PAPU_VPSGEADDR],
+                                                      0xFFFFFFFF, ba + q);
+                              uint16_t w = (uint16_t)lduw_le_phys(
+                                               address_space_memory, a);
+                              fwrite(&w, 2, 1, f);
+                          }
+                          fclose(f);
+                          fprintf(stderr, "  [APU] wrote 64 KB of voice %u's "
+                                  "buffer (ba=%08X, %u-byte container, "
+                                  "stride %u) to %s\n", v, (unsigned)ba,
+                                  (unsigned)container_size,
+                                  (unsigned)block_size, pth);
+                      }
+                  }
+              } }
             if (stream) {
                 addr = segment_offset + cbo * block_size;
             } else {
@@ -1127,6 +1267,38 @@ static void voice_process(MCPXAPUState *d,
                                      NV_PAVS_VOICE_CFG_HRTF_TARGET_HANDLE);
         if (hrtf_handle != HRTF_NULL_HANDLE) {
             hrtf_filter_process(&d->vp.filters[v].hrtf, samples, samples);
+        }
+    }
+
+    /* RECOMP_APU_VOICE=1: where a voice's sound is lost.
+     *
+     * An active voice that produces silence has three quite different causes
+     * -- it decoded nothing, it decoded something and the envelope is at zero,
+     * or it decoded something at full envelope and every mixbin gain is zero
+     * -- and from the encode processor's output they are indistinguishable.
+     * Printed once a second per voice, so a running title stays readable. */
+    {
+        static int trace = -1;
+        static int64_t last_ms[MCPX_HW_MAX_VOICES];
+        if (trace < 0) trace = getenv("RECOMP_APU_VOICE") ? 1 : 0;
+        if (trace && v < MCPX_HW_MAX_VOICES) {
+            int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+            if (now - last_ms[v] >= 1000) {
+                float pk = 0.0f;
+                int i, b;
+                for (i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+                    float a = samples[i][0] < 0 ? -samples[i][0] : samples[i][0];
+                    if (a > pk) pk = a;
+                }
+                fprintf(stderr, "  [VOICE %3u] decoded peak %.4f  envelope %.4f"
+                        "  bins/vols", v, (double)pk, (double)ea_value);
+                for (b = 0; b < 8; b++)
+                    fprintf(stderr, " %u:%.3f", bin[b],
+                            (double)attenuate(vol[b]));
+                fprintf(stderr, "\n");
+                fflush(stderr);
+                last_ms[v] = now;
+            }
         }
     }
 

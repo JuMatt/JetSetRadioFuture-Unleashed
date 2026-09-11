@@ -9,6 +9,7 @@ Implements multi-pass function detection with confidence scoring:
 5. Cross-validation and overlap resolution
 """
 
+import re
 import bisect
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
@@ -143,6 +144,17 @@ class FunctionDetector:
         # bodies exist: the test is whether the target lands in a gap, which
         # needs the gaps to be known. One rebuild picks up what it finds.
         if self._pass_imm_ref_targets(sections):
+            self.functions.clear()
+            self._build_functions(sections)
+
+        # A table-referenced address in a gap that decodes as a prologue is a
+        # function start on the same evidence the gap-prologue pass accepts.
+        # It has to come first: JSRF's sub_0007B8D0 is reached only through a
+        # vtable, so its 0x340-byte body was a gap when the gap-prologue scan
+        # ran, and that scan claimed the `push ebx` after its first early
+        # return as a function of its own -- which then clamped the real
+        # function to 108 bytes and stubbed its forward branches.
+        if self._pass_data_ptr_prologues(sections):
             self.functions.clear()
             self._build_functions(sections)
 
@@ -299,6 +311,57 @@ class FunctionDetector:
             return
 
         va_start = section.virtual_addr
+
+        # MSVC's SEH/EH frame prologue, which a function using __try or C++
+        # exception handling opens with instead of (or as well as) the ebp
+        # frame:
+        #
+        #     mov eax, fs:[0]      64 A1 00 00 00 00
+        #     push -1              6A FF
+        #     push <handler>       68 xx xx xx xx
+        #     push eax             50
+        #     mov fs:[0], esp      64 89 25 00 00 00 00
+        #
+        # and the older ordering (push -1; push handler; mov eax, fs:[0];
+        # push eax; mov fs:[0], esp). The first form has no `push ebp`, so
+        # nothing else recognises it; JSRF's sub_00080BD0 (an object's
+        # per-frame update, reached only through a vtable) was found only as
+        # a conditional-branch orphan, and its body was then a gap that the
+        # immediate-reference pass could claim a "function" inside of. A
+        # pushbuffer method header that happened to equal 0x817BC did exactly
+        # that: it split the function 0x98 bytes before its epilogue, which
+        # became a stub, and every call leaked the whole 64-byte frame.
+        #
+        # The second form usually follows `push ebp; mov ebp, esp`, which the
+        # loop below already claims; it only counts here when it does not.
+        seh_a = re.compile(rb'\x64\xa1\x00\x00\x00\x00\x6a\xff\x68....\x50'
+                           rb'\x64\x89\x25\x00\x00\x00\x00', re.S)
+        seh_b = re.compile(rb'\x6a\xff\x68....\x64\xa1\x00\x00\x00\x00\x50'
+                           rb'\x64\x89\x25\x00\x00\x00\x00', re.S)
+        # Either form can also follow an ebp frame -- `push ebp; mov ebp,
+        # esp; and esp, -8; push -1 ...` is how MSVC aligns a frame that
+        # holds doubles -- so the byte before matters: a function start is
+        # preceded by padding or by the previous function's ret or jmp, never
+        # by an instruction that falls into it.
+        def falls_in_from_above(addr: int) -> bool:
+            for back in range(1, 16):
+                prev = self.engine.get_instruction(addr - back)
+                if prev is None or prev.end_address != addr:
+                    continue
+                return not (prev.is_ret or prev.is_jump
+                            or prev.mnemonic in ("int3", "nop", "hlt"))
+            return False
+
+        for pat, form in ((seh_a, "seh_prologue"), (seh_b, "seh_prologue_alt")):
+            for m in pat.finditer(data):
+                off = m.start()
+                addr = va_start + off
+                if addr not in self.engine.instructions:
+                    continue
+                if falls_in_from_above(addr):
+                    continue
+                self._add_candidate(addr, config.CONFIDENCE_PROLOGUE, form)
+
         i = 0
         while i < len(data) - 2:
             # Check for push ebp; mov ebp, esp
@@ -547,7 +610,10 @@ class FunctionDetector:
             return any(lo <= addr < hi for lo, hi in code_ranges)
 
         targets = set()
+        cond_targets = set()
         for insn in self.engine.instructions.values():
+            if insn.is_cond_jump and insn.jump_target is not None:
+                cond_targets.add(insn.jump_target)
             target = insn.imm_ref
             if target is None or target in self.functions:
                 continue
@@ -555,8 +621,32 @@ class FunctionDetector:
                 continue
             targets.add(target)
 
+        def mid_flow(addr: int) -> bool:
+            """Is `addr` plainly the middle of some function's control flow?
+
+            An immediate can collide with a code address by accident -- a
+            pushbuffer method header (count << 18 | method) is a small
+            integer that looks exactly like a .text address, and JSRF's
+            0x000817BC landed 0x98 bytes before the epilogue of a function
+            the earlier passes had not found. A conditional branch never
+            targets a function start, and code that simply falls into the
+            address from the instruction before is not a start either. Both
+            are cheap to check and either rules the address out.
+            """
+            if addr in cond_targets:
+                return True
+            for back in range(1, 16):
+                prev = self.engine.get_instruction(addr - back)
+                if prev is None or prev.end_address != addr:
+                    continue
+                return not (prev.is_ret or prev.is_jump
+                            or prev.mnemonic in ("int3", "nop", "hlt"))
+            return False
+
         found = 0
         for target in sorted(targets):
+            if mid_flow(target):
+                continue
             # A ret, not merely a terminator: an immediate is weak evidence,
             # so the probe has to reject data that happens to disassemble. The
             # cap also keeps a wrong guess from walking the rest of the section.
@@ -638,6 +728,54 @@ class FunctionDetector:
 
         added = self._pass_cond_branch_orphans(bodies, starts) or added
         return added
+
+    def _pass_data_ptr_prologues(self, sections: List[SectionInfo]) -> bool:
+        """Data-table code pointers that land in a gap on a real prologue.
+
+        The full data-pointer pass below deliberately makes aliases, not
+        starts, because most table targets are interior entry points. A
+        target that sits in unclaimed code and begins with a recognisable
+        prologue is different: nothing else can own those bytes, so making it
+        a start cannot split anything, and it stops the gap-prologue scan from
+        carving a function out of the middle of its body.
+        """
+        code_ranges = [(sec.virtual_addr, sec.virtual_addr + sec.virtual_size)
+                       for sec in sections]
+        code_names = {sec.name for sec in sections}
+        bounds = sorted((f.start, f.end) for f in self.functions.values())
+        starts = [b[0] for b in bounds]
+
+        def in_a_gap(addr: int) -> bool:
+            i = bisect.bisect_right(starts, addr) - 1
+            return not (i >= 0 and addr < bounds[i][1])
+
+        added = 0
+        seen = set()
+        for sec in self.image.sections:
+            if sec.name in code_names:
+                continue
+            data = self.image.get_section_data(sec)
+            if not data:
+                continue
+            for off in range(0, len(data) - 3, 4):
+                value = int.from_bytes(data[off:off + 4], "little")
+                if value in seen or value in self._candidates:
+                    continue
+                seen.add(value)
+                if not any(lo <= value < hi for lo, hi in code_ranges):
+                    continue
+                if not in_a_gap(value):
+                    continue
+                if value not in self.engine.instructions:
+                    continue
+                if not self.engine.probes_as_prologue(value):
+                    continue
+                self._add_candidate(value, config.CONFIDENCE_CC_BOUNDARY,
+                                    "data_ptr_prologue")
+                added += 1
+        if added:
+            print(f"  {added} table-referenced prologue(s) in gaps promoted to functions")
+        return added > 0
 
     def _pass_data_ptr_targets(self, sections: List[SectionInfo]) -> bool:
         """
@@ -754,8 +892,14 @@ class FunctionDetector:
                 first = self.engine.instructions[target]
                 if first.mnemonic.lower() in ("int3", "nop"):
                     continue
-                if not self.engine.probes_as_function_body(target,
-                                                           max_insns=64):
+                # A body probe gives up after 64 instructions, which a large
+                # method with loops never satisfies -- JSRF's DirectSound
+                # vtable entry 0x00173DB0 (a 700-byte reader) was dropped and
+                # every indirect call to it landed on its neighbour. A
+                # recognisable prologue after padding is the same evidence.
+                if not (self.engine.probes_as_function_body(target,
+                                                            max_insns=64)
+                        or self.engine.probes_as_prologue(target)):
                     continue
                 i = bisect.bisect_right(starts, target)
                 sec = self.image.get_section_at_va(target)

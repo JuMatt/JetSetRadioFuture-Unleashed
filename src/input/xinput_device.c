@@ -12,6 +12,98 @@
 
 #include "xinput_xbox.h"
 #include <string.h>
+#include <stdio.h>
+
+
+/* ---- scripted input ------------------------------------------------------
+ *
+ * A way to press buttons without hands.
+ *
+ * "Does it get past the title screen" cannot be answered by a headless run,
+ * and answering it by hand means a person watching a window for two minutes
+ * every time something changes. RECOMP_AUTO_INPUT is a list of
+ * <seconds>:<button> pairs -- "12:start,16:a,20:a" -- each held for half a
+ * second at that point after the process starts.
+ *
+ * It overrides the real pad only while a press is due, so a controller in
+ * someone's hands still works alongside it.
+ */
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <time.h>
+
+typedef struct { double at; WORD buttons; BYTE analog_index; } ScriptedPress;
+
+static double input_now(void)
+{
+    static double t0 = -1.0;
+    struct timespec ts;
+    double now;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    now = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+    if (t0 < 0.0) t0 = now;
+    return now - t0;
+}
+
+/* Returns 1 if it filled pState, 0 to let the real pad answer. */
+static int input_script(DWORD port, XBOX_INPUT_STATE *pState)
+{
+    #define SCRIPT_MAX 16
+    static ScriptedPress press[SCRIPT_MAX];
+    static int n = -1;
+    static const double hold = 0.5;
+    double t;
+    int i;
+
+    if (n < 0) {
+        const char *spec = getenv("RECOMP_AUTO_INPUT");
+        n = 0;
+        if (spec) {
+            char buf[512], *p, *save = NULL;
+            snprintf(buf, sizeof buf, "%s", spec);
+            for (p = strtok_r(buf, ",", &save); p && n < SCRIPT_MAX;
+                 p = strtok_r(NULL, ",", &save)) {
+                char name[32] = "";
+                double at = 0.0;
+                if (sscanf(p, "%lf:%31s", &at, name) != 2) continue;
+                press[n].at = at;
+                press[n].buttons = 0;
+                press[n].analog_index = 0xFF;
+                if      (!strcmp(name, "start")) press[n].buttons = XBOX_GAMEPAD_START;
+                else if (!strcmp(name, "back"))  press[n].buttons = XBOX_GAMEPAD_BACK;
+                else if (!strcmp(name, "up"))    press[n].buttons = XBOX_GAMEPAD_DPAD_UP;
+                else if (!strcmp(name, "down"))  press[n].buttons = XBOX_GAMEPAD_DPAD_DOWN;
+                else if (!strcmp(name, "left"))  press[n].buttons = XBOX_GAMEPAD_DPAD_LEFT;
+                else if (!strcmp(name, "right")) press[n].buttons = XBOX_GAMEPAD_DPAD_RIGHT;
+                else if (!strcmp(name, "a"))     press[n].analog_index = XBOX_BUTTON_A;
+                else if (!strcmp(name, "b"))     press[n].analog_index = XBOX_BUTTON_B;
+                else continue;
+                n++;
+            }
+            fprintf(stderr, "[INPUT] scripted: %d press(es) from \"%s\"\n",
+                    n, spec);
+        }
+    }
+    if (!n || port != 0) return 0;
+
+    t = input_now();
+    for (i = 0; i < n; i++) {
+        if (t < press[i].at || t > press[i].at + hold) continue;
+        {
+            static int said[SCRIPT_MAX];
+            if (!said[i]) { said[i] = 1;
+                fprintf(stderr, "[INPUT] scripted press %d at %.1fs\n", i, t); }
+        }
+        memset(pState, 0, sizeof *pState);
+        pState->dwPacketNumber = (DWORD)(t * 1000.0);
+        pState->Gamepad.wButtons = press[i].buttons;
+        if (press[i].analog_index != 0xFF)
+            pState->Gamepad.bAnalogButtons[press[i].analog_index] = 255;
+        return 1;
+    }
+    return 0;
+}
 
 /* ======================================================================== */
 #if defined(_WIN32)
@@ -35,6 +127,7 @@ void xbox_InputInit(void)
 
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
+    if (pState && input_script(dwPort, pState)) return ERROR_SUCCESS;
     XINPUT_STATE xi_state;
     DWORD result;
 
@@ -114,7 +207,150 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
 }
 
 /* ======================================================================== */
-#else /* !_WIN32 */
+#elif defined(__APPLE__)
+/* ====================  Apple GameController backend  ==================== */
+/* ======================================================================== */
+
+/* The Objective-C half is in xinput_gc.m and speaks only plain C types --
+ * see the note at the top of that file for why the two cannot share a
+ * translation unit. */
+void nv_gc_init(void);
+int  nv_gc_poll(unsigned port, unsigned short *buttons,
+                unsigned char *analog, short *axes);
+
+/* Button bits as xinput_gc.m defines them. */
+#define GC_DPAD_UP    0x0001u
+#define GC_DPAD_DOWN  0x0002u
+#define GC_DPAD_LEFT  0x0004u
+#define GC_DPAD_RIGHT 0x0008u
+#define GC_START      0x0010u
+#define GC_BACK       0x0020u
+#define GC_LTHUMB     0x0040u
+#define GC_RTHUMB     0x0080u
+
+static BOOL  g_connected[XBOX_MAX_CONTROLLERS];
+static DWORD g_packet[XBOX_MAX_CONTROLLERS];
+
+void xbox_InputInit(void)
+{
+    nv_gc_init();
+}
+
+DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
+{
+    if (pState && input_script(dwPort, pState)) return ERROR_SUCCESS;
+    unsigned short btn = 0;
+    unsigned char analog[8];
+    short axes[4];
+    WORD out = 0;
+
+    if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
+        return ERROR_DEVICE_NOT_CONNECTED;
+
+    memset(pState, 0, sizeof(XBOX_INPUT_STATE));
+    memset(analog, 0, sizeof analog);
+    memset(axes, 0, sizeof axes);
+
+    int have_pad = nv_gc_poll((unsigned)dwPort, &btn, analog, axes);
+
+    /* The window's keyboard, merged in rather than instead.
+     *
+     * Someone with a pad in their hands and someone using the keyboard should
+     * both work, and a run with neither should behave exactly as before. So
+     * the keys are OR-ed over whatever the controller reported: nothing held
+     * changes nothing. Only available in a windowed run -- there is no
+     * keyboard to read otherwise -- so the symbol is weak. */
+    {
+        extern int nv_window_keys(unsigned short *b, unsigned char *a)
+            __attribute__((weak));
+        unsigned short kb = 0;
+        unsigned char ka[8] = { 0 };
+        if (nv_window_keys && dwPort == 0 && nv_window_keys(&kb, ka)) {
+            int i;
+            have_pad = 1;
+            if (kb & 0x0001u) out |= XBOX_GAMEPAD_DPAD_UP;
+            if (kb & 0x0002u) out |= XBOX_GAMEPAD_DPAD_DOWN;
+            if (kb & 0x0004u) out |= XBOX_GAMEPAD_DPAD_LEFT;
+            if (kb & 0x0008u) out |= XBOX_GAMEPAD_DPAD_RIGHT;
+            if (kb & 0x0010u) out |= XBOX_GAMEPAD_START;
+            if (kb & 0x0020u) out |= XBOX_GAMEPAD_BACK;
+            for (i = 0; i < 8; i++) if (ka[i]) analog[i] = ka[i];
+        }
+    }
+
+    if (!have_pad) {
+        g_connected[dwPort] = FALSE;
+        return ERROR_DEVICE_NOT_CONNECTED;
+    }
+
+    /* Say once, per port, that a pad turned up. Bluetooth pairing, macOS
+     * privacy prompts and the run loop all have to line up before this is
+     * true, and "the game does not respond to the controller" has too many
+     * possible causes to leave it unsaid. */
+    if (!g_connected[dwPort])
+        fprintf(stderr, "[PAD] controller %u connected\n", (unsigned)dwPort);
+    g_connected[dwPort] = TRUE;
+    pState->dwPacketNumber = ++g_packet[dwPort];
+
+    if (btn & GC_DPAD_UP)    out |= XBOX_GAMEPAD_DPAD_UP;
+    if (btn & GC_DPAD_DOWN)  out |= XBOX_GAMEPAD_DPAD_DOWN;
+    if (btn & GC_DPAD_LEFT)  out |= XBOX_GAMEPAD_DPAD_LEFT;
+    if (btn & GC_DPAD_RIGHT) out |= XBOX_GAMEPAD_DPAD_RIGHT;
+    if (btn & GC_START)      out |= XBOX_GAMEPAD_START;
+    if (btn & GC_BACK)       out |= XBOX_GAMEPAD_BACK;
+    if (btn & GC_LTHUMB)     out |= XBOX_GAMEPAD_LEFT_THUMB;
+    if (btn & GC_RTHUMB)     out |= XBOX_GAMEPAD_RIGHT_THUMB;
+    pState->Gamepad.wButtons = out;
+
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A]        = analog[0];
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_B]        = analog[1];
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_X]        = analog[2];
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_Y]        = analog[3];
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK]    = analog[4];
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_WHITE]    = analog[5];
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] = analog[6];
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] = analog[7];
+
+    pState->Gamepad.sThumbLX = axes[0];
+    pState->Gamepad.sThumbLY = axes[1];
+    pState->Gamepad.sThumbRX = axes[2];
+    pState->Gamepad.sThumbRY = axes[3];
+    return ERROR_SUCCESS;
+}
+
+DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
+{
+    /* Rumble goes through CoreHaptics here, which wants a haptic engine per
+     * controller and a running pattern rather than a motor speed. The game
+     * polls this every frame; reporting success and doing nothing keeps it
+     * happy until that engine exists. */
+    if (dwPort >= XBOX_MAX_CONTROLLERS || !pVibration)
+        return ERROR_DEVICE_NOT_CONNECTED;
+    return g_connected[dwPort] ? ERROR_SUCCESS : ERROR_DEVICE_NOT_CONNECTED;
+}
+
+BOOL xbox_InputIsConnected(DWORD dwPort)
+{
+    if (dwPort >= XBOX_MAX_CONTROLLERS) return FALSE;
+    return g_connected[dwPort];
+}
+
+DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags,
+                                XBOX_INPUT_CAPABILITIES *pCaps)
+{
+    (void)dwFlags;
+    if (dwPort >= XBOX_MAX_CONTROLLERS || !pCaps)
+        return ERROR_DEVICE_NOT_CONNECTED;
+    if (!g_connected[dwPort]) return ERROR_DEVICE_NOT_CONNECTED;
+    memset(pCaps, 0, sizeof(XBOX_INPUT_CAPABILITIES));
+    pCaps->Type    = 1;   /* gamepad */
+    pCaps->SubType = 1;
+    pCaps->Flags   = 0;
+    return ERROR_SUCCESS;
+}
+
+/* ======================================================================== */
+#else /* !_WIN32, !__APPLE__ */
 /* ====================  SDL2 GameController backend  ===================== */
 /* ======================================================================== */
 
@@ -148,6 +384,7 @@ void xbox_InputInit(void)
 
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
+    if (pState && input_script(dwPort, pState)) return ERROR_SUCCESS;
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
         return ERROR_DEVICE_NOT_CONNECTED;
 

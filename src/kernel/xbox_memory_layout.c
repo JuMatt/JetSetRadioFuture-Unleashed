@@ -13,10 +13,14 @@
  */
 
 #include "xbox_memory_layout.h"
+#include <stdlib.h>
+#include <unistd.h>
 #include "kernel.h"
 #include <stdio.h>
+#include <time.h>
 #include <string.h>
 #include <setjmp.h>
+#include <signal.h>
 
 /* XBE header field offsets (per xboxdevwiki.net/Xbe) */
 #define XBE_MAGIC_OFFSET        0x0000
@@ -648,7 +652,23 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
         *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
                                + g_memory_offset) = GetTickCount();
 
-        Sleep(0);  /* yield; the waiter is spinning on another core */
+        /* Yield -- or actually sleep, on a host with fewer cores than the
+         * runtime has busy threads. RECOMP_ACK_SLEEP_US=<n> (default 200 on
+         * POSIX) keeps this thread from eating a whole core; the pushbuffer
+         * ack latency it adds is well under a frame. */
+        {
+            static int us = -1;
+            if (us < 0) {
+                const char *e = getenv("RECOMP_ACK_SLEEP_US");
+#if defined(_WIN32)
+                us = e ? atoi(e) : 0;
+#else
+                us = e ? atoi(e) : 200;
+#endif
+            }
+            if (us > 0) { struct timespec ts = { 0, (long)us * 1000L }; nanosleep(&ts, NULL); }
+            else Sleep(0);
+        }
     }
     return 0;
 }
@@ -716,14 +736,94 @@ RECOMP_TLS uint32_t g_ebx = 0, g_esi = 0, g_edi = 0;
 extern volatile uint32_t g_icall_trace[16];
 extern volatile uint32_t g_icall_trace_idx;
 
+/*
+ * Both switches, and the repair.
+ *
+ * RECOMP_ABI_CHECK=1 turns the comparison on. RECOMP_ABI_RESTORE=1 also puts
+ * the three registers back, which is less papering over the bug than
+ * asserting what the architecture already promises: ebx, esi and edi are
+ * callee-saved under every convention this title uses, so a caller is
+ * entitled to find them unchanged, and a lifted callee that loses one has
+ * broken a contract rather than done something unusual. Restoring them turns
+ * a pointer that goes wrong several frames later into nothing at all -- and
+ * that is exactly the shape of the crash that kills a run in twenty: a table
+ * walk keeps its cursor in esi, calls a virtual on each entry, and one of
+ * those calls comes back with esi holding something else.
+ *
+ * A repair and not a cure: esp is deliberately left alone, because whether
+ * the callee or the caller pops the arguments is a property of the
+ * convention and there is no single right answer at the call site. A callee
+ * that returns with esp wrong has damaged its caller's stack, and the summary
+ * below is what names it so the lifter can be fixed properly.
+ */
+int g_recomp_abi_check;
+int g_recomp_abi_restore;
+uint64_t g_recomp_abi_repairs;      /* counted by the macro, not here */
+static uint64_t g_abi_events;
+
+enum { ABI_SLOTS = 32 };
+static uint32_t g_abi_seen[ABI_SLOTS];
+static uint64_t g_abi_hits[ABI_SLOTS];
+static int      g_abi_count;
+
+/* Printed from atexit and also every so often as the run goes.
+ *
+ * atexit alone is no use here: a run under test is killed rather than exited,
+ * and a killed process runs no atexit handlers, so the one line that says
+ * what the repair actually did was never seen. The periodic copy costs a
+ * comparison on a path that is already rare. */
+static void recomp_abi_summary(void)
+{
+    int i, j;
+    uint64_t save[ABI_SLOTS];
+    if (!g_abi_count)
+        return;
+    for (i = 0; i < g_abi_count; i++)
+        save[i] = g_abi_hits[i];
+    fprintf(stderr, "[ABI] %llu calls came back with a callee-saved register "
+                    "changed; %llu repaired. By callee:\n",
+            (unsigned long long)g_abi_events,
+            (unsigned long long)g_recomp_abi_repairs);
+    /* Ranked: one routine in a hot loop and twenty one-off oddities are the
+     * same list unsorted, and only the first is worth a morning. */
+    for (j = 0; j < g_abi_count && j < 12; j++) {
+        int best = -1;
+        for (i = 0; i < g_abi_count; i++)
+            if (g_abi_hits[i] && (best < 0 || g_abi_hits[i] > g_abi_hits[best]))
+                best = i;
+        if (best < 0) break;
+        fprintf(stderr, "        sub_%08X  %llu time(s)\n",
+                g_abi_seen[best], (unsigned long long)g_abi_hits[best]);
+        g_abi_hits[best] = 0;
+    }
+    for (i = 0; i < g_abi_count; i++)
+        g_abi_hits[i] = save[i];
+    fflush(stderr);
+}
+
+__attribute__((constructor))
+static void recomp_abi_switches(void)
+{
+    if (getenv("RECOMP_ABI_RESTORE")) {
+        g_recomp_abi_restore = 1;
+        g_recomp_abi_check = 1;
+    }
+    if (getenv("RECOMP_ABI_CHECK"))
+        g_recomp_abi_check = 1;
+    if (g_recomp_abi_check)
+        atexit(recomp_abi_summary);
+}
+
 void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
                               uint32_t edi0, uint32_t esp0)
 {
-    enum { SLOTS = 32 };
-    static uint32_t seen[SLOTS];
-    static uint64_t hits[SLOTS];
-    static int count;
+    enum { SLOTS = ABI_SLOTS };
+    uint32_t *seen = g_abi_seen;
+    uint64_t *hits = g_abi_hits;
+    int count = g_abi_count;
     int i;
+
+    g_abi_events++;
 
     for (i = 0; i < count; i++)
         if (seen[i] == va)
@@ -733,7 +833,7 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
             return;
         seen[count] = va;
         hits[count] = 0;
-        count++;
+        g_abi_count = ++count;
         fprintf(stderr, "[ABI] sub_%08X:%s%s%s%s\n"
                         "      ebx %08X->%08X esi %08X->%08X"
                         " edi %08X->%08X esp %08X->%08X\n",
@@ -759,6 +859,9 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
         fflush(stderr);
     }
     hits[i]++;
+    /* Every so often, not only at exit: see the note on recomp_abi_summary. */
+    if ((g_abi_events % 256) == 0)
+        recomp_abi_summary();
 }
 #endif
 
@@ -979,6 +1082,20 @@ volatile uint32_t g_icall_trace[16] = {0};
 volatile uint32_t g_icall_trace_idx = 0;
 volatile uint64_t g_icall_count = 0;
 
+/* Used only by the startup RAM probe below: a store that faults means the
+ * backing object is shorter than the mapping claims, and the probe wants to
+ * carry on past it rather than die. */
+static volatile sig_atomic_t g_ram_probe_failed;
+static sigjmp_buf g_ram_probe_jmp;
+
+static void ram_probe_handler(int s)
+{
+    (void)s;
+    g_ram_probe_failed = 1;
+    siglongjmp(g_ram_probe_jmp, 1);
+}
+
+
 BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 {
     DWORD old_protect;
@@ -1043,7 +1160,45 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             0,                      /* sentinel - let OS choose */
         };
 
-        for (int i = 0; try_bases[i] != 0 || i == 0; i++) {
+        /* The sentinel is a candidate, not a terminator: "let the OS choose"
+         * is the case that matters on a host where every fixed address is
+         * refused -- macOS reserves the whole low 4 GB of a 64-bit process,
+         * so all five hints fail there and the run has nothing but this.
+         * Nothing downstream needs a particular address; the layout is
+         * expressed as an offset from whatever we get. */
+        /*
+         * First, try to own the whole guest span outright.
+         *
+         * On macOS an address hint to mmap is not a hint, it is ignored: a
+         * probe asking for four different addresses got the same
+         * kernel-chosen one back every time. So the candidate walk below can
+         * never place anything where it wants there, and the tiled aperture
+         * at 0xF0000000 -- the window titles render through -- was refused on
+         * every run, which is not something the emulation can work around.
+         *
+         * Reserving four gigabytes and letting the kernel say where turns
+         * that around: inside a span this process owns, MAP_FIXED is not a
+         * gamble but a placement, and every mirror and aperture lands at its
+         * exact offset from the base. Nothing downstream wants a particular
+         * address -- the whole layout is expressed as an offset -- so where
+         * the kernel puts it does not matter.
+         */
+#if !defined(_WIN32)
+        {
+            void *span = win32_reserve_address_space(NULL, (size_t)0x100000000ULL);
+            if (span) {
+                g_memory_base = MapViewOfFileEx(g_mapping_handle,
+                                                FILE_MAP_ALL_ACCESS, 0, 0,
+                                                g_memory_size, span);
+                if (g_memory_base)
+                    fprintf(stderr, "  Guest address space: 4096 MB reserved"
+                                    " at %p\n", span);
+            }
+        }
+#endif
+
+        for (int i = 0; !g_memory_base
+                     && i < (int)(sizeof try_bases / sizeof try_bases[0]); i++) {
             LPVOID hint = try_bases[i] ? (LPVOID)try_bases[i] : NULL;
             g_memory_base = MapViewOfFileEx(
                 g_mapping_handle,
@@ -1073,6 +1228,82 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     }
 
     g_memory_offset = (uintptr_t)g_memory_base - XBOX_MAP_START;
+
+    /*
+     * Prove the RAM view is writable end to end.
+     *
+     * A native arm64 run kept dying with SIGBUS on an ordinary byte store
+     * about twenty-two megabytes into guest RAM -- and a byte store cannot be
+     * misaligned, so the fault code was not saying what it appeared to say.
+     * The two remaining explanations are a protection this process applied by
+     * accident and a mapping that is shorter than it claims, and one write per
+     * megabyte tells them apart in a few microseconds. Everything downstream
+     * assumes this window is sixty-four megabytes of writable memory; if it is
+     * not, saying so here is worth far more than the crash it becomes later.
+     */
+#if !defined(_WIN32)
+    {
+        struct sigaction sa, old_bus, old_segv;
+        volatile size_t off;
+
+        memset(&sa, 0, sizeof sa);
+        sa.sa_handler = ram_probe_handler;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGBUS, &sa, &old_bus);
+        sigaction(SIGSEGV, &sa, &old_segv);
+
+        for (off = 0; off < g_memory_size; off += 1024 * 1024) {
+            volatile unsigned char *p = (volatile unsigned char *)g_memory_base + off;
+            g_ram_probe_failed = 0;
+            if (sigsetjmp(g_ram_probe_jmp, 1) == 0) {
+                unsigned char saved = *p;
+                *p = 0xA5;
+                if (*p != 0xA5) g_ram_probe_failed = 1;
+                *p = saved;
+            }
+            if (g_ram_probe_failed) {
+                fprintf(stderr, "  WARNING: guest RAM is not writable from"
+                                " 0x%08X on (%zu of %zu MB usable) -- the"
+                                " backing object is short\n",
+                        (unsigned)(XBOX_MAP_START + off),
+                        off / (1024 * 1024), g_memory_size / (1024 * 1024));
+                break;
+            }
+        }
+        sigaction(SIGBUS, &old_bus, NULL);
+        sigaction(SIGSEGV, &old_segv, NULL);
+        if (!g_ram_probe_failed)
+            fprintf(stderr, "  Guest RAM: %zu MB writable end to end\n",
+                    g_memory_size / (1024 * 1024));
+    }
+#endif
+
+    /* Claim the rest of the guest's four gigabytes before anything else can.
+     *
+     * Everything above the base view sits at an exact offset from it: the RAM
+     * mirrors, the tiled aperture at 0xF0000000 that titles render through,
+     * and the device windows. Each of those was asking the kernel for its
+     * address and accepting a refusal, which on macOS is what the tiled
+     * aperture got every single run -- and a render target write to an
+     * unmapped page faults, so the console's normal way of drawing a frame
+     * did not work at all there.
+     *
+     * Reserving the span as unreadable pages turns those from requests into
+     * placements: the mappings that follow replace our own reservation rather
+     * than competing for territory. Unreadable rather than absent is also
+     * worth having on its own -- a guest pointer that strays into a hole now
+     * faults where it happened instead of landing on an unrelated host
+     * allocation.
+     *
+     * Best effort: on a host that will not give up the span, the individual
+     * mappings fall back to asking, exactly as before.
+     */
+#if !defined(_WIN32)
+    /* If the span above was taken, every window below is already inside
+     * territory this process owns and will be placed rather than requested.
+     * If it was not -- a host too fragmented for four contiguous gigabytes --
+     * the mirrors and apertures fall back to asking, exactly as before. */
+#endif
 
     /* Guest page zero: no access.
      *
@@ -1569,6 +1800,15 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
              * init. Until the DSP handshake is answered, the honest default is
              * the failure that gets further, with the correct behaviour one
              * variable away. */
+            if (getenv("RECOMP_AC97_READY_NOTRAP")) {
+                /* Codec-ready bit only, no MMIO trapping: for hosts without a
+                 * fault-based MMIO decoder (POSIX / ARM64). The DSP doorbell
+                 * is answered by RECOMP_APU_DSP_ACK instead. */
+                *(volatile uint32_t *)((char *)g_mcpx_memory
+                                       + MCPX_AC97_CODEC_STATUS)
+                    |= MCPX_AC97_CODEC_READY;
+                fprintf(stderr, "  AC97: codec reported ready (no MMIO trap)\n");
+            } else
             if (getenv("RECOMP_AC97_READY")) {
                 /* The APU's registers have to fault so they can be routed to
                  * the emulated APU, which is the half that answers the DSP
@@ -1922,6 +2162,7 @@ ptrdiff_t xbox_GetMemoryOffset(void)
  * No free support (bump-only for now).
  */
 static uint32_t g_heap_next = XBOX_HEAP_BASE;
+uint32_t g_heap_next_for_check(void) { return g_heap_next; }
 
 static int g_heap_alloc_count = 0;
 
@@ -1934,6 +2175,30 @@ static int g_heap_alloc_count = 0;
 static struct { uint32_t addr; uint32_t size; uint8_t free; }
     g_heap_blocks[XBOX_HEAP_MAX_BLOCKS];
 static int g_heap_block_count = 0;
+
+/* RECOMP_HEAP_CHECK=1: verify the block table after every operation --
+ * address order, no overlap, nothing past the bump pointer. */
+static void heap_check(const char *where)
+{
+    static int on = -1;
+    extern uint32_t g_heap_next_for_check(void);
+    if (on < 0) on = getenv("RECOMP_HEAP_CHECK") ? 1 : 0;
+    if (!on) return;
+    for (int i = 0; i < g_heap_block_count; i++) {
+        uint32_t a = g_heap_blocks[i].addr, e = a + g_heap_blocks[i].size;
+        int bad = 0;
+        if (g_heap_blocks[i].size == 0) bad = 1;
+        if (i + 1 < g_heap_block_count && e > g_heap_blocks[i + 1].addr) bad = 2;
+        if (e > g_heap_next_for_check()) bad = 3;
+        if (bad) {
+            fprintf(stderr, "[HEAPCHK] %s: block %d addr=%08X size=%u free=%d violates rule %d (next=%08X)\n",
+                    where, i, a, g_heap_blocks[i].size, g_heap_blocks[i].free, bad,
+                    i + 1 < g_heap_block_count ? g_heap_blocks[i + 1].addr : 0);
+            fflush(stderr);
+            abort();
+        }
+    }
+}
 
 /*
  * Simulated stacks for spawned threads.
@@ -1972,17 +2237,35 @@ uint32_t xbox_AllocThreadTib(void)
     /* XBOX_VA is scoped to the loader; the same arithmetic, spelled here. */
     #define TIB_VA(va) ((void *)((uintptr_t)(va) + g_memory_offset))
     const uint32_t tib_size = 0x40;
-    uint32_t tib, block, thread_data, total;
+    /* fs:[0x28] and what it points at.
+     *
+     * The TIB is copied wholesale so a new thread inherits the fields the
+     * title filled in, and that copy brought fs:[0x28] with it -- one RW
+     * engine context, at one address, for every thread. Everything hanging
+     * off a TIB is per-thread on the console, and this is no exception: six
+     * threads sharing one context is six threads overwriting each other's
+     * pointers in it, which surfaces as a wild address read out of it much
+     * later with nothing to connect it to the cause.
+     *
+     * Sized generously and zeroed, because what the engine keeps in there is
+     * not documented anywhere we can read; too much costs a few kilobytes per
+     * thread, too little costs a corruption that looks like something else. */
+    const uint32_t ctx_size = 0x100;      /* the fs:[0x28] structure */
+    const uint32_t rw_size  = 0x1000;     /* the data area it points at */
+    uint32_t tib, block, thread_data, total, ctx, rw;
 
     if (!g_tls_total)
         return 0;                    /* image has no TLS; nothing to copy */
 
     total = g_tls_total;
-    tib = xbox_HeapAlloc(tib_size + total + g_tls_thread_size, 16);
+    tib = xbox_HeapAlloc(tib_size + total + g_tls_thread_size
+                         + ctx_size + rw_size, 16);
     if (!tib)
         return 0;
     block       = tib + tib_size;
     thread_data = block + total;
+    ctx         = thread_data + g_tls_thread_size;
+    rw          = ctx + ctx_size;
 
     /* The TIB itself, copied so stack bounds and the fields the title filled
      * in are inherited, then the two that must not be. */
@@ -1993,6 +2276,19 @@ uint32_t xbox_AllocThreadTib(void)
     *(uint32_t *)TIB_VA(tib + 0x00) = 0xFFFFFFFFu;   /* own SEH chain    */
     *(uint32_t *)TIB_VA(block)      = thread_data;   /* slot 0           */
     *(uint32_t *)TIB_VA(tib + 0x04) = block + total; /* fs:[4], see above*/
+
+    /* This thread's own RW engine context, copied from the main thread's so
+     * any field the loader set is inherited, then repointed at its own data
+     * area. */
+    {
+        uint32_t main_ctx = *(const uint32_t *)TIB_VA(XBOX_TIB_MAIN + 0x28);
+        memset(TIB_VA(ctx), 0, ctx_size);
+        if (main_ctx)
+            memcpy(TIB_VA(ctx), TIB_VA(main_ctx), ctx_size);
+        memset(TIB_VA(rw), 0, rw_size);
+        *(uint32_t *)TIB_VA(ctx + 0x28) = rw;
+        *(uint32_t *)TIB_VA(tib + 0x28) = ctx;
+    }
 
     return tib;
     #undef TIB_VA
@@ -2104,11 +2400,14 @@ uint32_t xbox_ContiguousAllocatedBytes(void)
 }
 
 
+uint32_t g_heap_next_for_check(void);
+
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
 {
     uint32_t result;
 
     if (alignment < 4) alignment = 4;
+    heap_check("alloc-entry");
 
     /* Enforce minimum allocation size.
      * The Xbox D3D8 code sometimes computes resource sizes from GPU
@@ -2123,17 +2422,70 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
      * 48 MB in 4,726 allocations, and its second D3D CreateDevice then failed
      * with E_OUTOFMEMORY -- which the title reports by clearing
      * global_d3d_device, so the rasterizer asserts and startup stops. */
-    for (int i = 0; i < g_heap_block_count; i++) {
-        if (!g_heap_blocks[i].free || g_heap_blocks[i].size < size) {
-            continue;
+    /* Best fit over the free list, splitting the remainder off as its own
+     * free block. First-fit-whole-block was what ran before, and it handed a
+     * 16-byte request the first free block that fit -- a released 4 MB file
+     * buffer, say -- so the heap fragmented into a few huge "live" blocks
+     * holding tiny objects and JSRF's next 8 MB stage load found 45 MB in use
+     * and nothing contiguous. Blocks stay in address order (the split
+     * remainder is inserted right after its parent) so coalescing in
+     * xbox_HeapFree keeps working by index. */
+    {
+        int best = -1;
+        uint32_t best_waste = 0xFFFFFFFFu;
+        static int no_reuse = -1;
+        if (no_reuse < 0) no_reuse = getenv("RECOMP_HEAP_NO_REUSE") ? 1 : 0;
+        for (int i = 0; !no_reuse && i < g_heap_block_count; i++) {
+            uint32_t start, end, waste;
+            if (!g_heap_blocks[i].free || !g_heap_blocks[i].size)
+                continue;
+            start = (g_heap_blocks[i].addr + alignment - 1) & ~(alignment - 1);
+            end = g_heap_blocks[i].addr + g_heap_blocks[i].size;
+            if (start < g_heap_blocks[i].addr || start + size > end || start + size < start)
+                continue;
+            waste = g_heap_blocks[i].size - size;
+            if (waste < best_waste) { best_waste = waste; best = i; }
+            if (waste == 0) break;
         }
-        if (g_heap_blocks[i].addr & (alignment - 1)) {
-            continue;   /* wrong alignment for this request */
+        if (best >= 0) {
+            uint32_t start = (g_heap_blocks[best].addr + alignment - 1) & ~(alignment - 1);
+            uint32_t bend = g_heap_blocks[best].addr + g_heap_blocks[best].size;
+            uint32_t head = start - g_heap_blocks[best].addr;
+            uint32_t tail = bend - (start + size);
+            int idx = best;
+            if (head >= 16 && g_heap_block_count < XBOX_HEAP_MAX_BLOCKS) {
+                /* leading alignment slack stays free, block moves after it */
+                memmove(&g_heap_blocks[best + 2], &g_heap_blocks[best + 1],
+                        (size_t)(g_heap_block_count - best - 1) * sizeof g_heap_blocks[0]);
+                g_heap_block_count++;
+                g_heap_blocks[best].size = head;
+                g_heap_blocks[best].free = 1;
+                idx = best + 1;
+                g_heap_blocks[idx].addr = start;
+                g_heap_blocks[idx].size = size + tail;
+                g_heap_blocks[idx].free = 1;
+            } else if (head) {
+                /* too small to track: absorb into this block */
+                size += head;
+                start = g_heap_blocks[best].addr;
+                tail = bend - (start + size);
+            }
+            if (tail >= 16 && g_heap_block_count < XBOX_HEAP_MAX_BLOCKS) {
+                memmove(&g_heap_blocks[idx + 2], &g_heap_blocks[idx + 1],
+                        (size_t)(g_heap_block_count - idx - 1) * sizeof g_heap_blocks[0]);
+                g_heap_block_count++;
+                g_heap_blocks[idx + 1].addr = start + size;
+                g_heap_blocks[idx + 1].size = tail;
+                g_heap_blocks[idx + 1].free = 1;
+                g_heap_blocks[idx].size = size;
+            }
+            g_heap_blocks[idx].addr = start;
+            g_heap_blocks[idx].free = 0;
+            result = start;
+            memset((void *)((uintptr_t)result + g_memory_offset), 0, g_heap_blocks[idx].size);
+            heap_check("alloc-reuse");
+            return result;
         }
-        g_heap_blocks[i].free = 0;
-        result = g_heap_blocks[i].addr;
-        memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
-        return result;
     }
 
     /* Align the next pointer */
@@ -2143,6 +2495,23 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
         fprintf(stderr, "xbox_HeapAlloc: out of memory (requested %u, used %u/%u)\n",
                 size, g_heap_next - XBOX_HEAP_BASE,
                 (unsigned)(XBOX_HEAP_TOP - XBOX_HEAP_BASE));
+        /* A request larger than the console ever had is not an exhausted heap,
+         * it is a corrupt size -- and then the block histogram below answers a
+         * question nobody asked. What is wanted is who asked for it, so scan
+         * the caller's stack for code addresses and name the callers. */
+        if (size > (XBOX_HEAP_TOP - XBOX_HEAP_BASE)) {
+            const uint32_t *sp = (const uint32_t *)((uint8_t *)g_xbox_mem_offset
+                                                    + g_esp);
+            int i, shown = 0;
+            fprintf(stderr, "  request exceeds the whole heap: corrupt size."
+                            " Guest callers:\n");
+            for (i = 0; i < 400 && shown < 24; i++)
+                if (sp[i] > 0x11000 && sp[i] < 0x1C4000) {
+                    fprintf(stderr, "    [esp+%03X] %08X\n", i * 4, sp[i]);
+                    shown++;
+                }
+            fflush(stderr);
+        }
         /* Who ate the heap? Group live blocks by size -- an exhausted heap is
          * nearly always one request size repeated, and the count names it. */
         {
@@ -2236,6 +2605,7 @@ void xbox_HeapFree(uint32_t xbox_va)
     if (!xbox_va) {
         return;
     }
+    heap_check("free-entry");
     frees++;
     if (frees <= 8) {
         fprintf(stderr, "  [HEAP] free #%d va=0x%08X blocks=%d\n",
@@ -2253,21 +2623,31 @@ void xbox_HeapFree(uint32_t xbox_va)
             fflush(stderr);
         }
 
-        /* Coalesce with neighbours. Blocks are recorded in bump order, so
-         * index order is address order and adjacency is a simple end==start
-         * test. Keeps large contiguous requests satisfiable after a lot of
-         * small churn. */
+        /* Coalesce with neighbours. Blocks are kept in address order, so
+         * adjacency is an end==start test on the next/previous entry. Merged
+         * entries are removed from the table (not zeroed in place -- a zeroed
+         * entry between two free blocks used to stop them ever merging). */
         if (i + 1 < g_heap_block_count && g_heap_blocks[i + 1].free &&
             g_heap_blocks[i].addr + g_heap_blocks[i].size == g_heap_blocks[i + 1].addr) {
             g_heap_blocks[i].size += g_heap_blocks[i + 1].size;
-            g_heap_blocks[i + 1].size = 0;
-            g_heap_blocks[i + 1].addr = 0;
+            memmove(&g_heap_blocks[i + 1], &g_heap_blocks[i + 2],
+                    (size_t)(g_heap_block_count - i - 2) * sizeof g_heap_blocks[0]);
+            g_heap_block_count--;
         }
         if (i > 0 && g_heap_blocks[i - 1].free &&
             g_heap_blocks[i - 1].addr + g_heap_blocks[i - 1].size == g_heap_blocks[i].addr) {
             g_heap_blocks[i - 1].size += g_heap_blocks[i].size;
-            g_heap_blocks[i].size = 0;
-            g_heap_blocks[i].addr = 0;
+            memmove(&g_heap_blocks[i], &g_heap_blocks[i + 1],
+                    (size_t)(g_heap_block_count - i - 1) * sizeof g_heap_blocks[0]);
+            g_heap_block_count--;
+            i--;
+        }
+        /* A free block at the very top of the bump region gives its space
+         * back to the bump pointer, so big requests can come from there. */
+        if (i == g_heap_block_count - 1 &&
+            g_heap_blocks[i].addr + g_heap_blocks[i].size == g_heap_next) {
+            g_heap_next = g_heap_blocks[i].addr;
+            g_heap_block_count--;
         }
         return;
     }

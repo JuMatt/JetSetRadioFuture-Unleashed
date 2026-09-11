@@ -20,6 +20,8 @@
  */
 
 #include "apu_state.h"
+#include <stdlib.h>
+#include <string.h>
 #include "apu.h"
 #include "apu_xaudio2.h"
 #include "fpconv.h"
@@ -274,37 +276,80 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         return;
     }
 
-    /* XAudio2 path: render and submit a buffer */
+    /* XAudio2 / CoreAudio path: submit the frame the APU just finished.
+     *
+     * This used to memset frame_buf before filling it -- which erased the
+     * only thing in it that the title had actually produced. The voice
+     * processor decodes JSRF's four active voices into mixbins, the encode
+     * processor writes those mixbins into frame_buf across its eight
+     * sub-frames, and this function then ran a moment later and zeroed all 256
+     * samples of it before submitting them. What reached the speakers was the
+     * software mixer alone, which serves the DirectSound shim and is empty for
+     * a title that drives the hardware APU: the emulated console was making
+     * sound correctly and every sample of it was being thrown away.
+     *
+     * So: submit what is there, and add the test tone and the software mixer
+     * on top rather than in place of it. mixer_render already accumulates.
+     *
+     * The length is the frame the encode processor fills, not the output
+     * device's buffer size -- submitting 512 samples from a 256-sample buffer
+     * sent the second half twice. */
     if (xa2_is_active()) {
-        int buf_size = xa2_get_buffer_size();
-        int16_t xa2_tmp[1024][2];  /* matches XA2_BUF_SAMPLES max */
-        int remaining = buf_size;
-        int out_offset = 0;
+        int chunk = MIXER_FRAME_SAMPLES;
 
-        while (remaining > 0) {
-            int chunk = (remaining < MIXER_FRAME_SAMPLES) ? remaining : MIXER_FRAME_SAMPLES;
-            memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
-
-            if (g_test_tone.active && !g_audio_muted) {
-                for (int i = 0; i < chunk; i++) {
-                    int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
-                    d->monitor.frame_buf[i][0] = s;
-                    d->monitor.frame_buf[i][1] = s;
-                    g_test_tone.phase += g_test_tone.phase_inc;
-                    if (g_test_tone.phase >= 2.0 * M_PI)
-                        g_test_tone.phase -= 2.0 * M_PI;
-                }
+        if (g_test_tone.active && !g_audio_muted) {
+            for (int i = 0; i < chunk; i++) {
+                int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
+                int32_t l = d->monitor.frame_buf[i][0] + s;
+                int32_t r = d->monitor.frame_buf[i][1] + s;
+                d->monitor.frame_buf[i][0] = (int16_t)(l > 32767 ? 32767 : l < -32768 ? -32768 : l);
+                d->monitor.frame_buf[i][1] = (int16_t)(r > 32767 ? 32767 : r < -32768 ? -32768 : r);
+                g_test_tone.phase += g_test_tone.phase_inc;
+                if (g_test_tone.phase >= 2.0 * M_PI)
+                    g_test_tone.phase -= 2.0 * M_PI;
             }
-
-            if (!g_audio_muted)
-                mixer_render(d->monitor.frame_buf, chunk);
-
-            memcpy(xa2_tmp + out_offset, d->monitor.frame_buf, chunk * 2 * sizeof(int16_t));
-            out_offset += chunk;
-            remaining -= chunk;
         }
 
-        xa2_submit_samples((const int16_t *)xa2_tmp, buf_size);
+        /* RECOMP_MUTE=1 silences the output.
+         *
+         * The voice processor is decoding something wrongly -- one voice, a
+         * peak of exactly 9882 every second on two different machines, which
+         * is a waveform repeating rather than a mix -- and until that is fixed
+         * the sound is worse than no sound. The APU keeps running: muting here
+         * rather than at the source keeps the timing the title sees identical,
+         * so this changes nothing except what reaches the speakers. */
+        { static int mute = -1;
+          if (mute < 0) mute = getenv("RECOMP_MUTE") ? 1 : 0;
+          if (mute) g_audio_muted = 1; }
+
+        if (g_audio_muted)
+            memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+        else
+            mixer_render(d->monitor.frame_buf, chunk);
+
+        /* RECOMP_APU_STATS says whether anything is actually in it. "The
+         * audio device opened" and "the audio device is playing sound" are
+         * different claims and only one of them is worth making. */
+        { static int stats = -1; static int64_t last_ms; static int peak;
+          int i;
+          if (stats < 0) stats = getenv("RECOMP_APU_STATS") ? 1 : 0;
+          if (stats) {
+              int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+              for (i = 0; i < chunk; i++) {
+                  int a = d->monitor.frame_buf[i][0];
+                  if (a < 0) a = -a;
+                  if (a > peak) peak = a;
+              }
+              if (!last_ms) last_ms = now;
+              if (now - last_ms >= 1000) {
+                  fprintf(stderr, "[APU] output peak %d/32767 (%s)\n", peak,
+                          peak ? "audible" : "SILENT");
+                  fflush(stderr);
+                  last_ms = now; peak = 0;
+              }
+          } }
+
+        xa2_submit_samples((const int16_t *)d->monitor.frame_buf, chunk);
         return;
     }
 
@@ -409,6 +454,12 @@ static void se_frame(MCPXAPUState *d)
     if (elapsed_ms >= 1000) {
         g_dbg.utilization = 1.0f - d->sleep_acc_us / (elapsed_ms * 1000.0f);
         g_dbg.frames_processed = (int)(d->frame_count * 1000.0 / elapsed_ms + 0.5);
+        if (getenv("RECOMP_APU_STATS")) {
+            int na = 0, i;
+            for (i = 0; i < 256; i++) na += g_dbg.vp.v[i].active ? 1 : 0;
+            fprintf(stderr, "[APU] %d frames/s, %d voices active\n",
+                    g_dbg.frames_processed, na);
+        }
         d->frame_count_time_ms = now_ms;
         d->frame_count = 0;
         d->sleep_acc_us = 0;
@@ -419,7 +470,8 @@ static void se_frame(MCPXAPUState *d)
     float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
     memset(mixbins, 0, sizeof(mixbins));
 
-    mcpx_apu_vp_frame(d, mixbins);
+    { static int no_vp = -1; if (no_vp < 0) no_vp = getenv("RECOMP_APU_NO_VP") ? 1 : 0;
+      if (!no_vp) mcpx_apu_vp_frame(d, mixbins); }
     mcpx_apu_dsp_frame(d, mixbins);
     mcpx_apu_monitor_frame(d);
 
@@ -463,6 +515,8 @@ static void *mcpx_apu_frame_thread(void *arg)
             se_frame(d);
         } else {
             /* Lightweight: just monitor frame (test tone + software mixer) */
+            extern void mcpx_apu_dsp_ack_tick(MCPXAPUState *d);
+            mcpx_apu_dsp_ack_tick(d);
             mcpx_apu_monitor_frame(d);
             d->ep_frame_div++;
         }
@@ -557,6 +611,11 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     qemu_thread_create(&d->apu_thread, "mcpx.apu_thread",
                        mcpx_apu_frame_thread, d, QEMU_THREAD_JOINABLE);
     mcpx_apu_wait_for_idle(d);
+    /* On hosts without MMIO trapping nothing will ever resume the APU from
+     * the register path, and a paused frame thread cannot answer the DSP
+     * doorbell. Run it from the start unless a trap-capable host says not to. */
+    if (!getenv("RECOMP_APU_START_PAUSED"))
+        mcpx_apu_resume(d);
     qemu_mutex_unlock(&d->lock);
 
     fprintf(stderr, "[APU] MCPX APU initialized (standalone)\n");

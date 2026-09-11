@@ -551,6 +551,12 @@ class DisasmEngine:
                     return True
                 if nxt.mnemonic == "lea" and nxt.op_str.startswith("ebp,"):
                     return True
+                # A frameless function that saves ebp as just another
+                # callee-saved register: `push ebp; push esi` ... JSRF's ADX
+                # decoder callback at 0x0013B750 opens this way and, reached
+                # only through a function-pointer table, was otherwise invisible.
+                if nxt.mnemonic == "push" and nxt.op_str in ("esi", "edi", "ebx"):
+                    return True
             return False
 
         if m == "push" and ops in ("esi", "edi", "ebx"):
@@ -583,6 +589,25 @@ class DisasmEngine:
                 third = list(self._cs.disasm(
                     data[offset:offset + 24], addr, count=3))
                 if len(third) > 2 and third[2].mnemonic == "call":
+                    return True
+
+        # The C++ exception frame MSVC 7 emits at the top of a function with
+        # unwindable locals:
+        #
+        #     push -1                  (or a small state index)
+        #     push <__ehhandler$>      immediate
+        #     mov eax, fs:[0]
+        #
+        # JSRF's sub_0007BE30 is reached only through a vtable and opens this
+        # way; the sweep had drifted across the jump table before it and
+        # decoded `00 90 90 90 90 6a` as one instruction over its first byte.
+        if m == "push" and (ops == "-1" or ops.startswith("0x")) and len(insns) > 1:
+            nxt = insns[1]
+            if nxt.mnemonic == "push" and nxt.op_str.startswith("0x"):
+                third = list(self._cs.disasm(
+                    data[offset:offset + 24], addr, count=3))
+                if (len(third) > 2 and third[2].mnemonic == "mov"
+                        and "fs:[0]" in third[2].op_str.replace(" ", "")):
                     return True
 
         return False

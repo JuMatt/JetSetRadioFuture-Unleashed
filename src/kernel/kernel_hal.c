@@ -12,6 +12,7 @@
  */
 
 #include "kernel.h"
+#include <string.h>
 #if defined(_WIN32)
 #include <intrin.h>
 #endif

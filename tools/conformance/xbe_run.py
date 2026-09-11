@@ -149,7 +149,7 @@ def _decode_at(data, sections, cs, va):
     return Func(va, end, data[off:off + (end - va)], bool(plain), calls, ok)
 
 
-def scan(data, sections, cs):
+def scan(data, sections, cs, extra_seeds=()):
     """Every function we can decode, reached from a prologue or from a call.
 
     Seeding only from `push ebp; mov ebp, esp` finds the framed functions and
@@ -171,6 +171,7 @@ def scan(data, sections, cs):
             seeds.append(sec.va + pos)
             pos += 1
 
+    seeds.extend(extra_seeds)
     funcs, todo, seen = {}, list(seeds), set(seeds)
     while todo:
         va = todo.pop()
@@ -205,9 +206,9 @@ def admissible(funcs):
     return ok
 
 
-def find_candidates(data, sections, limit, cs):
+def find_candidates(data, sections, limit, cs, extra_seeds=()):
     """(entries to call, every function to lift, entry -> its call closure)."""
-    funcs = scan(data, sections, cs)
+    funcs = scan(data, sections, cs, extra_seeds)
     ok = admissible(funcs)
     # Only a plain-`ret` function can be called from C: a stdcall callee cleans
     # argument bytes we would have to guess. Callees may be either -- the

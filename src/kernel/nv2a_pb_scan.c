@@ -1,3 +1,4 @@
+#include <stddef.h>
 /*
  * Read-only survey of the pushbuffer a title submits.
  *
@@ -43,14 +44,35 @@ static uint32_t s_tot_words, s_tot_unknown, s_tot_jumps, s_tot_segments;
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 extern void nv2a_pb_exec_report(void);
 static int s_exec_enabled = -1;
+static int s_scan_enabled = -1;
+
+/* An index from (subchannel, method) straight to the inventory slot.
+ *
+ * This function used to walk the inventory looking for the pair, and it runs
+ * on every word of the pushbuffer -- two million a second on this title, times
+ * up to two hundred entries scanned. Measured on an M2 Pro, the pushbuffer
+ * walk was 84% of the frame and this was most of it: an inventory kept for
+ * diagnostics was costing more than the emulated GPU.
+ *
+ * A method is 13 bits and always 4-aligned, a subchannel is 3, so the pair
+ * fits in a 14-bit index and the lookup is one load. Thirty-two kilobytes.
+ */
+#define PB_INDEX_BITS 14
+static int16_t s_seen_index[1 << PB_INDEX_BITS];
+static int     s_seen_index_ready;
 
 static void note(uint32_t subch, uint32_t method)
 {
-    for (int i = 0; i < s_seen_count; i++) {
-        if (s_seen[i].method == method && s_seen[i].subch == subch) {
-            s_seen[i].count++;
-            return;
-        }
+    uint32_t key;
+
+    if (!s_seen_index_ready) {
+        memset(s_seen_index, 0xFF, sizeof s_seen_index);   /* -1 everywhere */
+        s_seen_index_ready = 1;
+    }
+    key = ((subch & 7u) << 11) | ((method >> 2) & 0x7FFu);
+    if (s_seen_index[key] >= 0) {
+        s_seen[s_seen_index[key]].count++;
+        return;
     }
     if (s_seen_count >= PB_MAX_METHODS) {
         /* Silently dropping past the cap is how a truncated inventory reads as
@@ -67,6 +89,7 @@ static void note(uint32_t subch, uint32_t method)
         s_seen[s_seen_count].method = method;
         s_seen[s_seen_count].subch  = subch;
         s_seen[s_seen_count].count  = 1;
+        s_seen_index[key] = (int16_t)s_seen_count;
         s_seen_count++;
     }
 }
@@ -130,7 +153,7 @@ void nv2a_pb_scan_report(void)
 
     if (s_exec_enabled > 0)
         nv2a_pb_exec_report();
-    if (!s_seen_count || !getenv("RECOMP_PB_SCAN"))
+    if (!s_seen_count || s_scan_enabled <= 0)
         return;
     fprintf(stderr, "[PB] %u segments, %u words, %u jumps, %u unrecognised"
                     " -- %d distinct (subchannel, method) pairs\n",
@@ -149,10 +172,28 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
     uint32_t va = start_va;
     uint32_t words = 0, jumps = 0, unknown = 0;
 
+    /* Both read once. This runs on every pushbuffer segment the title submits
+     * -- thousands a second -- and getenv walks the environment doing a string
+     * compare per entry every time it is called. */
     if (s_exec_enabled < 0)
         s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
-    if (!(getenv("RECOMP_PB_SCAN") || s_exec_enabled) || end_va <= start_va)
+    if (s_scan_enabled < 0)
+        s_scan_enabled = getenv("RECOMP_PB_SCAN") != NULL;
+    if (!(s_scan_enabled || s_exec_enabled) || end_va <= start_va)
         return;
+
+    /*
+     * How much of the frame this walk costs.
+     *
+     * The GL profile accounts for the GL calls and the vertex decode and finds
+     * 94% of the frame somewhere else. The two remaining candidates are this
+     * -- walking the pushbuffer and running every method through the backend's
+     * state machine -- and the recompiled guest code itself, and they are
+     * indistinguishable from the frame rate. One clock pair per segment
+     * measures it without the measurement becoming the cost: a segment is
+     * hundreds of methods.
+     */
+    { extern void nv2a_pb_time_begin(void); nv2a_pb_time_begin(); }
     if (end_va - start_va > 0x400000u)        /* a sane single-frame bound */
         end_va = start_va + 0x400000u;
 
@@ -175,7 +216,9 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
 
             for (uint32_t i = 0; i < count && va < end_va; i++) {
                 uint32_t m = noninc ? method : method + i * 4;
-                note(subch, m);
+                /* The inventory is only ever printed under RECOMP_PB_SCAN, so
+                 * when nobody is going to read it, do not build it. */
+                if (s_scan_enabled) note(subch, m);
                 /* Same walk, two consumers: the survey counts, the executor
                  * acts. Keeping them on one decode means they can never
                  * disagree about what the stream said. */
@@ -194,4 +237,5 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
     s_tot_unknown += unknown;
     s_tot_jumps += jumps;
     s_tot_segments++;
+    { extern void nv2a_pb_time_end(unsigned methods); nv2a_pb_time_end(words); }
 }

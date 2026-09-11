@@ -209,13 +209,39 @@ extern RECOMP_TLS uint32_t g_seh_ebp;
  * now run on real host threads, so a read-modify-write that races is exactly
  * the bug these instructions exist to prevent.
  */
+/* Alignment: x86 permits a lock-prefixed operation on any address, and ARM
+ * does not. The exclusive-load instructions clang lowers __sync_* to fault
+ * with SIGBUS on a misaligned pointer, and JSRF does exactly that -- a locked
+ * read-modify-write two bytes into a dword -- within the first two hundred
+ * draws of the native arm64 build. Since the guest genuinely relies on these
+ * being atomic across its threads, the unaligned case takes a lock rather
+ * than giving up atomicity; a striped array so that the common aligned path
+ * and two unrelated unaligned addresses do not serialise against each other.
+ */
+uint32_t recomp_atomic_add32_unaligned(void *p, uint32_t v);
+uint32_t recomp_atomic_cas32_unaligned(void *p, uint32_t cmp, uint32_t val);
+
 #if defined(_MSC_VER)
 #include <intrin.h>
-#define RECOMP_ATOMIC_ADD32(p, v)     ((uint32_t)_InterlockedExchangeAdd((volatile long *)(p), (long)(v)))
-#define RECOMP_ATOMIC_CAS32(p, cmp, val)     ((uint32_t)_InterlockedCompareExchange((volatile long *)(p),                                            (long)(val), (long)(cmp)))
+#define RECOMP_ATOMIC_ADD32(p, v) \
+    (((uintptr_t)(p) & 3u) \
+     ? recomp_atomic_add32_unaligned((void *)(p), (uint32_t)(v)) \
+     : (uint32_t)_InterlockedExchangeAdd((volatile long *)(p), (long)(v)))
+#define RECOMP_ATOMIC_CAS32(p, cmp, val) \
+    (((uintptr_t)(p) & 3u) \
+     ? recomp_atomic_cas32_unaligned((void *)(p), (uint32_t)(cmp), (uint32_t)(val)) \
+     : (uint32_t)_InterlockedCompareExchange((volatile long *)(p), \
+                                             (long)(val), (long)(cmp)))
 #else
-#define RECOMP_ATOMIC_ADD32(p, v)     ((uint32_t)__sync_fetch_and_add((volatile uint32_t *)(p), (uint32_t)(v)))
-#define RECOMP_ATOMIC_CAS32(p, cmp, val)     ((uint32_t)__sync_val_compare_and_swap((volatile uint32_t *)(p),                                            (uint32_t)(cmp), (uint32_t)(val)))
+#define RECOMP_ATOMIC_ADD32(p, v) \
+    (((uintptr_t)(p) & 3u) \
+     ? recomp_atomic_add32_unaligned((void *)(p), (uint32_t)(v)) \
+     : (uint32_t)__sync_fetch_and_add((volatile uint32_t *)(p), (uint32_t)(v)))
+#define RECOMP_ATOMIC_CAS32(p, cmp, val) \
+    (((uintptr_t)(p) & 3u) \
+     ? recomp_atomic_cas32_unaligned((void *)(p), (uint32_t)(cmp), (uint32_t)(val)) \
+     : (uint32_t)__sync_val_compare_and_swap((volatile uint32_t *)(p), \
+                                             (uint32_t)(cmp), (uint32_t)(val)))
 #endif
 
 #include <setjmp.h>
@@ -251,6 +277,42 @@ extern RECOMP_TLS int g_fp_cmp;
  * followed by `test ah, 0x44; jp` is how this era's CRT asks "is this a NaN",
  * and collapsing it to "equal" answers no every time. */
 #define RECOMP_FCMP(a, b)     (((a) != (a) || (b) != (b)) ? 2 : (a) < (b) ? -1 : (a) > (b) ? 1 : 0)
+
+/* fist/fistp with x87 semantics: the control word's rounding mode decides
+ * the integer, and anything unrepresentable (NaN, out of range) stores the
+ * "integer indefinite" 0x80..0 rather than whatever the host cast gives
+ * (ARM64 saturates, and returns 0 for NaN). Rounding-control bits 10-11:
+ * 0 nearest-even, 1 down, 2 up, 3 toward zero. */
+static inline double recomp_fp_round_cw(double v) {
+    switch ((g_fp_control_word >> 10) & 3) {
+    case 1:  return floor(v);
+    case 2:  return ceil(v);
+    case 3:  return trunc(v);
+    default: return rint(v);
+    }
+}
+static inline int64_t recomp_fist64(double v) {
+    double r;
+    if (v != v) return (int64_t)0x8000000000000000ull;
+    r = recomp_fp_round_cw(v);
+    if (r >= 9223372036854775808.0 || r < -9223372036854775808.0)
+        return (int64_t)0x8000000000000000ull;
+    return (int64_t)r;
+}
+static inline int32_t recomp_fist32(double v) {
+    double r;
+    if (v != v) return (int32_t)0x80000000u;
+    r = recomp_fp_round_cw(v);
+    if (r >= 2147483648.0 || r < -2147483648.0) return (int32_t)0x80000000u;
+    return (int32_t)r;
+}
+static inline int16_t recomp_fist16(double v) {
+    double r;
+    if (v != v) return (int16_t)0x8000;
+    r = recomp_fp_round_cw(v);
+    if (r >= 32768.0 || r < -32768.0) return (int16_t)0x8000;
+    return (int16_t)r;
+}
 
 /* ================================================================
  * ICALL trace ring buffer (for debugging indirect calls)
@@ -313,11 +375,62 @@ void recomp_icall_not_code_log(uint32_t va);
 uint64_t xbox_ReadTimeStampCounter(void);
 
 void recomp_trace_enter(const char *name, uint32_t va);
-#define RECOMP_TRACE_ENTER(name, va) recomp_trace_enter((name), (va))
 void recomp_trace_exit(const char *name, uint32_t va);
-#define RECOMP_TRACE_EXIT(name, va) recomp_trace_exit((name), (va))
 void recomp_trace_esp(const char *name, const char *tag);
-#define RECOMP_TRACE_ESP(name, tag) recomp_trace_esp((name), (tag))
+
+/*
+ * The cost of a hook that is switched off.
+ *
+ * These three sit on every recompiled function -- one at entry, one at exit,
+ * one after every call -- and they used to be unconditional calls into
+ * another translation unit. A recompiled title makes tens of millions of
+ * function calls a second, so "a call that returns immediately" is not free
+ * at all: it is a call, an argument setup, a thread-local lookup inside
+ * (which on Darwin is another call), a weak-symbol hook that cannot be
+ * inlined or elided, and two static-local checks, on every one of them. The
+ * profile put three quarters of a frame in "the recompiled guest itself",
+ * and a good part of that was this.
+ *
+ * Gated here instead, where the compiler can see the gate: the common case is
+ * a load, a test and a not-taken branch. The slow paths are unchanged and
+ * still say everything they said before, they simply are not entered.
+ *
+ * g_recomp_tick is deliberately a plain global rather than thread-local. It
+ * decides only how often a thread offers to give up its time slice, so a lost
+ * increment moves a slice boundary by a few microseconds and nothing else --
+ * and a thread-local would cost more than the thing being counted.
+ */
+/* Portable "this branch is the rare one". MSVC has no __builtin_expect, and
+ * this header is meant to compile there too. */
+#if defined(__GNUC__) || defined(__clang__)
+#  define RECOMP_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+#  define RECOMP_UNLIKELY(x) (x)
+#endif
+
+extern unsigned g_recomp_tick;
+extern int      g_recomp_hooks;
+extern int      g_recomp_fpcheck;
+void recomp_slice_check(void);
+void recomp_fp_enter(uint32_t va);
+void recomp_fp_exit(uint32_t va);
+
+#define RECOMP_TRACE_ENTER(name, va) do { \
+    if (RECOMP_UNLIKELY((++g_recomp_tick & 0xFFu) == 0u)) \
+        recomp_slice_check(); \
+    if (RECOMP_UNLIKELY(g_recomp_fpcheck != 0)) recomp_fp_enter((va)); \
+    if (RECOMP_UNLIKELY(g_recomp_hooks != 0)) \
+        recomp_trace_enter((name), (va)); \
+} while (0)
+#define RECOMP_TRACE_EXIT(name, va) do { \
+    if (RECOMP_UNLIKELY(g_recomp_fpcheck != 0)) recomp_fp_exit((va)); \
+    if (RECOMP_UNLIKELY(g_recomp_hooks != 0)) \
+        recomp_trace_exit((name), (va)); \
+} while (0)
+#define RECOMP_TRACE_ESP(name, tag) do { \
+    if (RECOMP_UNLIKELY(g_recomp_hooks != 0)) \
+        recomp_trace_esp((name), (tag)); \
+} while (0)
 
 
 /* ================================================================
@@ -333,20 +446,96 @@ void recomp_trace_esp(const char *name, const char *tag);
  */
 #define XBOX_PTR(addr) ((uintptr_t)(uint32_t)(addr) + g_xbox_mem_offset)
 
-/** Read/write N bytes at a flat Xbox memory address. */
-#define MEM8(addr)   (*(volatile uint8_t  *)XBOX_PTR(addr))
-#define MEM16(addr)  (*(volatile uint16_t *)XBOX_PTR(addr))
-#define MEM32(addr)  (*(volatile uint32_t *)XBOX_PTR(addr))
+/* ---- Memory-mapped device registers ---------------------------------
+ *
+ * The lifted code reads and writes guest memory through the macros below.
+ * A device register is guest memory too, as far as the title is concerned,
+ * but a load or store there has to reach the device model (the APU's voice
+ * processor, say), not a byte in a mapping. Fault-based trapping is one way
+ * to do that; it is host-specific and needs an instruction decoder. This is
+ * the other: one range check on every access, and a slow path that calls
+ * recomp_mmio_read / recomp_mmio_write for the device window. Reads go
+ * through a pointer to a thread-local scratch so the macros stay
+ * expressions; writes are emitted by the lifter as MEMWxx(addr, value).
+ */
+#ifndef RECOMP_MMIO_LO
+#define RECOMP_MMIO_LO 0xFE800000u     /* MCPX APU ... */
+#define RECOMP_MMIO_HI 0xFEE00000u     /* ... the AC'97 controller and the
+                                        * two USB host controllers, which
+                                        * begin exactly at the old bound */
+#endif
+uint32_t recomp_mmio_read(uint32_t addr, unsigned size);
+void recomp_mmio_write(uint32_t addr, uint32_t val, unsigned size);
+
+#if defined(__GNUC__)
+#define RECOMP_MMIO_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+#define RECOMP_MMIO_UNLIKELY(x) (x)
+#endif
+#define RECOMP_IS_MMIO(a) RECOMP_MMIO_UNLIKELY(((uint32_t)(a) - RECOMP_MMIO_LO) < (RECOMP_MMIO_HI - RECOMP_MMIO_LO))
+
+static inline volatile uint8_t *recomp_p8(uint32_t a) {
+    static RECOMP_TLS uint8_t scr;
+    if (RECOMP_IS_MMIO(a)) { scr = (uint8_t)recomp_mmio_read(a, 1); return &scr; }
+    return (volatile uint8_t *)XBOX_PTR(a);
+}
+static inline volatile uint16_t *recomp_p16(uint32_t a) {
+    static RECOMP_TLS uint16_t scr;
+    if (RECOMP_IS_MMIO(a)) { scr = (uint16_t)recomp_mmio_read(a, 2); return &scr; }
+    return (volatile uint16_t *)XBOX_PTR(a);
+}
+static inline volatile uint32_t *recomp_p32(uint32_t a) {
+    static RECOMP_TLS uint32_t scr;
+    if (RECOMP_IS_MMIO(a)) { scr = recomp_mmio_read(a, 4); return &scr; }
+    return (volatile uint32_t *)XBOX_PTR(a);
+}
+static inline volatile uint64_t *recomp_p64(uint32_t a) {
+    static RECOMP_TLS uint64_t scr;
+    if (RECOMP_IS_MMIO(a)) {
+        scr = (uint64_t)recomp_mmio_read(a, 4) | ((uint64_t)recomp_mmio_read(a + 4, 4) << 32);
+        return &scr;
+    }
+    return (volatile uint64_t *)XBOX_PTR(a);
+}
+static inline void recomp_w8(uint32_t a, uint8_t v) {
+    if (RECOMP_IS_MMIO(a)) recomp_mmio_write(a, v, 1); else *(volatile uint8_t *)XBOX_PTR(a) = v;
+}
+static inline void recomp_w16(uint32_t a, uint16_t v) {
+    if (RECOMP_IS_MMIO(a)) recomp_mmio_write(a, v, 2); else *(volatile uint16_t *)XBOX_PTR(a) = v;
+}
+static inline void recomp_w32(uint32_t a, uint32_t v) {
+    if (RECOMP_IS_MMIO(a)) recomp_mmio_write(a, v, 4); else *(volatile uint32_t *)XBOX_PTR(a) = v;
+}
+static inline void recomp_wf(uint32_t a, float v) {
+    if (RECOMP_IS_MMIO(a)) { uint32_t b; memcpy(&b, &v, 4); recomp_mmio_write(a, b, 4); }
+    else *(volatile float *)XBOX_PTR(a) = v;
+}
+static inline void recomp_wd(uint32_t a, double v) {
+    if (RECOMP_IS_MMIO(a)) { uint64_t b; memcpy(&b, &v, 8); recomp_mmio_write(a, (uint32_t)b, 4); recomp_mmio_write(a + 4, (uint32_t)(b >> 32), 4); }
+    else *(volatile double *)XBOX_PTR(a) = v;
+}
+
+/** Read N bytes at a flat Xbox memory address (assignable for RAM only). */
+#define MEM8(addr)   (*recomp_p8((uint32_t)(addr)))
+#define MEM16(addr)  (*recomp_p16((uint32_t)(addr)))
+#define MEM32(addr)  (*recomp_p32((uint32_t)(addr)))
+
+/** Write N bytes: the form the lifter emits for every store. */
+#define MEMW8(addr, v)   recomp_w8((uint32_t)(addr), (uint8_t)(v))
+#define MEMW16(addr, v)  recomp_w16((uint32_t)(addr), (uint16_t)(v))
+#define MEMW32(addr, v)  recomp_w32((uint32_t)(addr), (uint32_t)(v))
+#define MEMWF(addr, v)   recomp_wf((uint32_t)(addr), (float)(v))
+#define MEMWD(addr, v)   recomp_wd((uint32_t)(addr), (double)(v))
 
 /** Signed memory reads. */
-#define SMEM8(addr)  (*(volatile int8_t   *)XBOX_PTR(addr))
-#define SMEM16(addr) (*(volatile int16_t  *)XBOX_PTR(addr))
-#define SMEM32(addr) (*(volatile int32_t  *)XBOX_PTR(addr))
-#define SMEM64(addr) (*(volatile int64_t  *)XBOX_PTR(addr))
+#define SMEM8(addr)  (*(volatile int8_t   *)recomp_p8((uint32_t)(addr)))
+#define SMEM16(addr) (*(volatile int16_t  *)recomp_p16((uint32_t)(addr)))
+#define SMEM32(addr) (*(volatile int32_t  *)recomp_p32((uint32_t)(addr)))
+#define SMEM64(addr) (*(volatile int64_t  *)recomp_p64((uint32_t)(addr)))
 
 /** Float/double memory access. */
-#define MEMF(addr)   (*(volatile float    *)XBOX_PTR(addr))
-#define MEMD(addr)   (*(volatile double   *)XBOX_PTR(addr))
+#define MEMF(addr)   (*(volatile float    *)recomp_p32((uint32_t)(addr)))
+#define MEMD(addr)   (*(volatile double   *)recomp_p64((uint32_t)(addr)))
 
 /* ================================================================
  * SSE / XMM register state
@@ -764,11 +953,34 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
 #ifdef RECOMP_ABI_CHECK
 void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
                               uint32_t edi0, uint32_t esp0);
+/* Runtime-switched as well as build-switched, and off unless RECOMP_ABI_CHECK
+ * is set in the environment. Reading and comparing four registers around
+ * every call in the title is a fine price for finding one clobbered callee
+ * and a poor one for the other several hundred million calls that will never
+ * clobber anything. */
+extern int g_recomp_abi_check;
+extern int g_recomp_abi_restore;
+extern uint64_t g_recomp_abi_repairs;
 #define RECOMP_ABI_CALL(va, fn) do { \
-    uint32_t _ab = g_ebx, _as = g_esi, _ad = g_edi, _ap = g_esp; \
-    (fn)(); \
-    if (g_ebx != _ab || g_esi != _as || g_edi != _ad || g_esp < _ap + 4) \
-        recomp_abi_violation_log((va), _ab, _as, _ad, _ap); \
+    if (RECOMP_UNLIKELY(g_recomp_abi_check != 0)) { \
+        uint32_t _ab = g_ebx, _as = g_esi, _ad = g_edi, _ap = g_esp; \
+        (fn)(); \
+        if (g_ebx != _ab || g_esi != _as || g_edi != _ad || g_esp < _ap + 4) { \
+            recomp_abi_violation_log((va), _ab, _as, _ad, _ap); \
+            /* Repaired only when the stack invariant held. A callee that \
+             * came back with esp BELOW where it started did not return at \
+             * all in the ordinary sense -- that is what a longjmp through \
+             * this frame looks like -- and a longjmp is entitled to change \
+             * these three registers, because restoring them is the whole \
+             * point of the setjmp it is returning to. */ \
+            if (g_recomp_abi_restore && g_esp >= _ap + 4) { \
+                g_ebx = _ab; g_esi = _as; g_edi = _ad; \
+                g_recomp_abi_repairs++; \
+            } \
+        } \
+    } else { \
+        (fn)(); \
+    } \
 } while(0)
 #else
 #define RECOMP_ABI_CALL(va, fn) (fn)()
@@ -804,6 +1016,10 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
     recomp_func_t _fn = recomp_lookup_manual(_va); \
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_kernel(_va); \
+    if (g_icall_verbose) { uint32_t _e0 = g_esp, _ra = MEM32(g_esp); \
+        if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); RECOMP_ABI_CALL(_va, _fn); } \
+        else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); recomp_icall_fail_log(_va); g_esp = (saved_esp); eax = 0; } \
+        recomp_icallv_record(_va, _e0, g_esp, eax, _ra); break; } \
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
                RECOMP_ABI_CALL(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
@@ -818,6 +1034,8 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
  * Use this when the caller pushes arguments that the callee would
  * normally clean up (stdcall convention).
  */
+extern int g_icall_verbose;
+void recomp_icallv_record(uint32_t va, uint32_t esp0, uint32_t esp1, uint32_t eax, uint32_t ra);
 #define RECOMP_ICALL_SAFE(xbox_va, saved_esp) do { \
     uint32_t _va = (uint32_t)(xbox_va); \
     g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
@@ -830,6 +1048,10 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
     recomp_func_t _fn = recomp_lookup_manual(_va); \
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_kernel(_va); \
+    if (g_icall_verbose) { uint32_t _e0 = g_esp, _ra = MEM32(g_esp); \
+        if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); RECOMP_ABI_CALL(_va, _fn); } \
+        else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); recomp_icall_fail_log(_va); g_esp = (saved_esp); eax = 0; } \
+        recomp_icallv_record(_va, _e0, g_esp, eax, _ra); break; } \
     if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
                RECOMP_ABI_CALL(_va, _fn); } \
     else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \

@@ -18,6 +18,9 @@
 #include "kernel.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>      /* getenv -- gcc lets an implicit declaration slide,
+                          * clang treats it as the C99 error it has been for
+                          * twenty-five years. */
 
 #if !defined(_WIN32)
 #include <fcntl.h>
@@ -28,6 +31,9 @@
 #include <dirent.h>
 #include <fnmatch.h>
 #endif
+#define XBOX_BYTES_PER_SECTOR       512u
+#define XBOX_SECTORS_PER_CLUSTER    32u      /* 512 * 32 = 16384 */
+
 
 /* Get the ANSI path from OBJECT_ATTRIBUTES (platform-independent). */
 static const char* get_xbox_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
@@ -481,8 +487,6 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
  * which reads as a title that did nothing rather than one that failed.
  *
  * Reporting the host's PC-typical 4 KB cluster (512 x 8) fails that check. */
-#define XBOX_BYTES_PER_SECTOR       512u
-#define XBOX_SECTORS_PER_CLUSTER    32u      /* 512 * 32 = 16384 */
 
 NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
@@ -687,6 +691,8 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
 /* ======================================================================== */
 #else /* !_WIN32 */
 /* ====================  POSIX backend  =================================== */
+uint32_t g_xbox_last_file_error;
+uint32_t xbox_LastFileError(void) { return g_xbox_last_file_error; }
 /* ======================================================================== */
 
 /* Convert Xbox access mask + disposition to POSIX open() flags. */
@@ -759,7 +765,11 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         return STATUS_INVALID_PARAMETER;
 
     const char* xbox_path = get_xbox_path(ObjectAttributes);
-    if (!xbox_path || !xbox_translate_path(xbox_path, host_path, MAX_PATH)) {
+    extern int g_xbox_translate_want_dir;
+    g_xbox_translate_want_dir = (CreateOptions & XBOX_FILE_DIRECTORY_FILE) ? 1 : 0;
+    BOOL tr = xbox_path && xbox_translate_path(xbox_path, host_path, MAX_PATH);
+    g_xbox_translate_want_dir = 0;
+    if (!tr) {
         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_FILE, "NtCreateFile: path translation failed");
         return STATUS_OBJECT_PATH_NOT_FOUND;
     }
@@ -775,12 +785,20 @@ NTSTATUS __stdcall xbox_NtCreateFile(
 
     if (fd < 0) {
         int e = errno;
-        XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile FAILED: %s (errno=%d)", host_path, e);
+        NTSTATUS st = errno_to_status(e);
+        /* FILE_DIRECTORY_FILE on something that exists but is a plain file:
+         * the console answers STATUS_NOT_A_DIRECTORY, and a title that probes
+         * "is this a folder?" that way needs to hear "no, it is a file" rather
+         * than "the path does not exist". */
+        if (e == ENOTDIR && (CreateOptions & XBOX_FILE_DIRECTORY_FILE))
+            st = 0xC0000103u;   /* STATUS_NOT_A_DIRECTORY */
+        fprintf(stderr, "  [FILE] open %s -> %s FAILED errno=%d opts=0x%X disp=%u -> 0x%08X\n",
+                xbox_path, host_path, e, CreateOptions, CreateDisposition, (unsigned)st);
         if (IoStatusBlock) {
-            IoStatusBlock->Status = STATUS_OBJECT_NAME_NOT_FOUND;
+            IoStatusBlock->Status = st;
             IoStatusBlock->Information = 0;
         }
-        return errno_to_status(e);
+        return st;
     }
 
     *FileHandle = w32_open_handle(fd, host_path);
@@ -788,9 +806,13 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         IoStatusBlock->Status = STATUS_SUCCESS;
         IoStatusBlock->Information = (CreateDisposition == XBOX_FILE_CREATE) ? 2 : 1;
     }
-    XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile: %s -> handle=%p", host_path, *FileHandle);
+    fprintf(stderr, "  [FILE] open %s -> %s (handle=%p, opts=0x%X)\n", xbox_path, host_path, *FileHandle, CreateOptions);
+    { extern void xbox_file_open_hook(const char *) __attribute__((weak));
+      if (xbox_file_open_hook) xbox_file_open_hook(xbox_path); }
     return STATUS_SUCCESS;
 }
+
+unsigned long long g_read_bytes, g_read_calls;
 
 NTSTATUS __stdcall xbox_NtReadFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
@@ -818,7 +840,29 @@ NTSTATUS __stdcall xbox_NtReadFile(
         return STATUS_UNSUCCESSFUL;
     }
 
+    /* A short read leaves the rest of the buffer as the title found it.
+     *
+     * On the console it is not: files sit on 2048-byte disc sectors, and a
+     * title that reads its file size rounded up to a sector -- which is the
+     * normal way to read a whole file on Xbox -- gets the sector padding,
+     * which is zero. Here it got whatever the heap block last held.
+     *
+     * JSRF reads Media/Progress/Progress.dat (27776 bytes) as 28160, parses
+     * a chunk table that runs to the end of *its* buffer, and built objects
+     * out of 384 bytes of a freed allocation: null vtables, a 3 GB malloc,
+     * and a wild pointer three frames later. Nothing in the trace pointed
+     * back to the read, because the read had succeeded.
+     *
+     * The count stays short, so a streaming loop still sees its EOF; only
+     * the bytes the title can see are made deterministic.
+     */
+    if ((ULONG)n < Length)
+        memset((uint8_t *)Buffer + n, 0, Length - (ULONG)n);
+
     IoStatusBlock->Information = (ULONG_PTR)n;
+    /* Counted so the periodic kernel summary can say whether a title sitting
+     * on a loading screen is loading. */
+    if (n > 0) { g_read_bytes += (unsigned long long)n; g_read_calls++; }
     if (n == 0 && Length > 0) {
         IoStatusBlock->Status = STATUS_END_OF_FILE;
         return STATUS_END_OF_FILE;
@@ -963,6 +1007,7 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
     int fd = w32_handle_fd(FileHandle);
     if (fd < 0)
         return STATUS_INVALID_HANDLE;
+    if (getenv("JSRF_DBG")) fprintf(stderr, "  [FILE] NtSetInformationFile class %d len %u fd %d\n", (int)FileInformationClass, (unsigned)Length, fd);
 
     switch (FileInformationClass) {
         case XboxFilePositionInformation: {
@@ -1028,6 +1073,14 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
                 ULONGLONG cs = (ULONGLONG)info->BytesPerSector * info->SectorsPerAllocationUnit;
                 ULONGLONG total = (ULONGLONG)vfs.f_blocks * vfs.f_frsize;
                 ULONGLONG avail = (ULONGLONG)vfs.f_bavail * vfs.f_frsize;
+                /* Report console-sized volumes, not the host's. A title does
+                 * its free-space arithmetic in 32 bits sized for a 750 MB
+                 * cache partition; a 29 GB host disk overflows it and JSRF's
+                 * cache builder concluded it had no room and looped looking
+                 * for a set to evict. */
+                #define XBOX_CACHE_PARTITION_BYTES 0x2EE00000ull   /* 750 MB */
+                if (total > XBOX_CACHE_PARTITION_BYTES) total = XBOX_CACHE_PARTITION_BYTES;
+                if (avail > total) avail = total;
                 info->TotalAllocationUnits.QuadPart = total / cs;
                 info->AvailableAllocationUnits.QuadPart = avail / cs;
             } else {
@@ -1181,6 +1234,10 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         memcpy(entry->FileName, de->d_name, name_len);
     IoStatusBlock->Status = STATUS_SUCCESS;
     IoStatusBlock->Information = header_size + name_len;
+    if (getenv("JSRF_DBG"))
+        fprintf(stderr, "  [DIR] %s: %s size=%lld attrs=0x%X (hdr %u, len %u)\n",
+                dpath ? dpath : "?", de->d_name, (long long)st.st_size,
+                (unsigned)entry->FileAttributes, (unsigned)header_size, Length);
     return STATUS_SUCCESS;
 }
 

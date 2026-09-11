@@ -86,6 +86,7 @@ extern uint32_t xbox_AllocThreadTib(void);
 #define INTR_SO                 0x00000001u   /* scheduling overrun          */
 #define INTR_WDH                0x00000002u   /* writeback done head         */
 #define INTR_SF                 0x00000004u   /* start of frame              */
+#define INTR_SF                 0x00000004u   /* start of frame              */
 #define INTR_RD                 0x00000008u   /* resume detected             */
 #define INTR_UE                 0x00000010u   /* unrecoverable error         */
 #define INTR_FNO                0x00000020u   /* frame number overflow       */
@@ -310,6 +311,7 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
 #define HCCA_DONE_HEAD 0x84
 
 static uint32_t g_setup_pending;      /* wLength of the last SETUP seen */
+static uint32_t g_setup_sent;   /* how much of the response has gone */
 static UsbSetup g_setup;
 
 /* Every address below came out of guest memory, so none of them are trusted.
@@ -321,11 +323,39 @@ static UsbSetup g_setup;
  * which is a crash the title itself would never have had. A device model
  * following a pointer a title left lying around has to check it first.
  */
+/*
+ * Where the driver's descriptors actually are.
+ *
+ * A host controller is a bus master: every pointer it follows -- the HCCA,
+ * the endpoint descriptors, the transfer descriptors, the buffers -- is a
+ * physical address, and the console's USB driver allocates them from
+ * contiguous memory, which this runtime places in its own sixty-four megabyte
+ * window at Xbox VA 0x80000000. The range check below compared against the
+ * size of RAM, so every one of those pointers was out of range and the
+ * controller read zero from all of them: it found a null control list and an
+ * empty interrupt table, forever, and reported no error because reading zero
+ * from an empty list is exactly what an idle controller does.
+ *
+ * The result was a port where a gamepad enumerates -- descriptors, address,
+ * configuration -- and is then never asked for a single report, which is why
+ * no button has ever reached this game. The diagnostic meant to catch it says
+ * "the guest is reading the pad" on the first report, so it printed nothing
+ * at all, in every log ever captured.
+ */
+#define OHCI_CONTIG_BASE 0x80000000u   /* kernel.h's XBOX_CONTIG_BASE, which
+                                        * this file does not include: the
+                                        * device models are built without the
+                                        * kernel's surface on purpose. */
+#define OHCI_CONTIG_SIZE (64u * 1024u * 1024u)
+
 static int guest_ok(uint32_t va, uint32_t bytes)
 {
     size_t mapped = xbox_GetMappedSize();
-    return va != 0 && mapped != 0
-        && (uint64_t)va + bytes <= (uint64_t)mapped;
+    if (va == 0)
+        return 0;
+    if (va >= OHCI_CONTIG_BASE)
+        return (uint64_t)(va - OHCI_CONTIG_BASE) + bytes <= OHCI_CONTIG_SIZE;
+    return mapped != 0 && (uint64_t)va + bytes <= (uint64_t)mapped;
 }
 
 static uint32_t rd32(uint32_t va)
@@ -368,6 +398,7 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
             g_setup.wIndex        = (uint16_t)(p[4] | (p[5] << 8));
             g_setup.wLength       = (uint16_t)(p[6] | (p[7] << 8));
             g_setup_pending = 1;
+            g_setup_sent = 0;
             if (s_trace) {
                 fprintf(stderr, "  [OHCI%d] SETUP %02X %02X value %04X "
                                 "index %04X len %u\n",
@@ -381,8 +412,8 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
         if (endpoint == 0) {
             /* Data stage of a control transfer, or its status stage when the
              * driver asks for nothing. */
-            uint8_t buf[64];
-            int n;
+            uint8_t buf[256];
+            int n, off, part;
 
             if (!g_setup_pending)
                 return TD_CC_NOERROR;
@@ -391,12 +422,31 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
                 g_setup_pending = 0;
                 return TD_CC_STALL;
             }
-            if (n > len) n = len;
-            if (n > 0 && guest_ptr(cbp, (uint32_t)n))
-                memcpy(guest_ptr(cbp, (uint32_t)n), buf, (size_t)n);
-            moved = n;
-            if (s_trace && n > 0) {
-                fprintf(stderr, "  [OHCI%d] IN ep0 %d bytes\n", hc->index, n);
+            /*
+             * A control response arrives in packets, and each packet is a
+             * descriptor of its own.
+             *
+             * The device's endpoint zero takes eight bytes at a time, so a
+             * thirty-two byte configuration descriptor is four transfer
+             * descriptors and the driver queues them one after another.
+             * Answering each one from the start of the response sends the
+             * first eight bytes four times, which the driver reads as a
+             * malformed descriptor -- and its recovery is to reset the port
+             * and enumerate again, so the symptom is a device that enumerates
+             * forever and never reaches its endpoints. How much has gone is
+             * the whole fix.
+             */
+            off = (int)g_setup_sent;
+            part = n - off;
+            if (part < 0) part = 0;
+            if (part > len) part = len;
+            if (part > 0 && guest_ptr(cbp, (uint32_t)part))
+                memcpy(guest_ptr(cbp, (uint32_t)part), buf + off, (size_t)part);
+            g_setup_sent += (uint32_t)part;
+            moved = part;
+            if (s_trace) {
+                fprintf(stderr, "  [OHCI%d] IN ep0 %d bytes (%u of %d)\n",
+                        hc->index, part, g_setup_sent, n);
                 fflush(stderr);
             }
         } else {
@@ -422,11 +472,20 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
 }
 
 /* Walk the control list once. Returns 1 if anything completed. */
-static int ohci_run_control_list(OhciController *hc)
+/*
+ * Walk one list of endpoint descriptors and move whatever is queued on them.
+ *
+ * Split out of ohci_run_control_list because the periodic list needs exactly
+ * the same walk: an ED list is an ED list, and the only thing that differs
+ * between the control list and the thirty-two interrupt lists is where the
+ * head pointer comes from. `done_head` and `completed` accumulate across
+ * calls, so one tick's worth of lists produces one done queue and one
+ * writeback-done interrupt rather than one per list.
+ */
+static void ohci_run_ed_list(OhciController *hc, uint32_t ed,
+                             uint32_t *done_head, int *completed)
 {
-    uint32_t ed = hc->reg[HcControlHeadED / 4] & ED_PTR_MASK;
-    uint32_t done_head = 0;
-    int completed = 0, guard = 0;
+    int guard = 0;
 
     while (guest_ok(ed, 16) && ++guard < 64) {
         uint32_t ed0  = rd32(ed);
@@ -446,9 +505,9 @@ static int ohci_run_control_list(OhciController *hc)
             /* Report the outcome where the driver reads it, then put the
              * descriptor on the done queue, newest first. */
             wr32(td, (rd32(td) & 0x0FFFFFFFu) | (cc << 28));
-            wr32(td + 8, done_head);
-            done_head = td;
-            completed++;
+            wr32(td + 8, *done_head);
+            *done_head = td;
+            (*completed)++;
 
             head = next | (head & ED_HEAD_TOGGLE);
             if (cc != TD_CC_NOERROR) {
@@ -459,7 +518,11 @@ static int ohci_run_control_list(OhciController *hc)
         wr32(ed + 8, head);
         ed = rd32(ed + 12) & ED_PTR_MASK;
     }
+}
 
+static void ohci_finish_lists(OhciController *hc, uint32_t done_head,
+                              int completed)
+{
     if (completed) {
         uint32_t hcca = hc->reg[HcHCCA / 4];
         if (hcca)
@@ -467,6 +530,58 @@ static int ohci_run_control_list(OhciController *hc)
         hc->reg[HcDoneHead / 4] = done_head;
         hc->reg[HcInterruptStatus / 4] |= INTR_WDH;
     }
+}
+
+static int ohci_run_control_list(OhciController *hc)
+{
+    uint32_t done_head = 0;
+    int completed = 0;
+    ohci_run_ed_list(hc, hc->reg[HcControlHeadED / 4] & ED_PTR_MASK,
+                     &done_head, &completed);
+    ohci_finish_lists(hc, done_head, completed);
+    return completed;
+}
+
+/*
+ * The periodic list, which is where the controller finds the pad.
+ *
+ * This was missing, and its absence is why nothing has ever pressed a button
+ * in this port. A gamepad reports on an interrupt endpoint, and an interrupt
+ * endpoint is never on the control list: the driver hangs its ED off the
+ * thirty-two-entry table at the start of the HCCA and the controller walks
+ * one entry per millisecond frame. With only the control list walked, the
+ * device enumerated perfectly -- descriptors, address, configuration, all of
+ * it over endpoint zero -- and then was never asked for a single report. The
+ * diagnostic that was supposed to catch this said "the guest is reading the
+ * pad" on the first report and so printed nothing at all, in every log ever
+ * captured, which is the quietest possible way for a feature to be absent.
+ *
+ * All thirty-two entries are walked per tick rather than one, because this
+ * ticks at fifty hertz and the hardware at a thousand: taking one entry per
+ * tick would poll an endpoint listed in four of them once every eighty
+ * milliseconds. An ED reached through several entries is serviced once --
+ * hence `seen` -- so a tick delivers one report per endpoint, and the pad is
+ * read as often as this loop runs.
+ */
+static int ohci_run_periodic_list(OhciController *hc)
+{
+    uint32_t hcca = hc->reg[HcHCCA / 4];
+    uint32_t done_head = 0, seen[32];
+    int completed = 0, nseen = 0, i;
+
+    if (!hcca || !guest_ok(hcca, 0x100))
+        return 0;
+
+    for (i = 0; i < 32; i++) {
+        uint32_t ed = rd32(hcca + (uint32_t)i * 4) & ED_PTR_MASK;
+        int j, dup = 0;
+        if (!ed) continue;
+        for (j = 0; j < nseen; j++) if (seen[j] == ed) { dup = 1; break; }
+        if (dup) continue;
+        if (nseen < 32) seen[nseen++] = ed;
+        ohci_run_ed_list(hc, ed, &done_head, &completed);
+    }
+    ohci_finish_lists(hc, done_head, completed);
     return completed;
 }
 
@@ -646,6 +761,20 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
         uint32_t control, enable, status;
 
         Sleep(20);
+        /* The guest-lock watchdog rides here because this loop is the only
+         * one in the process that ticks steadily and never wants the lock
+         * itself -- a watchdog that can be blocked by the thing it is
+         * watching reports nothing at exactly the moment it matters. */
+        { extern void xbox_guest_lock_report(void) __attribute__((weak));
+          extern void xbox_guest_lock_stats(void) __attribute__((weak));
+          extern void xbox_guest_cs_report(void) __attribute__((weak));
+          extern void recomp_fp_report(void) __attribute__((weak));
+          if (xbox_guest_lock_report) xbox_guest_lock_report();
+          if (xbox_guest_lock_stats)  xbox_guest_lock_stats();
+          if (xbox_guest_cs_report)   xbox_guest_cs_report();
+          /* Same reasoning: the x87 census has to reach stderr on a run that
+           * is killed, which is every run. */
+          if (recomp_fp_report)       recomp_fp_report(); }
         control = hc->reg[HcControl / 4];
         enable  = hc->reg[HcInterruptEnable / 4];
 
@@ -678,11 +807,69 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * on it. Walking on the tick rather than only when CLF is written
          * costs a read of a guest dword and means a descriptor queued without
          * rewriting CLF is still moved -- which is legal, and drivers do it. */
+        /* What the driver has actually put in front of the controller.
+         *
+         * "No transfer ever happened" has three causes that look identical
+         * from outside -- the list is not enabled, the head is null, or the
+         * head points at an endpoint with nothing queued on it -- and this
+         * says which, once a second, without following the walk. */
+        if (s_trace) {
+            static unsigned n;
+            if ((n++ % 50) == 0) {
+                uint32_t ch = hc->reg[HcControlHeadED / 4] & ED_PTR_MASK;
+                uint32_t hcca = hc->reg[HcHCCA / 4];
+                uint32_t it = 0; int k, live = 0;
+                for (k = 0; k < 32; k++)
+                    if ((it = rd32(hcca + (uint32_t)k * 4) & ED_PTR_MASK) != 0)
+                        live++;
+                fprintf(stderr, "  [OHCI%d] control=%08X headED=%08X (%s) "
+                        "hcca=%08X %d/32 interrupt entries\n",
+                        hc->index, control, ch,
+                        guest_ok(ch, 16) ? "reachable" : "unreachable",
+                        hcca, live);
+                if (guest_ok(ch, 16))
+                    fprintf(stderr, "  [OHCI%d]   ED: %08X %08X %08X %08X\n",
+                            hc->index, rd32(ch), rd32(ch + 4), rd32(ch + 8),
+                            rd32(ch + 12));
+                fflush(stderr);
+            }
+        }
+
         if ((control & 0x10u)
          && guest_ok(hc->reg[HcControlHeadED / 4] & ED_PTR_MASK, 16)) {
             if (ohci_run_control_list(hc))
                 hc->reg[HcCommandStatus / 4] &= ~0x02u;   /* CLF consumed */
         }
+
+        /*
+         * A frame, and the interrupt that says one started.
+         *
+         * The driver waits on StartOfFrame to time the pauses the USB
+         * specification requires -- two milliseconds of settling after
+         * SET_ADDRESS, for one -- and it waits by enabling SF and blocking.
+         * A controller that never reports a frame therefore enumerates
+         * exactly as far as the first mandatory wait and stops: this port got
+         * the device descriptor and the address assigned, and then sat there
+         * while the driver waited for a frame that never came.
+         *
+         * One frame per tick rather than the thousand a second real hardware
+         * produces. What the driver does with SF is count it, so a slower
+         * clock makes the settling waits longer and nothing else; a thousand
+         * interrupts a second into a recompiled ISR would cost more than the
+         * whole USB stack is worth.
+         */
+        {
+            uint32_t hcca = hc->reg[HcHCCA / 4];
+            hc->reg[HcFmNumber / 4] = (hc->reg[HcFmNumber / 4] + 1) & 0xFFFFu;
+            if (hcca && guest_ok(hcca + 0x80, 4))
+                wr32(hcca + 0x80, hc->reg[HcFmNumber / 4]);
+            hc->reg[HcInterruptStatus / 4] |= INTR_SF;
+        }
+
+        /* The periodic list, if the driver has enabled it. PeriodicListEnable
+         * is bit 2 of HcControl. */
+        if (control & 0x04u)
+            ohci_run_periodic_list(hc);
 
         /* Level-triggered, which is what OHCI is: while an enabled source is
          * set, the line is asserted. The handler clears the status bit, so
@@ -766,13 +953,15 @@ void xbox_OhciInit(void)
             XBOX_OHCI0_BASE, XBOX_OHCI1_BASE, OHCI_PORTS);
     fflush(stderr);
 
-#if defined(_WIN32)
+    /* The bus master. Nothing else walks the descriptor lists, so without it
+     * a driver can find the controller, reset the port, and then wait for a
+     * report that never arrives. CreateThread is provided by the platform
+     * layer on every host here, so this is not Windows-only. */
     {
         HANDLE th = CreateThread(NULL, 0, ohci_thread, NULL, 0, NULL);
         if (th)
             CloseHandle(th);
     }
-#endif
 }
 
 static OhciController *hc_for(uint32_t va)
@@ -785,6 +974,35 @@ static OhciController *hc_for(uint32_t va)
         if (va >= s_hc[i].base && va < s_hc[i].base + XBOX_OHCI_SIZE)
             return &s_hc[i];
     return NULL;
+}
+
+
+/* ---- the MMIO-hook path (everywhere that is not Windows) ----------------
+ *
+ * On Windows the registers are answered by making the page inaccessible and
+ * decoding the faulting instruction. That works and it is slow, and it needs
+ * a structured-exception handler to route the fault back here. This runtime
+ * already has a faster and simpler route for exactly this: the recompiled
+ * code funnels every access in the MCPX aperture through a function pointer,
+ * which is how the APU is served. The USB block sits at the very top of that
+ * aperture and was one byte outside the window -- so every register the
+ * title's XAPI read came back as zero out of plain RAM, and it concluded
+ * there was no host controller. Hence a pad the guest never once read.
+ */
+int xbox_OhciEnabled(void) { return s_enabled; }
+
+uint32_t xbox_OhciRead(uint32_t xbox_va, int size)
+{
+    OhciController *hc = hc_for(xbox_va);
+    if (!hc) return 0;
+    return (uint32_t)ohci_read(hc, xbox_va - hc->base, size);
+}
+
+void xbox_OhciWrite(uint32_t xbox_va, uint32_t val, int size)
+{
+    OhciController *hc = hc_for(xbox_va);
+    if (!hc) return;
+    ohci_write(hc, xbox_va - hc->base, val, size);
 }
 
 int xbox_OhciOwnsAddress(uint32_t xbox_va)

@@ -41,6 +41,13 @@ int  xbox_OhciOwnsAddress(uint32_t xbox_va);
  * and stepped over. `ctx` is a PCONTEXT; void * keeps windows.h out of here. */
 int  xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va);
 
+/* Served through the runtime's MMIO function pointers rather than by
+ * faulting, which is how the APU is served and is both faster and portable.
+ * xbox_OhciEnabled() says whether the model is on at all. */
+int      xbox_OhciEnabled(void);
+uint32_t xbox_OhciRead(uint32_t xbox_va, int size);
+void     xbox_OhciWrite(uint32_t xbox_va, uint32_t val, int size);
+
 /* Report counts at exit, so a run says whether the driver ever looked. */
 void xbox_OhciReport(void);
 

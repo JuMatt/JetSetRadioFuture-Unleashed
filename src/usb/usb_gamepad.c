@@ -139,6 +139,7 @@ int usb_gamepad_control(const UsbSetup *setup, uint8_t *out, int max)
 
 /* The host's own pad, through the layer that already maps one to XInput.
  * A real controller plugged into the PC drives this emulated one. */
+#include <stdio.h>
 #include "../input/xinput_xbox.h"
 
 /*
@@ -166,9 +167,26 @@ int usb_gamepad_report(uint8_t *out, int max)
     /* A disconnected host pad is not an error here: the device is present on
      * the bus either way, it just reports nothing pressed. */
     if (xbox_InputGetState(0, &state) != 0)
-        return 20;
+        memset(&state, 0, sizeof state);
 
     g = &state.Gamepad;
+
+    /* Say once that the guest is reading the pad at all, and once when a
+     * button first reaches it.
+     *
+     * "The game does not respond to the controller" has three quite different
+     * causes -- the pad is not seen, the report is not read, or the report is
+     * read and the game does not care -- and they are indistinguishable from
+     * outside. These two lines separate all three. */
+    { static int said_read, said_press;
+      if (!said_read++) fprintf(stderr, "[PAD] the guest is reading the pad\n");
+      if (!said_press && (g->wButtons || g->bAnalogButtons[0]
+                          || g->bAnalogButtons[1])) {
+          said_press = 1;
+          fprintf(stderr, "[PAD] first button reaching the guest: "
+                  "buttons=%04X A=%u B=%u\n", g->wButtons,
+                  g->bAnalogButtons[0], g->bAnalogButtons[1]);
+      } }
     out[2] = (uint8_t)(g->wButtons & 0xFF);
     out[3] = (uint8_t)((g->wButtons >> 8) & 0xFF);
     for (i = 0; i < 8; i++)

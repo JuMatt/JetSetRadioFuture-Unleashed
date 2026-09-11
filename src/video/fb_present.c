@@ -1,3 +1,4 @@
+#include <stdint.h>
 /**
  * Show the guest framebuffer in a window.
  *

@@ -10,6 +10,7 @@
  */
 
 #include "kernel.h"
+#include <string.h>
 #if defined(_WIN32)
 /* _aligned_malloc/_aligned_free; POSIX gets them from win32_compat.h */
 #include <malloc.h>

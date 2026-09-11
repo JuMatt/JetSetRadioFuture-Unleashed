@@ -9,6 +9,8 @@
  */
 
 #include "nv2a_state.h"
+#include <stdlib.h>
+#include <unistd.h>
 #include "nv2a_pgraph_d3d11.h"
 
 /* ============================================================

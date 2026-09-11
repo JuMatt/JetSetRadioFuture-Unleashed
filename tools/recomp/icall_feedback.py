@@ -272,10 +272,16 @@ def cmd_seeds(args):
     probe = _decode_probe(args.xbe)
     bodies = load_function_bodies(args.functions)
     kept, dropped = {}, []
+    padded = _padding_probe(args.xbe)
     for va, flags in sorted(db.items()):
         if bodies:
             inside = _interior_of(va, bodies)
-            if inside is not None:
+            # ...unless the target sits right after alignment padding (nop /
+            # int3): nothing flows across padding, so a body that spans it was
+            # over-extended by the detector (alias bodies routinely are), and
+            # clamping it is the correction, not a truncation. JSRF's
+            # DirectSound reader entry 0x00175300 is exactly this.
+            if inside is not None and not (padded and padded(va)):
                 dropped.append((va, "inside sub_%08X -- would truncate it" % inside))
                 continue
         if probe is not None:
@@ -295,6 +301,24 @@ def cmd_seeds(args):
     for va, why in dropped:
         print("     0x%08X  %s" % (va, why))
     return 0
+
+
+def _padding_probe(xbe_path):
+    """Returns a predicate: is the byte before va alignment padding (nop/int3)?"""
+    if not xbe_path:
+        return None
+    try:
+        from tools.disasm.loader import load_image
+        image = load_image(xbe_path)
+    except Exception:
+        return None
+    def padded(va):
+        b = image.read_u32_at_va(va - 4)
+        if b is None:
+            return False
+        prev = (b >> 24) & 0xFF
+        return prev in (0x90, 0xCC)
+    return padded
 
 
 def _decode_probe(xbe_path):

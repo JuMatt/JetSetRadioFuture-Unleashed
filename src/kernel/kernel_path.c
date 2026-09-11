@@ -456,6 +456,9 @@ translate:
 #else /* !_WIN32  -- POSIX / Linux */
 /* ======================================================================== */
 
+static __thread wchar_t s_last_host_path_posix[MAX_PATH];
+const wchar_t *xbox_LastHostPath(void) { return s_last_host_path_posix; }
+
 #include <unistd.h>
 #include <stdlib.h>
 #include <sys/stat.h>
@@ -465,6 +468,80 @@ translate:
 static char s_game_dir[MAX_PATH];
 static char s_save_dir[MAX_PATH];
 static BOOL s_initialized = FALSE;
+
+/* Partition devices on POSIX -- same scheme as the Win32 build above: the raw
+ * disk (Partition0) is an image file carrying the retail partition table at
+ * sector 4, and the other partitions are sparse image files of the retail
+ * geometry, so XAPI's utility-drive mount finds the cache partitions it
+ * expects. See the Win32 block for the reasoning. */
+#include <fcntl.h>
+#define XBOX_PART_TABLE_OFFSET 0x800
+#define XBOX_PART_IN_USE       0x80000000u
+
+static void posix_write_partition_table(const char *path)
+{
+    static const struct { const char *name; uint32_t start, size; } parts[] = {
+        { "XBOX_PART_X",  0x00000400, 0x00177000 },
+        { "XBOX_PART_Y",  0x00177400, 0x00177000 },
+        { "XBOX_PART_Z",  0x002EE400, 0x00177000 },
+        { "XBOX_PART_C",  0x00465400, 0x000FA000 },
+        { "XBOX_PART_E",  0x0055F400, 0x00465400 },
+    };
+    unsigned char sector[512];
+    int fd = open(path, O_RDWR | O_CREAT, 0644);
+    if (fd < 0) return;
+    memset(sector, 0, sizeof(sector));
+    memcpy(sector, "****PARTINFO****", 16);
+    for (size_t i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) {
+        unsigned char *e = sector + 48 + i * 32;
+        size_t n = strlen(parts[i].name);
+        memset(e, ' ', 16);
+        memcpy(e, parts[i].name, n < 16 ? n : 16);
+        uint32_t v = XBOX_PART_IN_USE; memcpy(e + 16, &v, 4);
+        memcpy(e + 20, &parts[i].start, 4);
+        memcpy(e + 24, &parts[i].size, 4);
+    }
+    pwrite(fd, sector, sizeof(sector), XBOX_PART_TABLE_OFFSET);
+    /* whole disk: 0x9C4400 sectors (retail 5 GB geometry) */
+    ftruncate(fd, (off_t)0x009C4400ull * 512);
+    close(fd);
+}
+
+static void posix_create_partition_images(void)
+{
+    static const unsigned long long part_sectors[6] = {
+        0, 0x00465400ull, 0x000FA000ull, 0x00177000ull, 0x00177000ull, 0x00177000ull };
+    char image[MAX_PATH];
+    snprintf(image, sizeof(image), "%s/Partition0.img", s_save_dir);
+    posix_write_partition_table(image);
+    for (int p = 1; p <= 5; p++) {
+        snprintf(image, sizeof(image), "%s/Partition%d.img", s_save_dir, p);
+        int fd = open(image, O_RDWR | O_CREAT, 0644);
+        if (fd < 0) continue;
+        struct stat st;
+        if (fstat(fd, &st) == 0 && st.st_size == 0)
+            ftruncate(fd, (off_t)(part_sectors[p] * 512ull));
+        close(fd);
+    }
+}
+
+int g_xbox_translate_want_dir;   /* set by NtCreateFile when FILE_DIRECTORY_FILE */
+static BOOL posix_partition_device_path(const char *xbox_path, char *out, DWORD n)
+{
+    if (g_xbox_translate_want_dir) return FALSE;   /* directory open -> filesystem view */
+    static const char *prefix = "\\Device\\Harddisk0\\Partition";
+    int len = match_prefix(xbox_path, prefix);
+    if (!len) return FALSE;
+    int digit = xbox_path[len];
+    if (digit < '0' || digit > '9') return FALSE;
+    const char *rest = xbox_path + len + 1;
+    /* "partition1\" is the root directory of the game/save filesystem, not
+     * the device -- leave it to the rules table. */
+    if (*rest == '\\' || *rest == '/') { if (digit == '1' || digit == '2') return FALSE; rest++; }
+    if (*rest != '\0') return FALSE;
+    snprintf(out, n, "%s/Partition%c.img", s_save_dir, digit);
+    return TRUE;
+}
 
 /* Strip a single trailing '/' (but never the root '/'). */
 static void strip_trailing_slash(char* s)
@@ -525,6 +602,16 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
     strip_trailing_slash(s_save_dir);
 
     s_initialized = TRUE;
+    {
+        static const char *subs[] = { "TitleData", "UserData", "Cache", "SystemData" };
+        char dir[MAX_PATH];
+        mkdir_p(s_save_dir);
+        for (int i = 0; i < 4; i++) {
+            snprintf(dir, sizeof(dir), "%s/%s", s_save_dir, subs[i]);
+            mkdir_p(dir);
+        }
+        posix_create_partition_images();
+    }
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_PATH, "Path init: game=%s, save=%s",
              s_game_dir, s_save_dir);
 }
@@ -546,6 +633,11 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
         char linked[512];
         if (resolve_symlink(xbox_path, linked, sizeof(linked)))
             return xbox_translate_path(linked, host_path_buf, buf_size);
+    }
+
+    if (posix_partition_device_path(xbox_path, host_path_buf, buf_size)) {
+        fprintf(stderr, "  [PATH] %s -> partition image %s\n", xbox_path, host_path_buf);
+        return TRUE;
     }
 
     for (int i = 0; i < PATH_RULE_COUNT; i++) {

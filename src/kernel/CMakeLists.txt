@@ -10,6 +10,7 @@ set(KERNEL_SOURCES
     kernel_rtl.c
     kernel_memory.c
     kernel_file.c
+    kernel_mmio.c
     kernel_thread.c
     kernel_sync.c
     kernel_hal.c
@@ -33,6 +34,7 @@ add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
 get_filename_component(XBOXRECOMP_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
 
 target_include_directories(xbox_kernel PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/../nv2a_gl
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${XBOXRECOMP_SRC_DIR}
 )
@@ -44,7 +46,7 @@ if(WIN32)
 else()
     # Linux: platform layer (POSIX host primitives) + OpenSSL for crypto.
     find_package(OpenSSL REQUIRED)
-    target_link_libraries(xbox_kernel PUBLIC platform OpenSSL::Crypto)
+    target_link_libraries(xbox_kernel PUBLIC platform OpenSSL::Crypto xbox_nv2a_gl)
 endif()
 
 if(MSVC)

@@ -16,6 +16,7 @@
  */
 
 #include "d3d8_internal.h"
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 

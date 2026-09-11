@@ -25,6 +25,7 @@
 #include "apu_state.h"
 #include "fpconv.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -99,6 +100,44 @@ static void dsp_ack_frame(MCPXAPUState *d)
     }
 }
 
+/* Register a doorbell address discovered at runtime.
+ *
+ * RECOMP_APU_DSP_ACK exists because the address cannot be derived from the APU
+ * registers -- but it can be derived from the *title*, whose DirectSound code
+ * computes it from its own object before spinning on it. A title that knows
+ * where its doorbell is can say so here, which beats an environment variable
+ * that has to be rediscovered every time the heap layout shifts underneath it.
+ *
+ * Idempotent: a call site inside a per-frame function may register the same
+ * address thousands of times.
+ */
+void mcpx_apu_dsp_ack_add(uint32_t addr)
+{
+    int i;
+
+    if (s_dsp_ack_count < 0)
+        dsp_ack_init();
+    addr &= 0x0FFFFFFFu;                  /* physical: strip the 0x80000000 VA */
+    if (!addr)
+        return;
+    for (i = 0; i < s_dsp_ack_count; i++)
+        if (s_dsp_ack[i] == addr)
+            return;
+    if (s_dsp_ack_count >= APU_DSP_ACK_MAX)
+        return;
+    s_dsp_ack[s_dsp_ack_count++] = addr;
+    fprintf(stderr, "[APU] DSP doorbell registered by the title: 0x%08X\n", addr);
+    fflush(stderr);
+}
+
+/* Doorbell ack independent of the APU register state: on hosts without MMIO
+ * trapping the APU never sees the title's register writes, so it never looks
+ * "active", but the DSP handshake the title spins on still has to be answered. */
+void mcpx_apu_dsp_ack_tick(MCPXAPUState *d)
+{
+    dsp_ack_frame(d);
+}
+
 void mcpx_apu_dsp_init(MCPXAPUState *d)
 {
     /* Allocate minimal DSP state for GP and EP.
@@ -158,6 +197,60 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
              * Each of the 8 sub-frames writes its own 32-sample slice. */
             d->monitor.frame_buf[off + i][0] = (int16_t)(left * 32767.0f);
             d->monitor.frame_buf[off + i][1] = (int16_t)(right * 32767.0f);
+        }
+    }
+
+    /* RECOMP_APU_WAV=<path>: the encode processor's output, as raw 16-bit
+     * stereo at 48 kHz.
+     *
+     * "It makes a horrible noise" is not a diagnosis. A voice decoded in the
+     * wrong format and a voice decoded correctly but played at the wrong rate
+     * both sound wrong and need different fixes, and both are obvious the
+     * moment the samples can be looked at rather than listened to. */
+    {
+        static FILE *wav = NULL;
+        static int tried;
+        if (!tried) {
+            const char *path = getenv("RECOMP_APU_WAV");
+            tried = 1;
+            if (path) {
+                wav = fopen(path, "wb");
+                if (wav) fprintf(stderr, "  [APU] writing raw 48 kHz stereo "
+                                         "s16 to %s\n", path);
+            }
+        }
+        if (wav) {
+            fwrite(&d->monitor.frame_buf[off][0], 2 * sizeof(int16_t),
+                   NUM_SAMPLES_PER_FRAME, wav);
+            fflush(wav);
+        }
+    }
+
+    /* RECOMP_APU_STATS: is the encode processor producing anything?
+     *
+     * Separate from the output-side peak in apu_core.c on purpose. "The APU is
+     * making sound" and "the sound is reaching the device" are different
+     * claims, and when they disagree the difference names the bug -- which is
+     * exactly how the memset that erased this buffer was found. */
+    {
+        static int stats = -1;
+        static int64_t last_ms;
+        static int peak;
+        int i;
+        if (stats < 0) stats = getenv("RECOMP_APU_STATS") ? 1 : 0;
+        if (stats) {
+            int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+            for (i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+                int a = d->monitor.frame_buf[off + i][0];
+                if (a < 0) a = -a;
+                if (a > peak) peak = a;
+            }
+            if (!last_ms) last_ms = now;
+            if (now - last_ms >= 1000) {
+                fprintf(stderr, "[APU] encode processor peak %d/32767\n", peak);
+                fflush(stderr);
+                last_ms = now; peak = 0;
+            }
         }
     }
 

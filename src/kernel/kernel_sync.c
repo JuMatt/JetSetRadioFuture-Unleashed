@@ -15,6 +15,7 @@
  */
 
 #include "kernel.h"
+#include <string.h>
 
 /* ============================================================================
  * Helper: Convert NT 100ns interval to Win32 milliseconds

@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
 
 #include "xbox_memory_layout.h"
 
@@ -143,9 +144,273 @@ static void prof_count(const char *name, uint32_t va)
     g_prof_full = 1;
 }
 
+/* RECOMP_TRACE_AFTER_VA=0x...: stay silent until that function is entered,
+ * so the budget is spent on the interesting window rather than on boot. */
+static int trace_armed(uint32_t va)
+{
+    static int state = -1;           /* -1 unread, 0 waiting, 1 armed */
+    static uint32_t trigger;
+    if (state < 0) {
+        const char *env = getenv("RECOMP_TRACE_AFTER_VA");
+        trigger = env ? (uint32_t)strtoul(env, NULL, 0) : 0;
+        state = trigger ? 0 : 1;
+    }
+    if (state == 0 && va == trigger) state = 1;
+    return state == 1;
+}
+
+/* Optional per-entry hook a title's bring-up code can supply (weak). */
+void recomp_trace_user_hook(const char *name, uint32_t va) __attribute__((weak));
+void recomp_trace_user_hook(const char *name, uint32_t va) { (void)name; (void)va; }
+
+/*
+ * The switch the generated code's hooks are behind, and the time-slice check
+ * they used to carry.
+ *
+ * g_recomp_hooks stays zero unless something actually wants a callback on
+ * every function entry: a trace, the entry profile, or a project's own hook
+ * (which enables it through recomp_trace_enable_hooks). Nothing else pays for
+ * them being there.
+ *
+ * recomp_slice_check is what remains of the old yield. The counter that
+ * decides when to call it moved into the macro, so a thread that is not due a
+ * slice boundary never leaves its own translation unit.
+ */
+unsigned g_recomp_tick;
+int      g_recomp_hooks;
+
+void recomp_slice_check(void)
+{
+    extern void xbox_guest_lock_yield_now(void);
+    xbox_guest_lock_yield_now();
+}
+
+void recomp_trace_enable_hooks(void)
+{
+    g_recomp_hooks = 1;
+}
+
+/* ── the x87 stack, checked the way the ABI is ────────────────────────────
+ *
+ * The hottest guest functions in this title are full of fild/fadd/fstp, and
+ * the lifter turns each of those into an index into an eight-entry rotating
+ * array of doubles. A push that is never popped does not fault: it moves the
+ * top by one, and from then on every register in that function -- and in
+ * every function it calls -- is read one slot away from where it was
+ * written. Numbers come out plausible and wrong, which is what a vehicle in
+ * the wrong place looks like, and nothing anywhere reports it.
+ *
+ * The same trick that found the callee-saved register bug works here. Record
+ * the depth on entry, compare it on exit, rank the offenders. A function that
+ * leaves the stack deeper or shallower than it found it has been lifted
+ * wrongly, whatever the picture looks like.
+ *
+ * Robust against the exits that never run: a tail jump leaves a frame behind,
+ * so the exit is matched by address rather than assumed to be the top of the
+ * shadow stack, and a stack that cannot be matched is abandoned rather than
+ * reported. A diagnostic that cries wolf is worse than none -- three of them
+ * were built last night and two were wrong.
+ */
+extern RECOMP_TLS int g_fp_top;
+int g_recomp_fpcheck;
+
+#define FPS_MAX 512
+static RECOMP_TLS struct { uint32_t va; int top; } t_fps[FPS_MAX];
+static RECOMP_TLS int t_fps_n;
+
+/* Reading the deltas -- and which way is "deeper".
+ *
+ * The lifter models the x87 stack as an eight-entry array with a rotating
+ * top, and a push DECREMENTS that top: fp_push does top = (top + 7) & 7.
+ * So a function that ends with a smaller g_fp_top than it started with has
+ * left a value on the stack, and the raw difference (now - was) for a push
+ * is minus one, not plus one. The first version of this report had that
+ * backwards and duly called four perfectly correct float-returning
+ * functions bugs. Everything below is in DEPTH: positive means deeper,
+ * which is what the words in the report say.
+ *
+ * A non-zero depth change is not by itself a bug, and a version of this
+ * that said so would have been the fourth cries-wolf diagnostic on this
+ * project. x86 returns a float in st(0), which the callee pushes and the
+ * caller pops: every float-returning function in the title legitimately
+ * ends exactly one deeper. Those are summarised away.
+ *
+ * What is actually worth reading:
+ *   one shallower      the callee popped a register it never pushed, so it
+ *                      has eaten one of the caller's -- every read the
+ *                      caller makes afterwards is off by one. Legitimate
+ *                      for an _ftol-style helper that takes its argument
+ *                      in st(0), so check the disassembly before believing
+ *                      it; a bug anywhere else.
+ *   two or more either way
+ *                      registers leaked or eaten in bulk. The stack is
+ *                      eight deep and wraps silently, so four of these in
+ *                      a chain and the whole file is garbage.
+ *   two different depths for one function
+ *                      its paths disagree. A compiler does not emit that,
+ *                      so one of them was lifted wrongly. Strongest signal
+ *                      of the three; read it first.
+ *
+ * The coverage line matters as much as the findings. Exits are matched by
+ * address because a tail jump leaves a frame behind, and a frame that
+ * cannot be matched within sixty-four makes the whole shadow stack
+ * untrustworthy, so it is abandoned. Abandoning loses any violation that
+ * was in flight -- so the report says how often that happened. A clean
+ * report over poor coverage means nothing, and there is no way to tell
+ * the two apart without printing the number.
+ */
+enum { FPV_SLOTS = 64 };
+static uint32_t g_fpv_seen[FPV_SLOTS];
+static uint64_t g_fpv_hits[FPV_SLOTS][8];   /* by (now - was) & 7 */
+static int      g_fpv_count;
+static uint64_t g_fpv_events;
+static uint64_t g_fpv_lost;                 /* violations past the last slot */
+static uint64_t g_fpv_calls;                /* entries seen */
+static uint64_t g_fpv_resets;               /* shadow stacks abandoned */
+
+/* bucket index -> depth change, positive = deeper. A push lands in 7. */
+#define FPV_DEPTH(i) (-((int)(((i) + 4) & 7) - 4))
+
+static uint64_t fpv_total(int s)
+{
+    int b; uint64_t n = 0;
+    for (b = 0; b < 8; b++) n += g_fpv_hits[s][b];
+    return n;
+}
+
+/* Everything except "always exactly one deeper", which is a float return. */
+static uint64_t fpv_suspicious(int s)
+{
+    int b, buckets = 0; uint64_t n = 0;
+    for (b = 0; b < 8; b++) if (g_fpv_hits[s][b]) buckets++;
+    for (b = 0; b < 8; b++) {
+        if (!g_fpv_hits[s][b]) continue;
+        if (FPV_DEPTH(b) == 1 && buckets == 1) continue;  /* plain float return */
+        n += g_fpv_hits[s][b];
+    }
+    return n;
+}
+
+static void recomp_fp_summary(void)
+{
+    int i, j, b, shown = 0;
+    uint64_t benign_fns = 0, benign_hits = 0;
+    char done[FPV_SLOTS];
+    memset(done, 0, sizeof(done));
+
+    fprintf(stderr, "[FPU] %llu returns out of %llu calls changed the x87 "
+                    "stack depth, over %d function(s)%s\n",
+            (unsigned long long)g_fpv_events, (unsigned long long)g_fpv_calls,
+            g_fpv_count, g_fpv_lost ? " (table full, some untracked)" : "");
+    fprintf(stderr, "[FPU]   coverage: %llu shadow stack(s) abandoned "
+                    "(%s)\n", (unsigned long long)g_fpv_resets,
+            g_fpv_resets * 100 < g_fpv_calls
+                ? "rare, so a clean result below means something"
+                : "OFTEN -- a clean result below means little");
+    if (!g_fpv_count) { fprintf(stderr, "[FPU]   nothing at all.\n");
+                        fflush(stderr); return; }
+
+    for (i = 0; i < g_fpv_count; i++)
+        if (!fpv_suspicious(i)) { benign_fns++; benign_hits += fpv_total(i); }
+    if (benign_fns)
+        fprintf(stderr, "[FPU]   %llu of them are plain float returns from "
+                        "%llu function(s) -- expected, not shown\n",
+                (unsigned long long)benign_hits,
+                (unsigned long long)benign_fns);
+
+    for (j = 0; j < g_fpv_count && shown < 12; j++) {
+        int best = -1, buckets = 0;
+        uint64_t bestn = 0, n;
+        for (i = 0; i < g_fpv_count; i++) {
+            if (done[i]) continue;
+            n = fpv_suspicious(i);
+            if (n > bestn) { bestn = n; best = i; }
+        }
+        if (best < 0) break;
+        done[best] = 1; shown++;
+        fprintf(stderr, "[FPU]   sub_%08X ", g_fpv_seen[best]);
+        for (b = 0; b < 8; b++) {
+            if (!g_fpv_hits[best][b]) continue;
+            buckets++;
+            fprintf(stderr, " %+d deeper x%llu", FPV_DEPTH(b),
+                    (unsigned long long)g_fpv_hits[best][b]);
+        }
+        fprintf(stderr, "%s\n", buckets > 1 ? "   <-- its paths disagree" : "");
+    }
+    if (!shown) fprintf(stderr, "[FPU]   nothing suspicious.\n");
+    fflush(stderr);
+}
+
+/* Called from the USB tick, which is the only loop in the process that runs
+ * steadily and wants no lock. The run is normally killed rather than exited,
+ * so a summary that only ran at exit would never be seen. */
+void recomp_fp_report(void)
+{
+    static unsigned ticks;
+    if (!g_recomp_fpcheck) return;
+    if (++ticks % 500u) return;        /* the tick is 20 ms, so every 10 s */
+    recomp_fp_summary();
+}
+
+static void recomp_fp_violation(uint32_t va, int was, int now)
+{
+    int i;
+    g_fpv_events++;
+    for (i = 0; i < g_fpv_count; i++)
+        if (g_fpv_seen[i] == va) break;
+    if (i == g_fpv_count) {
+        if (g_fpv_count == FPV_SLOTS) { g_fpv_lost++; return; }
+        g_fpv_seen[i] = va;
+        memset(g_fpv_hits[i], 0, sizeof(g_fpv_hits[i]));
+        g_fpv_count++;
+    }
+    g_fpv_hits[i][(unsigned)(now - was) & 7u]++;
+}
+
+void recomp_fp_enter(uint32_t va)
+{
+    g_fpv_calls++;
+    if (t_fps_n >= 0 && t_fps_n < FPS_MAX) {
+        t_fps[t_fps_n].va = va;
+        t_fps[t_fps_n].top = g_fp_top;
+    }
+    t_fps_n++;
+}
+
+void recomp_fp_exit(uint32_t va)
+{
+    int i, floor_i;
+    if (t_fps_n <= 0) { t_fps_n = 0; return; }
+    if (t_fps_n > FPS_MAX) { t_fps_n--; return; }
+    floor_i = t_fps_n - 64; if (floor_i < 0) floor_i = 0;
+    for (i = t_fps_n - 1; i >= floor_i; i--)
+        if (t_fps[i].va == va) break;
+    if (i < floor_i) { g_fpv_resets++; t_fps_n = 0; return; }  /* lost it */
+    if (g_fp_top != t_fps[i].top)
+        recomp_fp_violation(va, t_fps[i].top, g_fp_top);
+    t_fps_n = i;
+}
+
+/* Decided once, before main, so that the first guest function already sees
+ * the right answer -- a lazy check would be the very cost being removed. */
+__attribute__((constructor))
+static void recomp_trace_switches(void)
+{
+    if (getenv("RECOMP_TRACE_PROFILE") || getenv("RECOMP_TRACE_AFTER_VA")
+     || getenv("RECOMP_TRACE_ARGS")    || getenv("RECOMP_TRACE_DEREF")
+     || getenv("RECOMP_TRACE_FUNCS"))
+        g_recomp_hooks = 1;
+    if (getenv("RECOMP_FP_CHECK")) {
+        g_recomp_fpcheck = 1;
+        atexit(recomp_fp_summary);
+    }
+}
+
 void recomp_trace_enter(const char *name, uint32_t va)
 {
+    recomp_trace_user_hook(name, va);
     if (prof_enabled()) { prof_count(name, va); return; }
+    if (!trace_armed(va)) return;
     if (!trace_budget()) return;
     /* The return address as well as the registers: at entry it is still at
      * [esp], and it names the call site, which is the thing a trace of "who
@@ -208,6 +473,7 @@ void recomp_trace_enter(const char *name, uint32_t va)
 void recomp_trace_exit(const char *name, uint32_t va)
 {
     if (prof_enabled()) return;     /* entries alone carry the count */
+    if (!trace_armed(0)) return;
     if (!trace_budget()) return;
     fprintf(stderr, "[TRACE] <- %s (0x%08X)  esp=%08X eax=%08X ecx=%08X "
             "esi=%08X edi=%08X ebx=%08X\n",
@@ -221,6 +487,7 @@ void recomp_trace_exit(const char *name, uint32_t va)
 void recomp_trace_esp(const char *name, const char *tag)
 {
     if (prof_enabled()) return;
+    if (!trace_armed(0)) return;
     if (!trace_budget()) return;
     fprintf(stderr, "[ESP] %s @%s  esp=%08X esi=%08X edi=%08X\n",
             name, tag, g_esp, g_esi, g_edi);

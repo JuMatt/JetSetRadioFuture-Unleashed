@@ -33,6 +33,7 @@
 /* The swizzle decoder the D3D8 layer already uses -- one implementation of
  * Morton order, not a second one that can disagree with it. */
 #include "../d3d/d3d8_swizzle.h"
+#include "nv2a_gl.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
@@ -84,6 +85,15 @@ static int surface_hits_image(uint32_t base, uint32_t bytes)
  * in ordinary RAM (Wreckless renders to the tiled alias of physical
  * 0x01954000) keep the first path and are unaffected.
  */
+/* The same question, asked from the renderer.
+ *
+ * nv2a_gl.c had its own copy of this and the copy was wrong -- it sent every
+ * offset under sixty-four megabytes into the window, which made the
+ * contiguous test dead code and read every ordinary vertex buffer out of the
+ * wrong memory. One implementation, exported, so the next divergence cannot
+ * happen quietly. */
+uint32_t nv2a_dma_resolve(uint32_t offset);
+
 static uint32_t dma_resolve(uint32_t offset)
 {
     extern uint32_t xbox_ContiguousAllocatedBytes(void);
@@ -110,6 +120,8 @@ static uint32_t dma_resolve(uint32_t offset)
         return XBOX_CONTIG_BASE + offset;
     return offset;                         /* nothing better to offer */
 }
+
+uint32_t nv2a_dma_resolve(uint32_t offset) { return dma_resolve(offset); }
 
 static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what)
 {
@@ -301,20 +313,31 @@ static void note_texture_use(void)
     }
 }
 
+/* Same shape, same reason, same fix as note() in nv2a_pb_scan.c: this walked
+ * its table on every method it did not recognise, and a title spends a great
+ * many methods on things this executor has no use for. A method is 13 bits and
+ * 4-aligned, so eleven bits index it directly. */
+static int16_t s_unhandled_index[2048];
+static int     s_unhandled_index_ready;
+
 static void note_unhandled(uint32_t method)
 {
-    int i;
+    uint32_t key;
 
     s_gpu.unhandled_total++;
-    for (i = 0; i < s_unhandled_count; i++) {
-        if (s_unhandled[i].method == method) {
-            s_unhandled[i].count++;
-            return;
-        }
+    if (!s_unhandled_index_ready) {
+        memset(s_unhandled_index, 0xFF, sizeof s_unhandled_index);
+        s_unhandled_index_ready = 1;
+    }
+    key = (method >> 2) & 0x7FFu;
+    if (s_unhandled_index[key] >= 0) {
+        s_unhandled[s_unhandled_index[key]].count++;
+        return;
     }
     if (s_unhandled_count < PB_EXEC_MAX_UNHANDLED) {
         s_unhandled[s_unhandled_count].method = method;
         s_unhandled[s_unhandled_count].count = 1;
+        s_unhandled_index[key] = (int16_t)s_unhandled_count;
         s_unhandled_count++;
     }
 }
@@ -464,6 +487,12 @@ static void raster_triangle(const float a[2], const float b[2],
 
 static void clear_surface(uint32_t param)
 {
+    /* With the GL backend on, the title's surface belongs to it: it clears
+     * into its own framebuffer and copies the finished frame back. Clearing
+     * here as well would wipe that frame between the copy and the dump, which
+     * looks exactly like the GL path drawing nothing. */
+    if (nv2a_gl_enabled()) return;
+
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
     uint32_t bpp = surface_bpp();
     uint32_t y, x;
@@ -1105,8 +1134,25 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
                     textured ? (const float (*)[2])uv : NULL);
 }
 
+/* RECOMP_PB_EXEC_VERBOSE, read once.
+ *
+ * This was a getenv() on every pushbuffer method. getenv walks the whole
+ * environment doing a string compare per entry, and this function runs tens of
+ * thousands of times a frame -- so a diagnostic that prints six lines in total
+ * was costing more than the rasteriser. Measured on an M2 Pro, 93% of the
+ * frame was outside the GL calls entirely, and this is part of why.
+ */
+static int pb_verbose(void)
+{
+    static int v = -1;
+    if (v < 0) v = getenv("RECOMP_PB_EXEC_VERBOSE") ? 1 : 0;
+    return v;
+}
+
 static void raster_batch(void)
 {
+    if (nv2a_gl_enabled()) return;      /* GL owns the surface; see above */
+
     uint32_t i;
     uint32_t before = s_gpu.tris_drawn;
 
@@ -1205,7 +1251,7 @@ static void draw_primitive(void)
 
     raster_batch();
 
-    if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+    if (pb_verbose()) {
         static int shown;
         if (shown++ < 6) {
             fprintf(stderr, "  [GPU] prim %u, %u indices, pos attr:"
@@ -1354,6 +1400,31 @@ out:
 
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
+    /* The OpenGL backend keeps its own state machine and sees every method,
+     * including the ones this executor has no use for (vertex programs,
+     * viewport, depth). Deliberately before the subchannel check: it needs the
+     * stream as the title wrote it, not the subset that can be rasterised in
+     * software. Returns immediately unless RECOMP_GL is set. */
+    if (nv2a_gl_enabled() && subch == 0) {
+        nv2a_gl_method(method, param);
+        /*
+         * With GL rendering, everything below this line is dead weight.
+         *
+         * This function is the software rasteriser's state machine: it tracks
+         * surfaces, vertex attributes, indices and textures so that
+         * raster_batch() can draw triangles into guest memory. raster_batch()
+         * already returns immediately when GL is on, so all of that state is
+         * being maintained for a rasteriser that will never run -- on every
+         * one of two and a half million pushbuffer methods a second.
+         *
+         * RECOMP_PB_SOFT=1 keeps it, for comparing the two rasterisers or for
+         * debugging the software one.
+         */
+        static int keep_soft = -1;
+        if (keep_soft < 0) keep_soft = getenv("RECOMP_PB_SOFT") ? 1 : 0;
+        if (!keep_soft) return;
+    }
+
     static int inited;
     if (!inited) {
         inited = 1;
@@ -1363,7 +1434,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     /* Bring-up: the first parameters each surface method carries. A wrong
      * pitch or clip is indistinguishable from a method never arriving unless
      * the values are visible. */
-    if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+    if (pb_verbose()) {
         static int shown[8];
         int slot = -1;
         switch (method) {
@@ -1470,7 +1541,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         /* The stall ends when the buffer being read is the one just finished.
          * There is no scanout here to wait for, so that is now. */
         s_gpu.flip_read = s_gpu.flip_write;
-        if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+        if (pb_verbose()) {
             static unsigned n;
             if (n++ < 8) {
                 fprintf(stderr, "  [GPU] flip %u: read=%u write=%u\n",
@@ -1696,6 +1767,8 @@ static void peek_chain(void)
 
 void nv2a_pb_exec_report(void)
 {
+    nv2a_gl_report();
+
     peek_addresses();
     peek_chain();
     if (getenv("RECOMP_FIND_NAN")) {

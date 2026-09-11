@@ -96,6 +96,23 @@ VOID LeaveCriticalSection(LPCRITICAL_SECTION cs);
 BOOL TryEnterCriticalSection(LPCRITICAL_SECTION cs);
 VOID DeleteCriticalSection(LPCRITICAL_SECTION cs);
 
+#ifndef strtok_s
+#define strtok_s(s, d, c) strtok_r((s), (d), (c))
+#endif
+BOOL GetFileSizeEx(HANDLE h, PLARGE_INTEGER size);
+
+/* ---- Slim reader/writer locks + one-time init ------------------------ */
+typedef struct _RTL_SRWLOCK { PVOID Ptr; } SRWLOCK, *PSRWLOCK;
+#define SRWLOCK_INIT {0}
+VOID AcquireSRWLockShared(PSRWLOCK l);
+VOID ReleaseSRWLockShared(PSRWLOCK l);
+VOID AcquireSRWLockExclusive(PSRWLOCK l);
+VOID ReleaseSRWLockExclusive(PSRWLOCK l);
+typedef struct _RTL_RUN_ONCE { PVOID Ptr; } INIT_ONCE, *PINIT_ONCE;
+#define INIT_ONCE_STATIC_INIT {0}
+typedef BOOL (CALLBACK *PINIT_ONCE_FN)(PINIT_ONCE, PVOID, PVOID *);
+BOOL InitOnceExecuteOnce(PINIT_ONCE o, PINIT_ONCE_FN fn, PVOID param, PVOID *ctx);
+
 /* ---- Condition variables (paired with a CRITICAL_SECTION) ----------- */
 VOID InitializeConditionVariable(PCONDITION_VARIABLE cv);
 BOOL SleepConditionVariableCS(PCONDITION_VARIABLE cv, PCRITICAL_SECTION cs, DWORD ms);
@@ -356,6 +373,7 @@ int   WideCharToMultiByte(UINT cp, DWORD flags, LPCWSTR wide, int wideCount,
 #define ERROR_ACCESS_DENIED           5u
 #define ERROR_INVALID_HANDLE          6u
 #define ERROR_NOT_ENOUGH_MEMORY       8u
+#define ERROR_INVALID_ADDRESS         487u  /* a fixed mapping was refused */
 #define ERROR_NO_MORE_FILES           18u
 #define ERROR_GEN_FAILURE             31u
 #define ERROR_HANDLE_EOF              38u
@@ -540,4 +558,12 @@ static inline MMRESULT waveOutClose(HWAVEOUT h) { (void)h; return MMSYSERR_NOERR
 #endif
 
 #endif /* !_WIN32 */
+
+/* Reserve a range of this process's address space as unreadable pages, so
+ * that later VirtualAlloc and MapViewOfFileEx calls inside it can take their
+ * exact addresses instead of asking the kernel and hoping. Returns the base,
+ * or NULL if the reservation could not be placed. Non-Windows only; on
+ * Windows the guest layout is reserved by VirtualAlloc(MEM_RESERVE). */
+void *win32_reserve_address_space(void *base, size_t size);
+
 #endif /* WIN32_COMPAT_H */

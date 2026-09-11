@@ -537,7 +537,7 @@ class FunctionTranslator:
         last_setter = None
         for insn in instructions:
             m = insn.mnemonic
-            if m in ("adc", "sbb", "stc", "clc", "cmc"):
+            if m in ("adc", "sbb", "stc", "clc", "cmc", "rcr", "rcl"):
                 return True
             cc = None
             if m.startswith("j") and len(m) > 1:
@@ -552,6 +552,78 @@ class FunctionTranslator:
             elif m in _FLAGS_UNDEFINED:
                 last_setter = None
         return False
+
+    @staticmethod
+    def _flag_states_compatible(a, b):
+        """Two predecessor flag states a jcc can consume interchangeably.
+
+        A cmp/test that is not fused with its jcc snapshots its operands into
+        _fa/_fb/_fas/_fbs, and the condition is built from the snapshot, not
+        from the operands -- so two `cmp`s with different operands but the
+        same width leave identical state as far as the consumer is concerned.
+        MSVC emits exactly this shape for `x > (cond ? a : b)`: two compares in
+        two arms joining on one jle. CRI's ADX watchdog in JSRF was one --
+        refusing to merge sent the jle through the unassigned _flags fallback,
+        which is always false, so every stream was declared starved on its
+        first frame and restarted forever.
+        """
+        if not a or not b:
+            return False
+        (ma, opa), (mb, opb) = a, b
+        if ma != mb or ma not in ("cmp", "test"):
+            return False
+        if len(opa) < 2 or len(opb) < 2:
+            return False
+        from .lifter import _operand_width
+        def width(ops):
+            w = _operand_width(ops[0])
+            if w is None:
+                w = _operand_width(ops[1])
+            return w or 4
+        return width(opa) == width(opb)
+
+    # Arithmetic whose ZF and SF come straight from the value it left in its
+    # destination. Two arms ending in different members of this set that
+    # share a destination agree on je/jne/js/jns at the join.
+    _RESULT_FLAG_SETTERS = frozenset({
+        "and", "or", "xor", "inc", "dec", "add", "sub", "neg",
+        "shl", "shr", "sar", "zf_result",
+    })
+
+    @classmethod
+    def _flag_states_result_merge(cls, a, b):
+        """Merge two result-based flag states on the same destination.
+
+        MSVC's `x & mask` sign-fixup idiom -- `and eax, 0x800007ff; jns L;
+        dec eax; or eax, ~mask; inc eax; L: jne err` -- joins an `and` arm
+        with an `inc` arm on a jne that only asks whether eax is zero. JSRF's
+        CRI file device tests every read offset that way; with the join
+        refused the jne read the unassigned _flags fallback and reported
+        "illegal seek position" for a perfectly aligned request.
+        """
+        if not a or not b:
+            return None
+        (ma, opa), (mb, opb) = a, b
+        if ma not in cls._RESULT_FLAG_SETTERS or mb not in cls._RESULT_FLAG_SETTERS:
+            return None
+        if not opa or not opb:
+            return None
+        da, db = opa[0], opb[0]
+        if da.type != db.type:
+            return None
+        if da.type == "reg":
+            same = da.reg == db.reg
+        elif da.type == "mem":
+            same = (getattr(da, "mem_base", None) == getattr(db, "mem_base", None)
+                    and getattr(da, "mem_index", None) == getattr(db, "mem_index", None)
+                    and getattr(da, "mem_scale", None) == getattr(db, "mem_scale", None)
+                    and getattr(da, "mem_disp", None) == getattr(db, "mem_disp", None)
+                    and da.mem_size == db.mem_size)
+        else:
+            same = False
+        if not same:
+            return None
+        return ("zf_result", [da])
 
     def _func_has_prologue(self, instructions):
         """Check if function starts with push ebp; mov ebp, esp."""
@@ -817,7 +889,10 @@ class FunctionTranslator:
         # cmpxchg belongs here too: it snapshots the compare it performed,
         # because eax may be replaced before the branch reads the result.
         if any(insn.mnemonic in ("cmp", "test", "bsf", "bsr", "cmpxchg",
-                                 "lock cmpxchg")
+                                 "lock cmpxchg", "xadd", "lock xadd",
+                                 "add", "sub", "and", "or", "xor", "inc", "dec",
+                                 "neg", "shl", "sal", "shr", "sar", "shld",
+                                 "shrd", "adc", "sbb")
                for insn in instructions):
             lines.append("    uint32_t _fa = 0, _fb = 0;")
             lines.append("    int32_t _fas = 0, _fbs = 0;")
@@ -948,9 +1023,16 @@ class FunctionTranslator:
                 states = [out_state[p] for p in sources]
                 incoming = states[0]
                 for other in states[1:]:
-                    if other != incoming:
-                        incoming = None
-                        break
+                    if other == incoming:
+                        continue
+                    if self._flag_states_compatible(incoming, other):
+                        continue
+                    merged = self._flag_states_result_merge(incoming, other)
+                    if merged is not None:
+                        incoming = merged
+                        continue
+                    incoming = None
+                    break
             else:
                 incoming = None
 
