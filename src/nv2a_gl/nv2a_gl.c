@@ -1212,6 +1212,12 @@ static void psh_sync_textures(void)
             else if (!t->offset)                          g_tex_dead[i][1]++;
             else                                          g_tex_dead[i][2]++;
         }
+        /* The stage's texture shader mode decides whether it is sampled at
+         * all: NONE means the sampler is never touched, whatever is bound. */
+        { uint32_t mode = (S.shader_stage_prog >> (5 * i)) & 31u;
+          S.psh.tex_mode[i] = (uint8_t)mode;
+          S.psh.clip_cmp[i] = (uint8_t)((S.shader_clip_mode >> (4 * i)) & 15u);
+          if (mode == 0 || mode == 4 || mode == 5) live = 0; }
         S.psh.tex_bound[i] = (uint8_t)(live ? 1 : 0);
         /* A8 and the swizzled A8: colour comes back as zero from GL and as
          * one from the console. */
@@ -4947,10 +4953,16 @@ static void fliplog(const char *why)
         const char *e = getenv("RECOMP_GL_FLIPLOG");
         budget = e ? atoi(e) : 0;
     }
+    /* RECOMP_GL_FLIPLOG_AFTER=<flips>: start counting the budget only once
+     * this many presents have gone by -- the title scene is fifteen
+     * thousand presents into a run. */
+    { static long after = -1;
+      if (after < 0) { const char *a = getenv("RECOMP_GL_FLIPLOG_AFTER"); after = a ? atol(a) : 0; }
+      if ((long)S.flips < after) { prev_draws = S.draws; return; } }
     if (budget <= 0) { prev_draws = S.draws; return; }
     budget--;
-    fprintf(stderr, "  [FLIP] %-10s surface=%08X %ux%u  draws=%u\n",
-            why, S.color_offset, S.clip_w, S.clip_h, S.draws - prev_draws);
+    fprintf(stderr, "  [FLIP] %-14s flip=%u surface=%08X %ux%u  draws=%u  fbo=%u\n",
+            why, S.flips, S.color_offset, S.clip_w, S.clip_h, S.draws - prev_draws, (unsigned)g_fbo);
     prev_draws = S.draws;
     fflush(stderr);
 }
@@ -5999,6 +6011,7 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
          */
         S.seen_flip_stall = 1;
         if (S.since_present) { fliplog("flip_stall"); present(1); }
+        else fliplog("stall(nodraw)");
         break;
     default:
         /* RECOMP_GL_UNHANDLED=1: every method this backend ignores, ranked.

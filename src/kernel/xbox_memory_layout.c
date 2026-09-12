@@ -440,6 +440,18 @@ static void frame_counters_tick(void)
 
 static void fence_mirrors_tick(void)
 {
+    /* RECOMP_FENCE_MIRROR=0: leave the fence block to the pushbuffer
+     * executor, which writes BACK_END_WRITE_SEMAPHORE_RELEASE values into it
+     * when it reaches them. Mirroring PUT on top of that would answer every
+     * fence "done" before the work behind it had been read -- which is what
+     * let JSRF rewrite its dynamic buffers under the renderer. */
+    { static int on = -1;
+      if (on < 0) { const char *e = getenv("RECOMP_FENCE_MIRROR");
+                    /* Off by default whenever the executor is running: it
+                     * writes the real semaphores. On for a run without it,
+                     * where nothing else would ever complete a fence. */
+                    on = e ? atoi(e) : (getenv("RECOMP_PB_EXEC") ? 0 : 1); }
+      if (!on) return; }
     for (int i = 0; i < g_fence_mirror_count; i++) {
         uint32_t dev, get_ptr;
 
@@ -460,6 +472,15 @@ static void fence_mirrors_tick(void)
             uint32_t put =
                 *(volatile uint32_t *)((uintptr_t)(dev + g_fence_mirrors[i].put_off)
                                        + g_memory_offset);
+            /* RECOMP_PB_SEMLOG=1: where the block is and what is in it,
+             * so the semaphore offsets the executor logs can be matched
+             * against it. Once a second. */
+            { static int lg = -1; static DWORD last;
+              if (lg < 0) lg = getenv("RECOMP_PB_SEMLOG") ? 1 : 0;
+              if (lg && GetTickCount() - last > 1000) { int k; last = GetTickCount();
+                  fprintf(stderr, "  [SEM] fence block at VA 0x%08X (dev 0x%08X put 0x%08X):", get_ptr, dev, put);
+                  for (k = 0; k < 24; k++) fprintf(stderr, " %08X", fence[k]);
+                  fprintf(stderr, "\n"); fflush(stderr); } }
             if (*fence != put)
                 *fence = put;
         }
@@ -576,7 +597,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             if (put != last_put || (now_ms - last_put_ms) > 2000) {
                 /* Survey the segment the title just submitted, once. */
                 {
-                    extern void nv2a_pb_scan(uint32_t, uint32_t);
+                    extern uint32_t nv2a_pb_scan(uint32_t, uint32_t);
                     extern void nv2a_pb_scan_report(void);
                     static DWORD last_report;
 
@@ -594,9 +615,24 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                      * The contiguous window IS the physical-address view, so
                      * OR-ing its base is the documented round trip, not a
                      * guess. */
-                    if (last_put && put > last_put)
+                    if (last_put && put > last_put) {
                         nv2a_pb_scan(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
                                      XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
+                    } else if (last_put && put < last_put) {
+                        /* The ring wrapped: PUT went back to its start.
+                         * The tail from the old PUT to the jump used to be
+                         * skipped outright, and with it whatever the title
+                         * had written there -- at worst the fence it was
+                         * about to wait on. Walk the tail up to the jump,
+                         * then from the jump's target to the new PUT. */
+                        uint32_t from = XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu);
+                        uint32_t to   = XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu);
+                        uint32_t j = nv2a_pb_scan(from, from + 0x20000u);
+                        if (j) {
+                            j = XBOX_CONTIG_BASE | (j & 0x0FFFFFFFu);
+                            if (j < to) nv2a_pb_scan(j, to);
+                        }
+                    }
                     /* Periodic, because what the title submits at init is not
                      * what it submits once it is drawing a menu, and the
                      * question the survey answers is about the latter. */

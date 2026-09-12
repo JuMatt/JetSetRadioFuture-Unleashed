@@ -166,11 +166,11 @@ void nv2a_pb_scan_report(void)
     fflush(stderr);
 }
 
-void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
+uint32_t nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t va = start_va;
-    uint32_t words = 0, jumps = 0, unknown = 0;
+    uint32_t words = 0, jumps = 0, unknown = 0, jump_to = 0;
 
     /* Both read once. This runs on every pushbuffer segment the title submits
      * -- thousands a second -- and getenv walks the environment doing a string
@@ -180,7 +180,7 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
     if (s_scan_enabled < 0)
         s_scan_enabled = getenv("RECOMP_PB_SCAN") != NULL;
     if (!(s_scan_enabled || s_exec_enabled) || end_va <= start_va)
-        return;
+        return 0;
 
     /*
      * How much of the frame this walk costs.
@@ -203,8 +203,14 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
         words++;
 
         if ((w & 3u) == 1u || (w & 0xE0000003u) == 0x20000000u) {
+            /* A jump ends this segment. Its target is handed back so the
+             * caller can carry on from there: the ring wraps with a jump
+             * to its start, and the commands the title wrote after it --
+             * including the fence the title then waits for -- are at the
+             * target, not here. */
             jumps++;
-            break;                            /* a jump ends this segment */
+            jump_to = ((w & 3u) == 1u) ? (w & ~3u) : (w & 0x1FFFFFFCu);
+            break;
         }
         if ((w & 3u) == 2u || (w & 0xFFFF0003u) == 0x00020000u)
             continue;
@@ -238,4 +244,5 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
     s_tot_jumps += jumps;
     s_tot_segments++;
     { extern void nv2a_pb_time_end(unsigned methods); nv2a_pb_time_end(words); }
+    return jump_to;
 }

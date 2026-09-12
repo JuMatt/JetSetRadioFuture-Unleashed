@@ -64,6 +64,13 @@ typedef struct {
      * drawing white and drawing nothing. */
     uint8_t  tex_bound[4];
     uint8_t  tex_alpha_only[4];
+    /* NV097_SET_SHADER_STAGE_PROGRAM: what each stage does with its
+     * coordinates before the combiners see it -- 0 none (never sampled,
+     * reads as 0,0,0,1), 1 2D projective, 4 pass-through (the coordinates
+     * themselves), 5 clip plane (discard by coordinate sign, per
+     * NV097_SET_SHADER_CLIP_PLANE_MODE), others sampled as 2D here. */
+    uint8_t  tex_mode[4];
+    uint8_t  clip_cmp[4];        /* four compare bits per stage: 1 = discard when >= 0 */
 
     /* Alpha test, which the NV2A does in fixed function. */
     uint8_t  alpha_test;

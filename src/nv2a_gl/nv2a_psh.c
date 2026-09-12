@@ -263,7 +263,22 @@ static int psh_emit(const Nv2aPshState *ps, char *buf, int bufsize, int msl)
         sb(&s, "\nvoid main() {\n");
     }
     for (i = 0; i < 4; i++) {
-        if (ps->tex_bound[i]) {
+        /* The texture shader for this stage (xemu psh.c, PS_TEXTUREMODES_*):
+         * a stage set to NONE is never sampled and reads as (0,0,0,1);
+         * PASSTHRU hands the coordinates through as a colour; CLIPPLANE
+         * discards the fragment by the sign of each coordinate and reads
+         * as zero. Everything else is sampled as a 2D texture. */
+        if (ps->tex_mode[i] == 0) {
+            sb(&s, "    vec4 r_t%d = vec4(0.0, 0.0, 0.0, 1.0);  // stage NONE\n", i);
+        } else if (ps->tex_mode[i] == 4) {
+            sb(&s, "    vec4 r_t%d = oT%d;  // stage PASSTHRU\n", i, i);
+        } else if (ps->tex_mode[i] == 5) {
+            int j;
+            sb(&s, "    vec4 r_t%d = vec4(0.0);  // stage CLIPPLANE\n", i);
+            for (j = 0; j < 4; j++)
+                sb(&s, "    if (oT%d.%c %s 0.0) NV2A_DISCARD;\n", i, "xyzw"[j],
+                   (ps->clip_cmp[i] >> j) & 1 ? ">=" : "<");
+        } else if (ps->tex_bound[i]) {
             if (msl)
                 sb(&s, "    vec4 r_t%d = tex%d.sample(smp%d, oT%d.xy * texScale%d);\n",
                    i, i, i, i, i);
@@ -282,10 +297,14 @@ static int psh_emit(const Nv2aPshState *ps, char *buf, int bufsize, int msl)
     sb(&s,
        "    vec4 r_v0 = oD0;\n"
        "    vec4 r_v1 = oD1;\n"
-       "    vec4 r_fog = vec4(fogColor.rgb, oFogC);\n"
-       /* R0 starts as texture 0 -- an NV2A convention, and the reason a
-        * single-stage title that never writes R0 still gets its texture. */
-       "    vec4 r_r0 = r_t0;\n"
+       "    vec4 r_fog = vec4(fogColor.rgb, oFogC);\n");
+    /* R0 starts black with texture 0's alpha (xemu psh.c: r0 = 0, r0.a =
+     * t0.a, or 1 when stage 0 is NONE). It used to start as the whole of
+     * texture 0, which fed t0's colour to any combiner that read R0 before
+     * writing it. */
+    sb(&s, ps->tex_mode[0] == 0 ? "    vec4 r_r0 = vec4(0.0, 0.0, 0.0, 1.0);\n"
+                                : "    vec4 r_r0 = vec4(0.0, 0.0, 0.0, r_t0.a);\n");
+    sb(&s,
        "    vec4 r_r1 = vec4(0.0);\n"
        "    vec4 r_sum = vec4(0.0);\n"
        "    vec4 r_ef = vec4(0.0);\n"

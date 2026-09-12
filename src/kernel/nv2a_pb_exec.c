@@ -1398,8 +1398,84 @@ out:
     s_gpu.idx_count = 0;
 }
 
+/*
+ * GPU semaphores -- the fences the title waits on.
+ *
+ * D3D ends a batch with NV097_SET_SEMAPHORE_OFFSET + BACK_END_WRITE_SEMAPHORE_
+ * RELEASE: when the GPU reaches that point it writes the value into the
+ * semaphore block, and the title's IsFencePending compares the block against
+ * the fence it handed out. Nothing here executed the write; what kept the
+ * title moving was the fence mirror in xbox_memory_layout.c copying the CPU
+ * put pointer into the block every tick, i.e. answering every fence "done"
+ * the moment it was issued. The GPU work behind the fence -- a dynamic
+ * vertex buffer the title is about to rewrite, the pushbuffer segment it is
+ * about to reuse -- had not been read yet, and this executor read it a few
+ * milliseconds later, after the title had moved on. RECOMP_PB_SEMLOG=1 logs
+ * the offsets and values so the block can be identified.
+ */
+static uint32_t s_sem_offset, s_sem_handle, s_sem_base;
+static int s_sem_base_known;
+
+/* The physical base of a DMA object, by its handle, through the RAMHT the
+ * title's driver built in instance memory (xemu pfifo.c ramht_lookup and
+ * nv2a.c nv_dma_load). The NV2A aperture is plain memory in this runtime, so
+ * the hash table and the objects are there to be read. Returns 0 and clears
+ * *ok when the entry is not the one asked for. */
+static uint32_t dma_object_base(uint32_t handle, int *ok)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    const uint32_t nv2a = 0xFD000000u;
+    uint32_t ramht = *(const uint32_t *)(mem + nv2a + 0x002210);
+    uint32_t push1 = *(const uint32_t *)(mem + nv2a + 0x003204);
+    uint32_t size = 1u << (((ramht >> 16) & 3u) + 12u);
+    unsigned bits = 0; while (!((size >> bits) & 1u)) bits++; bits--;   /* ctz - 1 */
+    uint32_t hash = 0, h = handle, chid = push1 & 0x1Fu;
+    uint32_t base, ectx, ehandle, inst, flags, frame;
+    *ok = 0;
+    while (h) { hash ^= h & ((1u << bits) - 1u); h >>= bits; }
+    hash ^= chid << (bits - 4);
+    if (hash * 8 >= size) return 0;
+    base = ((ramht & 0x1F0u) << 12) + hash * 8;
+    ehandle = *(const uint32_t *)(mem + nv2a + 0x700000 + base);
+    ectx    = *(const uint32_t *)(mem + nv2a + 0x700000 + base + 4);
+    if (ehandle != handle || !(ectx & 0x80000000u)) return 0;
+    inst  = (ectx & 0xFFFFu) << 4;
+    flags = *(const uint32_t *)(mem + nv2a + 0x700000 + inst);
+    frame = *(const uint32_t *)(mem + nv2a + 0x700000 + inst + 8);
+    *ok = 1;
+    return (frame & 0xFFFFF000u) | ((flags >> 20) & 0xFFFu);
+}
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
+    if (subch == 0 && (method == 0x1D6C || method == 0x1D70 || method == 0x01A4)) {
+        static int lg = -1, shown;
+        if (lg < 0) lg = getenv("RECOMP_PB_SEMLOG") ? 1 : 0;
+        if (method == 0x1D6C) s_sem_offset = param;
+        if (method == 0x01A4) { s_sem_handle = param; s_sem_base_known = 0; }
+        if (lg && shown < 60) { shown++;
+            fprintf(stderr, "  [SEM] %s = 0x%08X\n",
+                    method == 0x1D6C ? "SET_SEMAPHORE_OFFSET"
+                  : method == 0x1D70 ? "BACK_END_WRITE_SEMAPHORE_RELEASE"
+                  : "SET_CONTEXT_DMA_SEMAPHORE", param); fflush(stderr); }
+        if (method == 0x1D70) {
+            /* Execute the fence: the GPU has reached this point in the
+             * stream -- every draw before it has been issued -- so the value
+             * goes into the semaphore now and not a tick earlier. */
+            static int off = -1;
+            if (off < 0) off = getenv("RECOMP_PB_NOSEM") ? 1 : 0;
+            if (!off) {
+                uint32_t va;
+                if (!s_sem_base_known) { int ok; uint32_t b = dma_object_base(s_sem_handle, &ok);
+                    s_sem_base = ok ? b : 0; s_sem_base_known = 1;
+                    fprintf(stderr, "  [SEM] semaphore DMA handle 0x%08X -> physical base 0x%08X%s\n",
+                            s_sem_handle, s_sem_base, ok ? "" : " (RAMHT lookup failed, assuming 0)"); fflush(stderr); }
+                va = dma_resolve(s_sem_base + s_sem_offset);
+                if (va >= 0x1000u && va + 4 <= 0xFFFFFFFCu)
+                    *(volatile uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va) = param;
+            }
+        }
+    }
     /* The OpenGL backend keeps its own state machine and sees every method,
      * including the ones this executor has no use for (vertex programs,
      * viewport, depth). Deliberately before the subchannel check: it needs the
