@@ -368,6 +368,9 @@ static struct {
     uint32_t draws_3d;      /* draws made with a centred, full-screen viewport */
     uint32_t frame_tris;    /* triangles in the frame just finished */
     uint32_t skipped_no_prog, skipped_no_pos, shader_fails;
+    float    vp_off_reg[4];       /* NV097_SET_VIEWPORT_OFFSET exactly as written:
+                                   * the fixed-function shader adds it after its
+                                   * divide, the way the hardware does */
     uint32_t draws_inline, draws_array, draws_depth_on, surface_switches;
     uint32_t draws_xf[4];   /* draws by transform execution mode */
 } S;
@@ -582,6 +585,7 @@ static struct {
     GLuint   prog;
     GLint    u_c, u_vpScale, u_vpOff, u_vpSurface, u_posMode, u_drawTint;
     GLint    u_ffMat, u_ffTexMat;   /* fixed-function transform, see S.ff_* */
+    GLint    u_ffVpOff;
     GLint    u_litAmbient, u_zClip;
     GLint    u_tex[4], u_texScale[4], u_fogColor, u_alphaFunc, u_alphaRef;
     uint16_t inputs;
@@ -756,16 +760,33 @@ static int vp_trace(void)
  * So the window is used only for offsets the contiguous allocator has
  * actually handed out. RECOMP_GL_CONTIG_ALL=1 restores the old behaviour.
  */
+/* Where the runtime's general heap begins (xbox_memory_layout.h: stacks end
+ * at 0x00F80000 and the heap runs from there to the top of the map). A DMA
+ * offset at or above this is a heap VA the title handed straight to the GPU
+ * -- MmGetPhysicalAddress is the identity here -- and it can only be heap.
+ * The contiguous arena's high-water mark is a byte count from physical 0, so
+ * once the arena has grown past 15.5 MB every heap VA below the mark is
+ * ambiguous with a contiguous offset, and the resolver, checking the arena
+ * first, sends it to the window: fresh zeroed pages where the title's
+ * vertices are not. RECOMP_GL_HEAP_FIRST=1 sends heap VAs to the heap. */
+#define GL_HEAP_BASE 0x00F80000u
+
+int g_world_dump_pending;   /* set by present() when a frame dump is taken */
+
 static uint32_t resolve(uint32_t off)
 {
     extern uint32_t nv2a_dma_resolve(uint32_t) __attribute__((weak));
-    static int all = -1;
+    static int all = -1, heap_first = -1;
     if (all < 0) { const char *v = getenv("RECOMP_GL_CONTIG_ALL");
                    all = v ? atoi(v) : 0; }
+    if (heap_first < 0) { const char *v = getenv("RECOMP_GL_HEAP_FIRST");
+                          heap_first = v ? atoi(v) : 0; }
     if (all) {   /* the old behaviour, for comparing against */
         if (off < XBOX_CONTIG_SIZE) return XBOX_CONTIG_BASE + off;
         return off;
     }
+    if (heap_first && off >= GL_HEAP_BASE && off < XBOX_CONTIG_SIZE)
+        return off;
     if (nv2a_dma_resolve) return nv2a_dma_resolve(off);
     if (off < xbox_ContiguousAllocatedBytes()) return XBOX_CONTIG_BASE + off;
     return off;
@@ -1206,6 +1227,7 @@ static void pcache_locate_uniforms(int slot)
     g_pcache[slot].u_drawTint   = glGetUniformLocation(prog, "drawTint");
     g_pcache[slot].u_ffMat      = glGetUniformLocation(prog, "ffMat");
     g_pcache[slot].u_ffTexMat   = glGetUniformLocation(prog, "ffTexMat");
+    g_pcache[slot].u_ffVpOff    = glGetUniformLocation(prog, "ffVpOff");
     g_pcache[slot].u_litAmbient = glGetUniformLocation(prog, "litAmbient");
     g_pcache[slot].u_zClip      = glGetUniformLocation(prog, "zClip");
     for (i = 0; i < 4; i++) {
@@ -1706,6 +1728,24 @@ static GLuint upload_texture_inner(const TexStage *t)
     int slot = -1;
 
     if (!w || !h || w > 4096 || h > 4096) return 0;
+
+    /* Same routing census as the vertex arrays, for textures: a texture at
+     * a heap VA below the arena mark is decoded from the window instead. */
+    { static int dc = -1; static uint64_t n[5]; static uint32_t said;
+      if (dc < 0) dc = getenv("RECOMP_GL_DMACENSUS") ? 1 : 0;
+      if (dc) {
+          uint32_t off = t->offset, mark = xbox_ContiguousAllocatedBytes(); int cls;
+          if (off & 0x80000000u)      cls = 0;
+          else if (off < GL_HEAP_BASE) cls = off < mark ? 1 : 4;
+          else                         cls = off < mark ? 2 : 3;
+          n[cls]++;
+          if (++said % 2000 == 0)
+              fprintf(stderr, "  [DMA] texture uploads by route: bit31 %llu, contiguous %llu, "
+                              "HEAP-BELOW-MARK %llu, heap-above-mark %llu, low-above-mark %llu\n",
+                      (unsigned long long)n[0], (unsigned long long)n[1],
+                      (unsigned long long)n[2], (unsigned long long)n[3],
+                      (unsigned long long)n[4]);
+      } }
 
     /* Cache on where it came from and what it looks like. Hashing the whole
      * image would be exact but costs a full read per draw; hashing a sparse
@@ -2438,6 +2478,57 @@ static void do_draw(void)
                                                   * layout GL will accept */
     }
 
+    /*
+     * RECOMP_GL_DMACENSUS=1: where every draw's position array is routed.
+     *
+     * The DMA offset the title puts in SET_VERTEX_DATA_ARRAY_OFFSET is
+     * whatever MmGetPhysicalAddress gave it, and here that is the VA itself.
+     * A contiguous allocation is a VA in the window (0x80000000 + P, or P if
+     * D3D masked it), a heap allocation is a VA from 0x00F80000 up. The
+     * resolver decides by "is it below the arena's high-water mark", which
+     * is right for P and wrong for a heap VA the moment the arena passes
+     * 15.5 MB. Count the draws in each class, with the mark, so the size of
+     * the ambiguous class -- heap VA, below the mark, currently read from
+     * the window -- is a number and not a theory. For those, also say
+     * whether the window bytes it reads are zero (fresh pages: geometry
+     * silently absent) and whether the heap bytes it should read are not.
+     */
+    { static int dc = -1; static uint64_t tri[5], nd[5], zwin, nzheap;
+      static uint32_t dlast, mark;
+      if (dc < 0) dc = getenv("RECOMP_GL_DMACENSUS") ? 1 : 0;
+      if (dc && !inl) {
+          uint32_t off = S.attr[0].offset; int cls;
+          mark = xbox_ContiguousAllocatedBytes();
+          if (off & 0x80000000u)      cls = 0;   /* window VA outright */
+          else if (off < GL_HEAP_BASE) cls = off < mark ? 1 : 4;
+          else                         cls = off < mark ? 2 : 3;
+          tri[cls] += out_n / 3; nd[cls]++;
+          if (cls == 2) {
+              const uint32_t *w = (const uint32_t *)guest(XBOX_CONTIG_BASE + off);
+              const uint32_t *h = (const uint32_t *)guest(off);
+              int q, wz = 1, hz = 1;
+              for (q = 0; q < 16; q++) { if (w[q]) wz = 0; if (h[q]) hz = 0; }
+              zwin += wz; nzheap += !hz;
+          }
+      }
+      if (dc && S.draws - dlast >= 200000u) {
+          dlast = S.draws;
+          fprintf(stderr, "  [DMA] position arrays by route (arena mark %u bytes = 0x%08X, heap from 0x%08X):\n",
+                  mark, mark, GL_HEAP_BASE);
+          fprintf(stderr, "  [DMA]   window VA (bit31)      : %8llu draws %10llu tris\n"
+                          "  [DMA]   contiguous offset      : %8llu draws %10llu tris\n"
+                          "  [DMA]   HEAP VA BELOW MARK     : %8llu draws %10llu tris  (window bytes zero: %llu, heap bytes nonzero: %llu)\n"
+                          "  [DMA]   heap VA above mark     : %8llu draws %10llu tris\n"
+                          "  [DMA]   low VA above mark      : %8llu draws %10llu tris\n",
+                  (unsigned long long)nd[0], (unsigned long long)tri[0],
+                  (unsigned long long)nd[1], (unsigned long long)tri[1],
+                  (unsigned long long)nd[2], (unsigned long long)tri[2],
+                  (unsigned long long)zwin, (unsigned long long)nzheap,
+                  (unsigned long long)nd[3], (unsigned long long)tri[3],
+                  (unsigned long long)nd[4], (unsigned long long)tri[4]);
+          fflush(stderr);
+      } }
+
     if (vbuf_cap < out_n * stride_floats) {
         vbuf_cap = out_n * stride_floats + 4096;
         free(vbuf);
@@ -2940,6 +3031,8 @@ static void do_draw(void)
     }
     if (g_pcache[slot].u_ffMat >= 0) {
         glUniform4fv(g_pcache[slot].u_ffMat, 4, &S.u.ff_mat[0][0]);
+        if (g_pcache[slot].u_ffVpOff >= 0)
+            glUniform4fv(g_pcache[slot].u_ffVpOff, 1, S.vp_off_reg);
         if (g_pcache[slot].u_ffTexMat >= 0)
             glUniform4fv(g_pcache[slot].u_ffTexMat, 16, &S.u.ff_texmat[0][0]);
     }
@@ -3483,6 +3576,173 @@ static void do_draw(void)
      * Every fourth draw, vertex zero only: enough to bucket by, cheap enough
      * to leave on for a whole run.
      */
+    /*
+     * RECOMP_GL_WORLDY: the world height of every dynamic object, from its
+     * own transform.
+     *
+     * The whole GPU raster pipeline is eliminated -- nothing is clipped,
+     * culled, depth-tested or w-buffered away -- so a floating vehicle is
+     * placed where its transform puts it, and the transform is computed by
+     * the recompiled CPU and uploaded as constants. A dynamic object reads a
+     * bone/object matrix at c[A0+base]; when that matrix is a genuine affine
+     * world transform (last row 0,0,0,1) its fourth column is the object's
+     * world position, and column Y is its height. On the ground that is
+     * small. If the floaters cluster at a large Y, the CPU is computing their
+     * height wrong -- which is the bug, located, on the correct side of the
+     * emulator at last.
+     *
+     * Histogram the height across all such draws, sampled, so the shape of
+     * the distribution shows whether objects sit at a sensible spread of
+     * ground and rooftop heights or pile up at an impossible one.
+     */
+    { static int wy = -1; static uint64_t hist[12]; static uint32_t wlast;
+      static const float edges[11] = { -100,-20,-5,0,5,20,50,100,200,500,1000 };
+      if (wy < 0) wy = getenv("RECOMP_GL_WORLDY") ? 1 : 0;
+      if (wy && slot >= 0 && g_pcache[slot].uses_a0 && out_n >= 3
+             && S.xf_mode != NV2A_XF_MODE_FIXED && (S.draws & 1u) == 0) {
+          Nv2aVshProgram vp;
+          uint32_t pstart = S.prog_start < NV2A_VSH_MAX_INSNS ? S.prog_start : 0;
+          int len = nv2a_vsh_decode(S.prog + pstart * 4,
+                                    (int)(NV2A_VSH_MAX_INSNS - pstart), &vp);
+          int q, rel_base = -1;
+          for (q = 0; q < len; q++)
+              if (vp.insns[q].rel_addr) { rel_base = vp.insns[q].const_index; break; }
+          if (rel_base >= 0) {
+              float vin[16][4]; int a0s[8], na, k;
+              memset(vin, 0, sizeof vin);
+              for (k = 0; k < NUM_ATTRS; k++) {
+                  if (attr_at[k] >= 0)
+                      memcpy(vin[k], &vbuf[(size_t)(out_n/2) * stride_floats
+                                           + attr_at[k]], 16);
+                  else memcpy(vin[k], S.const_attr[k], 16);
+              }
+              na = nv2a_vsh_interp_a0(&vp, vin, S.u.c, a0s, 8);
+              if (na > 0) {
+                  int idx = rel_base + a0s[0];
+                  if (idx >= 0 && idx + 3 < NV2A_VSH_NUM_CONSTS) {
+                      const float *r3 = S.u.c[idx + 3];
+                      /* only genuine affine world matrices */
+                      if (fabsf(r3[0]) < 1e-4f && fabsf(r3[1]) < 1e-4f
+                       && fabsf(r3[2]) < 1e-4f && fabsf(r3[3]-1.0f) < 1e-3f) {
+                          float wyv = S.u.c[idx + 1][3];   /* col 3 of row Y */
+                          int b; for (b = 0; b < 11 && wyv >= edges[b]; b++) ;
+                          hist[b]++;
+                      }
+                  }
+              }
+          }
+      }
+      if (wy && S.draws - wlast >= 200000u) {
+          int b; wlast = S.draws;
+          fprintf(stderr, "  [WORLDY] object world height, all dynamic objects:\n");
+          fprintf(stderr, "  [WORLDY]   <-100 <-20 <-5 <0 <5 <20 <50 <100 <200 "
+                          "<500 <1000 1000+\n  [WORLDY]  ");
+          for (b = 0; b < 12; b++) fprintf(stderr, " %8llu",
+                                           (unsigned long long)hist[b]);
+          fprintf(stderr, "\n"); fflush(stderr);
+      } }
+
+    /*
+     * RECOMP_GL_DUMP_WORLD=1: the scene in world space, once per frame dump.
+     *
+     * Every picture so far is the camera's. This is the map. For each draw
+     * of the frame after a framebuffer dump, take a sample of its vertices,
+     * put each through the object matrix the program would use -- the four
+     * rows at c[A0+base] for a palette draw, c[107..110] for a fixed one --
+     * and write the world position, alongside the screen position the whole
+     * program produces. Plotted from above, the road network is a road
+     * network and a bus is a dot that is either on it or not; plotted from
+     * the side, a vehicle is either at the height of the road under it or
+     * hanging above nothing. No reference needed for that comparison: the
+     * road and the bus are in the same file in the same coordinates.
+     *
+     * The frame's camera goes in too (c[103..106]) so the view can be
+     * reconstructed, and each draw carries its slot, texture and matrix
+     * kind so the dots can be coloured by what drew them.
+     */
+    { static int wd = -1; static FILE *fp; static uint32_t start_flip; static int shot;
+      extern int g_world_dump_pending;
+      if (wd < 0) wd = getenv("RECOMP_GL_DUMP_WORLD") ? 1 : 0;
+      if (wd && g_world_dump_pending && !fp) {
+          char name[256]; const char *pfx = getenv("RECOMP_GL_DUMP_FB");
+          snprintf(name, sizeof name, "%s_world_%03d.txt", pfx ? pfx : "dump", shot++);
+          fp = fopen(name, "w"); start_flip = S.flips;
+          if (fp) { int r;
+              fprintf(fp, "# frame at flip %u draws %u\n", S.flips, S.draws);
+              for (r = 103; r <= 106; r++)
+                  fprintf(fp, "# c[%d] %.6g %.6g %.6g %.6g\n", r, S.u.c[r][0], S.u.c[r][1], S.u.c[r][2], S.u.c[r][3]);
+              fprintf(fp, "# c[58] %.6g %.6g %.6g %.6g\n# c[59] %.6g %.6g %.6g %.6g\n",
+                      S.u.c[58][0], S.u.c[58][1], S.u.c[58][2], S.u.c[58][3],
+                      S.u.c[59][0], S.u.c[59][1], S.u.c[59][2], S.u.c[59][3]);
+              fprintf(fp, "# columns: draw slot a0 matrix_base tex0 prim nverts | wx wy wz | sx sy sz sw | vx vy vz\n");
+          }
+      }
+      if (fp && S.flips - start_flip >= 3) { fclose(fp); fp = NULL; g_world_dump_pending = 0; }
+      /* The fixed-function half of the scene: the composite matrix and the
+       * homogeneous result for the same vertex sample, so the two pipelines'
+       * screen positions can be laid side by side. */
+      if (fp && slot >= 0 && out_n >= 3 && S.xf_mode == NV2A_XF_MODE_FIXED) {
+          uint32_t step = out_n / 48, vtx; int r; if (!step) step = 1;
+          fprintf(fp, "f %u %d %08X %u %u vpoff %.4g %.4g %.4g vpscl %.4g %.4g %.4g\n", S.draws, slot,
+                  S.tex[0].offset, S.prim, out_n, S.u.vp_off[0], S.u.vp_off[1], S.u.vp_off[2],
+                  S.u.vp_scale[0], S.u.vp_scale[1], S.u.vp_scale[2]);
+          for (r = 0; r < 4; r++)
+              fprintf(fp, "m %.6g %.6g %.6g %.6g\n", S.u.ff_mat[r][0], S.u.ff_mat[r][1],
+                      S.u.ff_mat[r][2], S.u.ff_mat[r][3]);
+          for (vtx = 0; vtx < out_n; vtx += step) {
+              const float *v = &vbuf[(size_t)vtx * stride_floats + (attr_at[0] >= 0 ? attr_at[0] : 0)];
+              float p[4];
+              for (r = 0; r < 4; r++)
+                  p[r] = v[0]*S.u.ff_mat[r][0] + v[1]*S.u.ff_mat[r][1]
+                       + v[2]*S.u.ff_mat[r][2] + v[3]*S.u.ff_mat[r][3];
+              fprintf(fp, "w %.5g %.5g %.5g %.5g %.5g %.5g %.5g\n", p[0], p[1], p[2], p[3], v[0], v[1], v[2]);
+          }
+      }
+      if (fp && slot >= 0 && out_n >= 3 && S.xf_mode != NV2A_XF_MODE_FIXED) {
+          Nv2aVshProgram vp;
+          uint32_t pstart = S.prog_start < NV2A_VSH_MAX_INSNS ? S.prog_start : 0;
+          int len = nv2a_vsh_decode(S.prog + pstart * 4,
+                                    (int)(NV2A_VSH_MAX_INSNS - pstart), &vp);
+          int q, rel_base = -1, fixed_base = -1;
+          for (q = 0; q < len; q++)
+              if (vp.insns[q].rel_addr) { rel_base = vp.insns[q].const_index; break; }
+          if (rel_base < 0 && g_pcache[slot].dis && strstr(g_pcache[slot].dis, "c[107]"))
+              fixed_base = 107;
+          if (rel_base >= 0 || fixed_base >= 0) {
+              uint32_t step = out_n / 48; if (!step) step = 1;
+              uint32_t vtx;
+              fprintf(fp, "d %u %d %d %d %08X %u %u vpoff %.4g %.4g %.4g c59 %.4g %.4g %.4g c58 %.4g %.4g %.4g\n",
+                      S.draws, slot, rel_base >= 0,
+                      rel_base >= 0 ? rel_base : fixed_base, S.tex[0].offset, S.prim, out_n,
+                      S.u.vp_off[0], S.u.vp_off[1], S.u.vp_off[2],
+                      S.u.c[59][0], S.u.c[59][1], S.u.c[59][2],
+                      S.u.c[58][0], S.u.c[58][1], S.u.c[58][2]);
+              for (vtx = 0; vtx < out_n; vtx += step) {
+                  float vin[16][4], op[4]; int k, base = fixed_base;
+                  memset(vin, 0, sizeof vin);
+                  for (k = 0; k < NUM_ATTRS; k++) {
+                      if (attr_at[k] >= 0)
+                          memcpy(vin[k], &vbuf[(size_t)vtx * stride_floats + attr_at[k]], 16);
+                      else memcpy(vin[k], S.const_attr[k], 16);
+                  }
+                  if (rel_base >= 0) {
+                      int a0s[8], na = nv2a_vsh_interp_a0(&vp, vin, S.u.c, a0s, 8);
+                      if (na < 1) continue;
+                      base = rel_base + a0s[0];
+                  }
+                  if (base < 0 || base + 3 >= NV2A_VSH_NUM_CONSTS) continue;
+                  if (!nv2a_vsh_interp(&vp, vin, S.u.c, op)) continue;
+                  { const float *v = vin[0]; float w[3]; int r;
+                    for (r = 0; r < 3; r++)
+                        w[r] = S.u.c[base+r][0]*v[0] + S.u.c[base+r][1]*v[1]
+                             + S.u.c[base+r][2]*v[2] + S.u.c[base+r][3]*v[3];
+                    fprintf(fp, "v %d %.4g %.4g %.4g %.4g %.4g %.4g %.4g %.4g %.4g %.4g\n",
+                            base, w[0], w[1], w[2], op[0], op[1], op[2], op[3], v[0], v[1], v[2]);
+                  }
+              }
+          }
+      } }
+
     { static int dcen = -1;
       static uint64_t dw[2][8], dn[2][8]; static uint32_t dlast;
       static const float edges[7] = { 50, 100, 200, 400, 800, 1600, 3200 };
@@ -4775,6 +5035,7 @@ static void present(int is_frame)
             return;
         }
         if (dump_due) {
+            g_world_dump_pending = 1;   /* RECOMP_GL_DUMP_WORLD: next frame's map */
             ring_dump();
             /* Every surface, not just the one that happens to be current: a
              * title that builds its frame off-screen and composites leaves
@@ -5182,6 +5443,7 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
               if (fv < 100.0f && S.u.vp_scale[0] > 100.0f) return;
           } }
         memcpy(&S.u.vp_off[sub], &param, 4);
+        memcpy(&S.vp_off_reg[sub], &param, 4);
         /* Only dirty the bank on a real change: the title rewrites the
          * viewport around most draws, and re-uploading 192 vec4s each time
          * costs more than the draw does. */

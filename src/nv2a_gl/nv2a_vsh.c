@@ -390,11 +390,57 @@ static const char *GLSL_PRELUDE =
  * arrive here having written oPos in the same space, and one conversion
  * serves them both.
  */
-static void emit_viewport_epilogue(SB *sb)
+static void emit_viewport_epilogue(SB *sb, int ff)
 {
     sb_add(sb,
         "\n"
-        "    vec4 ndc;\n"
+        "    vec4 ndc;\n");
+    if (ff) {
+        /*
+         * The fixed-function half, done the way the hardware does it (xemu,
+         * hw/xbox/nv2a/pgraph/glsl/vsh-ff.c):
+         *
+         *     oPos = position * composite;  oPos.xy /= oPos.w;
+         *     oPos.xy += c[VPOFF].xy;
+         *     oPos.xy = (2 * oPos.xy - surfaceSize) / surfaceSize;
+         *
+         * The composite matrix D3D uploads already carries the viewport
+         * scale AND the screen centre, so the divide lands in 0..640 by
+         * 0..480 pixels; the viewport OFFSET register, which the driver sets
+         * to (0.53125, 0.53125) for the duration of its fixed-function draws
+         * and to (320.53, 240.53) for its vertex-program draws, is added on
+         * top by the hardware and is only the half-pixel nudge here. The
+         * body has added it already. Then back to clip space by the surface
+         * size, exactly as the programmable path in xemu does.
+         *
+         * Before this, the shared mode-0 conversion below subtracted that
+         * (0.53, 0.53) offset and divided by the viewport scale -- which is
+         * the inverse of the programmable path's (320.53, 240.53) viewport,
+         * not of this one. Screen centre (320, 240) therefore landed at the
+         * bottom-right CORNER of the frame: the whole fixed-function world --
+         * every building, road and deck -- was drawn half a screen right and
+         * half a screen down of where the title put it, while every vertex-
+         * program draw -- every character, vehicle and pedestrian -- was
+         * where it belonged. Pedestrians in the sky above the rooftops, a
+         * bus in the air beside a deck that stops mid-span, and Beat
+         * standing on nothing were all one displacement.
+         */
+        sb_add(sb,
+            "    ndc.x = oPos.x * 2.0 / vpSurface.x - 1.0;\n"
+            "    ndc.y = 1.0 - oPos.y * 2.0 / vpSurface.y;\n"
+            "    ndc.z = (zClip.y > zClip.x)\n"
+            "          ? (oPos.z - zClip.x) / (zClip.y - zClip.x)\n"
+            "          : (oPos.z - vpOff.z) / (vpScale.z != 0.0 ? vpScale.z : 1.0);\n"
+            "#if !NV2A_CLIP_Z01\n"
+            "    ndc.z = ndc.z * 2.0 - 1.0;   // D3D depth [0,1] -> GL [-1,1]\n"
+            "#endif\n"
+            "    ndc.w = oPos.w;\n"
+            "    gl_Position = vec4(ndc.xyz * ndc.w, ndc.w);\n"
+            "    oFogC = oFog.x;\n"
+            "    gl_PointSize = max(oPts.x, 1.0);\n");
+        return;
+    }
+    sb_add(sb,
         "    if (posMode == 1) {\n"
         "        // The program left clip space alone: hand it over as is,\n"
         "        // remapping depth only where the target API wants [-w,w].\n"
@@ -591,7 +637,7 @@ static void emit_program_body(SB *sb, const Nv2aVshProgram *p)
      * this point and the perspective divide has not happened, so scaling xyz
      * against w is what puts the geometry back where the title meant it.
      */
-    emit_viewport_epilogue(sb);
+    emit_viewport_epilogue(sb, 0);
 }
 
 
@@ -640,6 +686,7 @@ int nv2a_vsh_emit_ff_glsl(const Nv2aVshFixed *f, char *buf, int bufsize)
 
     sb_add(&sb,
         "\nuniform vec4 ffMat[4];      // NV097_SET_COMPOSITE_MATRIX\n"
+        "uniform vec4 ffVpOff;       // NV097_SET_VIEWPORT_OFFSET, as written\n"
         "uniform float litAmbient;   // stand-in for the T&L unit's lighting\n"
         "uniform vec4 ffTexMat[16];  // NV097_SET_TEXTURE_MATRIX, 4 stages\n"
         "\nvoid main() {\n"
@@ -660,8 +707,14 @@ int nv2a_vsh_emit_ff_glsl(const Nv2aVshFixed *f, char *buf, int bufsize)
         "    // hardware -- so the divide by w lands straight in screen\n"
         "    // pixels, and the shared epilogue takes it from there.\n"
         "    float rhw = (p.w != 0.0) ? 1.0 / p.w : 0.0;\n"
-        "    oPos.xyz = p.xyz * rhw;\n"
-        "    oPos.w = rhw;\n");
+        "    // The hardware adds the viewport offset register after the\n"
+        "    // divide (xemu vsh-ff.c); the epilogue then un-screens by the\n"
+        "    // surface size. w stays the true clip w so the rasteriser\n"
+        "    // interpolates texture coordinates perspective-correctly --\n"
+        "    // handing it 1/w inverted the correction on every world polygon.\n"
+        "    oPos.xy = p.xy * rhw + ffVpOff.xy;\n"
+        "    oPos.z = p.z * rhw;\n"
+        "    oPos.w = (p.w != 0.0) ? p.w : 1.0;\n");
 
     /* Colour. Lighting is not emulated yet; a title that pre-bakes its
      * shading into the vertex colours -- which a cel-shaded one does -- is
@@ -702,7 +755,7 @@ int nv2a_vsh_emit_ff_glsl(const Nv2aVshFixed *f, char *buf, int bufsize)
         }
     }
     sb_add(&sb, "    oFogC = 1.0;\n");
-    emit_viewport_epilogue(&sb);
+    emit_viewport_epilogue(&sb, 1);
     sb_add(&sb, "}\n");
     return sb.overflow ? 0 : sb.pos;
 }
@@ -1014,8 +1067,11 @@ int nv2a_vsh_emit_ff_msl(const Nv2aVshFixed *f, char *buf, int bufsize)
         "    float4 p = float4(dot(v0, U.ffMat[0]), dot(v0, U.ffMat[1]),\n"
         "                      dot(v0, U.ffMat[2]), dot(v0, U.ffMat[3]));\n"
         "    float rhw = (p.w != 0.0) ? 1.0 / p.w : 0.0;\n"
-        "    oPos.xyz = p.xyz * rhw;\n"
-        "    oPos.w = rhw;\n");
+        "    // The viewport offset register, added after the divide as the\n"
+        "    // hardware does (see the GLSL emitter). U.vpOff is that register.\n"
+        "    oPos.xy = p.xy * rhw + U.vpOff.xy;\n"
+        "    oPos.z = p.z * rhw;\n"
+        "    oPos.w = (p.w != 0.0) ? p.w : 1.0;\n");
 
     sb_add(&sb,
         !f->has_diffuse ? "    oD0 = float4(1.0);\n" : "    oD0 = v3;\n");
@@ -1038,7 +1094,7 @@ int nv2a_vsh_emit_ff_msl(const Nv2aVshFixed *f, char *buf, int bufsize)
         }
     }
 
-    emit_viewport_epilogue(&sb);
+    emit_viewport_epilogue(&sb, 1);
 
     sb_add(&sb,
         "    Nv2aVshOut o;\n"
