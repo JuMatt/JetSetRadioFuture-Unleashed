@@ -168,7 +168,25 @@ extern uint32_t  xbox_ContiguousAllocatedBytes(void);
 #define M_SET_COMBINER_COLOR_ICW    0x0AC0   /* +i*4 */
 #define M_SET_COMBINER_COLOR_OCW    0x1E40   /* +i*4 */
 #define M_SET_COMBINER_CONTROL      0x1E60
-#define M_SET_FOG_COLOR             0x02FC
+/* Fog. FOG_COLOR was at 0x02FC, which is not an NV097 method at all -- the
+ * register is 0x02A8 -- so the fog colour was never read and sat at zero.
+ * The header also says its byte order is A-B-G-R, red in the LOW byte; the
+ * old decode took the high byte as red. Both fixed. The other fog registers
+ * were never decoded. */
+#define M_SET_FOG_MODE              0x029C
+#define M_SET_FOG_GEN_MODE          0x02A0
+#define M_SET_FOG_ENABLE            0x02A4
+#define M_SET_FOG_COLOR             0x02A8
+#define M_SET_FOG_PARAMS            0x09C0   /* +0..+8, three floats */
+/* Depth behaviour registers the renderer never decoded. CONTROL0 carries the
+ * w-buffering switch (Z_PERSPECTIVE_ENABLE) and the depth format; xemu reads
+ * both into its shader state. ZMIN_MAX_CONTROL says whether a fragment past
+ * the near or far plane is CULLED or CLAMPED to the plane -- xemu maps its
+ * ZCLAMP_EN bit straight onto GL_DEPTH_CLAMP. A title that clamps, drawn by a
+ * renderer that clips, loses everything beyond its far plane: the near half
+ * of the world, and nothing else, which is the picture on screen. */
+#define M_SET_CONTROL0              0x0290
+#define M_SET_ZMIN_MAX_CONTROL      0x1D78
 
 #define M_SET_COLOR_CLEAR_VALUE     0x1D90
 #define M_CLEAR_SURFACE             0x1D94
@@ -286,6 +304,10 @@ static struct {
     /* the pixel pipeline, as raw register words */
     Nv2aPshState psh;
     uint32_t fog_color;
+    uint32_t fog_mode, fog_gen_mode, fog_enable;
+    float    fog_params[3];
+    uint32_t control0;           /* NV097_SET_CONTROL0 */
+    uint32_t zminmax;            /* NV097_SET_ZMIN_MAX_CONTROL */
 
     /* textures and fixed state */
     TexStage tex[NUM_STAGES];
@@ -1157,6 +1179,13 @@ static void psh_sync_textures(void)
     S.psh.alpha_test = (uint8_t)(S.alpha_test ? 1 : 0);
     S.psh.alpha_func = (uint32_t)S.alpha_func;
     S.psh.alpha_ref  = S.alpha_ref;
+    /* RECOMP_GL_WBUFFER=0 ignores the register (the old behaviour); =1
+     * forces it on; unset honours what the title wrote to CONTROL0. */
+    { static int wb = -2;
+      if (wb == -2) { const char *v = getenv("RECOMP_GL_WBUFFER");
+                      wb = v ? atoi(v) : -1; }
+      S.psh.w_buffer = (uint8_t)(wb >= 0 ? wb
+                                         : ((S.control0 >> 16) & 1u)); }
 }
 
 /* Where this program keeps the things the backend sets every draw.
@@ -1432,7 +1461,8 @@ static int program_for_current(void)
       if (solid < 0) solid = (getenv("RECOMP_GL_SOLID")
                            || getenv("RECOMP_GL_DRAWID")
                            || getenv("RECOMP_GL_TINT_XF")
-                           || getenv("RECOMP_GL_TINT_GEQUAL")) ? 1 : 0;
+                           || getenv("RECOMP_GL_TINT_GEQUAL")
+                           || getenv("RECOMP_GL_TINTCLIP")) ? 1 : 0;
       if (solid) { free(fsrc); fsrc = NULL; } }
     /* RECOMP_GL_DUMP_PSH_3D=<n>: the generated combiner shader for the first
      * few programs compiled once the scene is up, with the raw register words
@@ -2771,6 +2801,52 @@ static void do_draw(void)
      * round, which is the way it was always worth asking: point at the part
      * of the picture that is wrong and read off who drew it.
      */
+    /*
+     * RECOMP_GL_TINTCLIP: run the middle vertex through the interpreter, work
+     * out whether the epilogue's ndc.z leaves [-1,1] -- i.e. whether GL would
+     * clip this draw on the near or far plane -- and paint it.
+     *
+     * Depth clamp forced on did not bring the far road back, and the title
+     * both leaves w-buffering off for the scene and asks to CULL past the far
+     * plane, so the "far-plane clipping" story is unproven. This settles it by
+     * location, not by argument: red for draws GL would clip on z, green for
+     * draws that survive. If the missing road fills red, it is clipped and the
+     * fix is in the epilogue's z mapping; if the missing road stays empty
+     * while red lands elsewhere, that geometry is simply not submitted and the
+     * search moves to the pushbuffer.
+     */
+    { static int tc = -1;
+      if (tc < 0) tc = getenv("RECOMP_GL_TINTCLIP") ? 1 : 0;
+      if (tc && g_pcache[slot].u_drawTint >= 0 && out_n >= 3
+             && S.xf_mode != NV2A_XF_MODE_FIXED) {
+          Nv2aVshProgram vp;
+          uint32_t pstart = S.prog_start < NV2A_VSH_MAX_INSNS ? S.prog_start : 0;
+          int len = nv2a_vsh_decode(S.prog + pstart * 4,
+                                    (int)(NV2A_VSH_MAX_INSNS - pstart), &vp);
+          int clipped = 0, ok = 0, k2; uint32_t vi2;
+          for (vi2 = 0; vi2 < out_n && vi2 < 24; vi2++) {
+              float vin[16][4], op[4];
+              memset(vin, 0, sizeof vin);
+              for (k2 = 0; k2 < NUM_ATTRS; k2++) {
+                  if (attr_at[k2] >= 0)
+                      memcpy(vin[k2], &vbuf[(size_t)vi2 * stride_floats
+                                            + attr_at[k2]], 16);
+                  else memcpy(vin[k2], S.const_attr[k2], 16);
+              }
+              if (!nv2a_vsh_interp(&vp, vin, S.u.c, op)) continue;
+              /* The epilogue's own z mapping, mode 0: ndc.z from the clip
+               * range, then compared against the clip volume in [-1,1]. */
+              { float z01 = (S.u.z_clip[1] > S.u.z_clip[0])
+                          ? (op[2] - S.u.z_clip[0]) / (S.u.z_clip[1] - S.u.z_clip[0])
+                          : op[2] / 16777215.0f;
+                float ndcz = z01 * 2.0f - 1.0f;   /* GL clip is [-w,w]/[-1,1] */
+                if (ndcz < -1.001f || ndcz > 1.001f) clipped++; else ok++; }
+          }
+          glUniform4f(g_pcache[slot].u_drawTint,
+                      clipped > ok ? 0.95f : 0.1f,
+                      clipped > ok ? 0.1f  : 0.9f, 0.1f, 1.0f);
+          goto tint_done;
+      } }
     if (g_pcache[slot].u_drawTint >= 0) {
         static int drawid = -1;
         if (drawid < 0) drawid = getenv("RECOMP_GL_DRAWID") ? 1 : 0;
@@ -2848,6 +2924,7 @@ static void do_draw(void)
             glUniform4f(g_pcache[slot].u_drawTint, 1.0f, 0.0f, 1.0f, 1.0f);
         }
     }
+    tint_done: ;
     /* The fixed-function transform, for the shaders that use it. Uploaded
      * whenever it changed or the program did, since uniforms belong to the
      * program object. */
@@ -2933,9 +3010,9 @@ static void do_draw(void)
     }
     if (g_pcache[slot].u_fogColor >= 0)
         glUniform4f(g_pcache[slot].u_fogColor,
-                    ((S.fog_color >> 16) & 0xFF) / 255.0f,
+                    (S.fog_color & 0xFF) / 255.0f,          /* R: low byte */
                     ((S.fog_color >> 8) & 0xFF) / 255.0f,
-                    (S.fog_color & 0xFF) / 255.0f,
+                    ((S.fog_color >> 16) & 0xFF) / 255.0f,  /* B */
                     ((S.fog_color >> 24) & 0xFF) / 255.0f);
     {
         /* RECOMP_GL_NOALPHATEST=1 passes every fragment.
@@ -3016,7 +3093,7 @@ static void do_draw(void)
                * The surface offset in the key says whether that is what is
                * happening. */
               enum { DC = 32 };
-              static struct { int t, f, m, a0; uint32_t surf, cm;
+              static struct { int t, f, m, a0, wb; uint32_t surf, cm;
                               uint64_t draws, tris; } dc[DC];
               static int ndc; static uint32_t last;
               int a0 = (slot >= 0 && g_pcache[slot].uses_a0) ? 1 : 0, i;
@@ -3024,20 +3101,23 @@ static void do_draw(void)
                   if (dc[i].t == S.depth_test && dc[i].f == S.depth_func
                    && dc[i].m == S.depth_mask && dc[i].a0 == a0
                    && dc[i].surf == S.color_offset
-                   && dc[i].cm == S.color_mask) break;
+                   && dc[i].cm == S.color_mask
+                   && dc[i].wb == (int)S.psh.w_buffer) break;
               if (i == ndc && ndc < DC) { dc[ndc].t = S.depth_test;
                   dc[ndc].f = S.depth_func; dc[ndc].m = S.depth_mask;
                   dc[ndc].a0 = a0; dc[ndc].surf = S.color_offset;
-                  dc[ndc].cm = S.color_mask; ndc++; }
+                  dc[ndc].cm = S.color_mask; dc[ndc].wb = (int)S.psh.w_buffer;
+                  ndc++; }
               if (i < ndc) { dc[i].draws++; dc[i].tris += out_n / 3; }
               if (S.draws - last >= 150000u) {
                   last = S.draws;
                   fprintf(stderr, "  [DCENSUS] depth state by draw class and "
                           "surface:\n");
                   for (i = 0; i < ndc; i++)
-                      fprintf(stderr, "  [DCENSUS]   surface %08X  %-8s test=%d "
+                      fprintf(stderr, "  [DCENSUS]   surface %08X  %-3s %s test=%d "
                               "func=0x%03X zwrite=%2d colour=%08X   %8llu draws %10llu tris\n",
-                              dc[i].surf, dc[i].a0 ? "entity" : "world",
+                              dc[i].surf, dc[i].a0 ? "A0" : "  ",
+                              dc[i].wb ? "W-BUF" : "z    ",
                               dc[i].t, dc[i].f, dc[i].m, dc[i].cm,
                               (unsigned long long)dc[i].draws,
                               (unsigned long long)dc[i].tris);
@@ -3066,6 +3146,8 @@ static void do_draw(void)
         rs.alpha_test   = S.alpha_test;
         rs.cull_enable  = S.cull_enable;
         rs.color_mask   = S.color_mask;
+        rs.zclamp       = S.zminmax;
+        rs.w_buffer     = S.psh.w_buffer;
         rs.cull_face    = S.cull_face;
         rs.front_face   = S.front_face;
         /* The window clip. A rectangle that covers the surface is the same as
@@ -4915,6 +4997,10 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
         S.consts_since_geom = 1;
         return;
     }
+    if (method >= M_SET_FOG_PARAMS && method < M_SET_FOG_PARAMS + 12) {
+        memcpy(&S.fog_params[(method - M_SET_FOG_PARAMS) / 4], &param, 4);
+        return;
+    }
     if (method >= M_SET_WINDOW_CLIP_HORZ && method < M_SET_WINDOW_CLIP_HORZ + 32) {
         S.wclip_h[(method - M_SET_WINDOW_CLIP_HORZ) / 4] = param;
         S.wclip_valid = 1; return;
@@ -5168,6 +5254,35 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
     case M_SET_COMBINER_SPECFOG_CW0: S.psh.final_abcd = param; break;
     case M_SET_COMBINER_SPECFOG_CW1: S.psh.final_efg = param; break;
     case M_SET_FOG_COLOR:            S.fog_color = param; break;
+    case M_SET_FOG_MODE:             S.fog_mode = param; break;
+    case M_SET_FOG_GEN_MODE:         S.fog_gen_mode = param; break;
+    case M_SET_FOG_ENABLE:           S.fog_enable = param; break;
+    case M_SET_CONTROL0: {
+        static uint32_t said = 0xFFFFFFFFu;
+        S.control0 = param;
+        if (param != said) {
+            said = param;
+            fprintf(stderr, "  [GL] CONTROL0 = %08X at draw %u, flip %u: z_format=%s  "
+                    "w-buffering(Z_PERSPECTIVE)=%s  stencil_write=%s\n", param,
+                    S.draws, S.flips,
+                    (param & (1u << 12)) ? "float" : "fixed",
+                    (param & (1u << 16)) ? "ON" : "off",
+                    (param & 1u) ? "on" : "off");
+            fflush(stderr);
+        }
+        break; }
+    case M_SET_ZMIN_MAX_CONTROL: {
+        static uint32_t said = 0xFFFFFFFFu;
+        S.zminmax = param;
+        if (param != said) {
+            said = param;
+            fprintf(stderr, "  [GL] ZMIN_MAX_CONTROL = %08X at draw %u: past the near/far "
+                    "plane a fragment is %s\n", param, S.draws,
+                    (param & 0xF0u) ? "CLAMPED to it (GL_DEPTH_CLAMP)"
+                                    : "culled");
+            fflush(stderr);
+        }
+        break; }
     case M_SET_COLOR_CLEAR_VALUE:    S.clear_color = param; break;
     case M_SET_ZSTENCIL_CLEAR_VALUE: S.clear_zstencil = param; break;
     case M_SET_CLEAR_RECT_H:
@@ -5532,6 +5647,24 @@ static void glb_state(const Nv2aRenderState *rs)
         glDepthMask(rs->depth_write ? GL_TRUE : GL_FALSE);
         g_last.depth_mask = rs->depth_write;
     }
+    /* Past the far plane: clamp or cull, as the title asked -- with
+     * RECOMP_GL_DEPTHCLAMP=1/0 to force it either way for the experiment
+     * that matters: does the distant road come back when nothing beyond the
+     * far plane is thrown away. */
+    { static int last_clamp = -1, force = -2;
+      int clamp;
+      if (force == -2) { const char *v = getenv("RECOMP_GL_DEPTHCLAMP");
+                         force = v ? atoi(v) : -1; }
+      /* A w-buffered draw must not be clipped on the program's z either:
+       * its depth comes from w in the fragment stage, and the console's
+       * range test is against w, which this title's clip range never
+       * rejects. Clamp instead, and let the fragment shader overwrite. */
+      clamp = force >= 0 ? force
+            : ((rs->zclamp & 0xF0u) || rs->w_buffer) ? 1 : 0;
+      if (clamp != last_clamp) {
+          if (clamp) glEnable(GL_DEPTH_CLAMP); else glDisable(GL_DEPTH_CLAMP);
+          last_clamp = clamp;
+      } }
     { static uint32_t last_cm = 0xFFFFFFFFu;
       uint32_t cm = rs->color_mask ? rs->color_mask : 0x01010101u;
       if (g_last_cm_reset) { last_cm = 0xFFFFFFFFu; g_last_cm_reset = 0; }

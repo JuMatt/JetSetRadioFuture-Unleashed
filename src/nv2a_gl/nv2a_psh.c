@@ -481,6 +481,29 @@ static int psh_emit(const Nv2aPshState *ps, char *buf, int bufsize, int msl)
            "      frag = vec4(1.0 - zz, 1.0 - zz, 1.0 - zz, 1.0); }\n"
            "#endif\n");
 
+    /*
+     * W-buffering, the way xemu does it.
+     *
+     * With Z_PERSPECTIVE_ENABLE set the NV2A's depth is not the program's z
+     * at all: it is the clip w, interpolated perspective-correctly across the
+     * triangle. xemu computes that with reciprocal-space barycentrics in the
+     * fragment shader and writes gl_FragDepth from it; here gl_FragCoord.w,
+     * which GL defines as the perspective-correct 1/w, gives the same number
+     * for free. Divided by 2^24 to match a 24-bit fixed buffer, as xemu's
+     * DEPTH_FORMAT_D24 path does.
+     *
+     * What this changes for the picture: the depth test compares w against
+     * CLIP_MIN..CLIP_MAX, and this title sets those to 0..16777215, so no
+     * fragment is ever rejected for being past the far plane. The vertex
+     * stage still has to be stopped from clipping on the program's z -- the
+     * backend enables GL_DEPTH_CLAMP for these draws -- and after that the
+     * whole world reaches the screen, the far half included.
+     *
+     * A separate shader variant, keyed by the w_buffer field in the hash, so
+     * that draws which do not use it keep early depth testing.
+     */
+    if (ps->w_buffer && !msl)
+        sb(&s, "    gl_FragDepth = (1.0 / gl_FragCoord.w) / 16777216.0;\n");
     sb(&s, msl ? "    return frag;\n}\n" : "}\n");
 
     return s.overflow ? 0 : s.pos;

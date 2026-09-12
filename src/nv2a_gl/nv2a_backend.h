@@ -125,6 +125,10 @@ typedef struct Nv2aRenderState {
      * blue, green, red and alpha. 0 means the register was never written,
      * which the console treats as all channels enabled. */
     uint32_t color_mask;
+    /* NV097_SET_ZMIN_MAX_CONTROL: bits 4-7 non-zero means a fragment past the
+     * near or far plane is clamped to it rather than culled. */
+    uint32_t zclamp;
+    int      w_buffer;       /* CONTROL0 Z_PERSPECTIVE_ENABLE: depth is w */
 } Nv2aRenderState;
 
 typedef struct {

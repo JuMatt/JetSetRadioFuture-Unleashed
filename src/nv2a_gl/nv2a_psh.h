@@ -69,6 +69,13 @@ typedef struct {
     uint8_t  alpha_test;
     uint32_t alpha_func;
     float    alpha_ref;
+
+    /* NV097_SET_CONTROL0 Z_PERSPECTIVE_ENABLE: w-buffering. The fragment's
+     * depth is the perspective-correct clip w, not the program's z, and it
+     * is compared against CLIP_MIN..CLIP_MAX -- which for a title that sets
+     * those to 0..16777215 means nothing is ever clipped by depth. Part of
+     * this struct so that the program cache keys on it: the shader differs. */
+    uint8_t  w_buffer;
 } Nv2aPshState;
 
 /*
