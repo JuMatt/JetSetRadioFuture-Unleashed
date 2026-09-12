@@ -178,6 +178,9 @@ extern uint32_t  xbox_ContiguousAllocatedBytes(void);
 #define M_SET_FOG_ENABLE            0x02A4
 #define M_SET_FOG_COLOR             0x02A8
 #define M_SET_FOG_PARAMS            0x09C0   /* +0..+8, three floats */
+#define M_SET_SHADER_CLIP_PLANE_MODE 0x1E6C  /* per stage, per component: >= or < */
+#define M_SET_SHADER_STAGE_PROGRAM  0x1E70   /* texture shader mode, 5 bits per stage */
+#define M_SET_SHADER_OTHER_STAGE_INPUT 0x1E78
 /* Depth behaviour registers the renderer never decoded. CONTROL0 carries the
  * w-buffering switch (Z_PERSPECTIVE_ENABLE) and the depth format; xemu reads
  * both into its shader state. ZMIN_MAX_CONTROL says whether a fragment past
@@ -305,6 +308,7 @@ static struct {
     Nv2aPshState psh;
     uint32_t fog_color;
     uint32_t fog_mode, fog_gen_mode, fog_enable;
+    uint32_t shader_stage_prog, shader_clip_mode, shader_other_input;
     float    fog_params[3];
     uint32_t control0;           /* NV097_SET_CONTROL0 */
     uint32_t zminmax;            /* NV097_SET_ZMIN_MAX_CONTROL */
@@ -323,6 +327,23 @@ static struct {
     /* Displayed frames, as distinct from finished passes: see M_FLIP_STALL. */
     uint32_t frames;
     uint32_t tris_ff, tris_pm;   /* triangles by transform pipeline */
+    uint32_t tris_ff_lit;        /* of the fixed-function ones, drawn with lighting on */
+    /* The T&L unit's lighting state, as the title programs it (xemu vsh-ff.c
+     * reads the same from its lighting context). Decoded so the fixed-
+     * function shader can light the way the hardware does. */
+    uint32_t light_enable_mask;      /* NV097_SET_LIGHT_ENABLE_MASK: 2 bits per light, 0 off 1 infinite 2 local 3 spot */
+    uint32_t color_material;         /* NV097_SET_COLOR_MATERIAL */
+    uint32_t light_control;          /* NV097_SET_LIGHT_CONTROL */
+    uint32_t normalization;          /* NV097_SET_NORMALIZATION_ENABLE */
+    uint32_t specular_enable;        /* NV097_SET_SPECULAR_ENABLE */
+    float    scene_ambient[3];       /* NV097_SET_SCENE_AMBIENT_COLOR */
+    float    material_emission[3];   /* NV097_SET_MATERIAL_EMISSION */
+    float    material_alpha;         /* NV097_SET_MATERIAL_ALPHA */
+    float    light_amb[8][3], light_dif[8][3], light_spc[8][3];
+    float    light_range[8], light_half[8][3], light_dir[8][3];
+    float    light_spot_falloff[8][3], light_spot_dir[8][4];
+    float    light_pos[8][3], light_att[8][3];
+    float    eye_position[4];        /* NV097_SET_EYE_POSITION */
     int      seen_flip_stall;
     /*
      * The fixed-function matrices, kept apart from the constant file.
@@ -1897,6 +1918,20 @@ static GLuint upload_texture_inner(const TexStage *t)
                     fclose(f);
                     fprintf(stderr, "  [GL] texture %s (%u non-black)\n", nm, nz);
                 }
+                /* And its alpha, as grey: a texture that decodes with alpha
+                 * one everywhere draws opaque where the title meant soft. */
+                { char na[144]; snprintf(na, sizeof na, "%s_a.bmp", nm);
+                  f = fopen(na, "wb");
+                  if (f) {
+                      fwrite(hdr, 1, sizeof hdr, f);
+                      for (y = 0; y < h; y++) {
+                          const uint8_t *r = back + (size_t)(h-1-y) * w * 4;
+                          uint8_t pad[3] = {0,0,0}, px[3];
+                          for (x = 0; x < w; x++) { px[0] = px[1] = px[2] = r[x*4+3]; fwrite(px, 1, 3, f); }
+                          fwrite(pad, 1, row - w*3, f);
+                      }
+                      fclose(f);
+                  } }
                 free(back);
             }
         } }
@@ -3743,6 +3778,143 @@ static void do_draw(void)
           }
       } }
 
+    /*
+     * RECOMP_GL_HUGE=1: small program draws that land far outside the screen.
+     *
+     * The title screen flashes: whole frames where the 2D elements come out
+     * as screen-wide black bars and white slabs -- a logo or a line of text
+     * magnified until only its strokes are visible. A draw of a few vertices
+     * whose screen box is several times the surface is that draw, so print
+     * everything about it: which program, which texture, the viewport it
+     * was given, the raw vertex, the w it produced. The first few say
+     * whether it is a wrong constant, a wrong viewport, or the title
+     * genuinely drawing off-screen and relying on a clip we do not apply.
+     */
+    /* RECOMP_GL_SPY_TEX=<hex offset>: everything about the first draws that
+     * sample the texture at that address -- combiner words, texture words,
+     * blend and test state, the vertex program, and the fragment shader as
+     * emitted. For a draw that comes out opaque black where the title meant
+     * a soft streak, one of these is where the alpha went. */
+    { static uint32_t spy; static int sinit, shown;
+      if (!sinit) { const char *v = getenv("RECOMP_GL_SPY_TEX"); sinit = 1;
+                    spy = v ? (uint32_t)strtoul(v, 0, 16) : 0; }
+      if (spy && shown < 4 && slot >= 0 && S.tex[0].offset == spy
+          && S.xf_mode != NV2A_XF_MODE_FIXED) {
+          int i; char *fs;
+          /* Only the magnified ones: vertex 0 well outside the screen. */
+          { Nv2aVshProgram vq; float vin[16][4], op[4]; int k;
+            uint32_t pstart = S.prog_start < NV2A_VSH_MAX_INSNS ? S.prog_start : 0;
+            if (nv2a_vsh_decode(S.prog + pstart * 4, (int)(NV2A_VSH_MAX_INSNS - pstart), &vq) <= 0) goto spy_done;
+            memset(vin, 0, sizeof vin);
+            for (k = 0; k < NUM_ATTRS; k++) {
+                if (attr_at[k] >= 0) memcpy(vin[k], &vbuf[attr_at[k]], 16);
+                else memcpy(vin[k], S.const_attr[k], 16);
+            }
+            if (!nv2a_vsh_interp(&vq, vin, S.u.c, op)) goto spy_done;
+            if (fabsf(op[0] - 320.0f) < 900.0f && fabsf(op[1] - 240.0f) < 700.0f) goto spy_done; }
+          fs = (char *)malloc(96 * 1024);
+          shown++;
+          fprintf(stderr, "  [SPY] draw %u flip %u surf %08X xf %u slot %d prim %u n %u | blend %d %04X/%04X | alpha test %d func %X ref %.3f"
+                          " | depth %d func %X mask %d | cull %d face %X | colour mask %08X | stages prog 0x%05X | fog en %u mode %u col %08X\n",
+                  S.draws, S.flips, S.color_offset, S.xf_mode, slot, S.prim, out_n, S.blend_enable, S.blend_src, S.blend_dst,
+                  S.alpha_test, S.alpha_func, S.alpha_ref, S.depth_test, S.depth_func, S.depth_mask,
+                  S.cull_enable, S.cull_face, S.color_mask, S.shader_stage_prog, S.fog_enable, S.fog_mode, S.fog_color);
+          for (i = 0; i < 4; i++)
+              fprintf(stderr, "  [SPY]   tex%d off %08X fmt %08X addr %08X ctl0 %08X ctl1 %08X filt %08X rect %08X en %d %ux%u bound %d\n",
+                      i, S.tex[i].offset, S.tex[i].format, S.tex[i].addr, S.tex[i].control0, S.tex[i].control1,
+                      S.tex[i].filter, S.tex[i].image_rect, S.tex[i].enabled, S.tex[i].width, S.tex[i].height, S.psh.tex_bound[i]);
+          fprintf(stderr, "  [SPY]   combiner control %08X final %08X %08X\n", S.psh.control, S.psh.final_abcd, S.psh.final_efg);
+          for (i = 0; i < (int)(S.psh.control & 0xF) && i < NV2A_PSH_STAGES; i++)
+              fprintf(stderr, "  [SPY]   stage %d rgb icw %08X ocw %08X | alpha icw %08X ocw %08X | c0 %08X c1 %08X\n",
+                      i, S.psh.rgb_icw[i], S.psh.rgb_ocw[i], S.psh.alpha_icw[i], S.psh.alpha_ocw[i], S.psh.c0[i], S.psh.c1[i]);
+          if (S.xf_mode != NV2A_XF_MODE_FIXED) {
+              Nv2aVshProgram vp; static char dis[16384];
+              uint32_t pstart = S.prog_start < NV2A_VSH_MAX_INSNS ? S.prog_start : 0;
+              if (nv2a_vsh_decode(S.prog + pstart * 4, (int)(NV2A_VSH_MAX_INSNS - pstart), &vp) > 0
+               && nv2a_vsh_disasm(&vp, dis, sizeof dis))
+                  fprintf(stderr, "%s", dis);
+              fprintf(stderr, "  [SPY]   c97 %.3g %.3g %.3g %.3g  c96 %.3g %.3g %.3g %.3g\n",
+                      S.u.c[97][0], S.u.c[97][1], S.u.c[97][2], S.u.c[97][3], S.u.c[96][0], S.u.c[96][1], S.u.c[96][2], S.u.c[96][3]);
+              { int r; for (r = 103; r <= 110; r++)
+                    fprintf(stderr, "  [SPY]   c%d %.6g %.6g %.6g %.6g\n", r, S.u.c[r][0], S.u.c[r][1], S.u.c[r][2], S.u.c[r][3]); }
+              fprintf(stderr, "  [SPY]   zclip %.1f..%.1f  zminmax ctl %08X  vpscale %.1f %.1f %.1f  vpoff %.2f %.2f %.2f\n",
+                      S.u.z_clip[0], S.u.z_clip[1], S.zminmax, S.u.vp_scale[0], S.u.vp_scale[1], S.u.vp_scale[2],
+                      S.u.vp_off[0], S.u.vp_off[1], S.u.vp_off[2]);
+              { uint32_t v; for (v = 0; v < out_n && v < 6; v++) {
+                    float vin[16][4], op[4]; int k;
+                    memset(vin, 0, sizeof vin);
+                    for (k = 0; k < NUM_ATTRS; k++) {
+                        if (attr_at[k] >= 0) memcpy(vin[k], &vbuf[(size_t)v * stride_floats + attr_at[k]], 16);
+                        else memcpy(vin[k], S.const_attr[k], 16);
+                    }
+                    if (nv2a_vsh_interp(&vp, vin, S.u.c, op))
+                        fprintf(stderr, "  [SPY]   oPos[%u] = %.4g %.4g %.6g %.4g  (z/2^24 = %.4g)\n", v, op[0], op[1], op[2], op[3], op[2] / 16777215.0f);
+              } }
+          }
+          if (fs && nv2a_psh_emit_glsl(&S.psh, fs, 96 * 1024)) fprintf(stderr, "----- fragment shader -----\n%s\n", fs);
+          free(fs);
+          { uint32_t v; int k;
+            for (v = 0; v < out_n && v < 6; v++) {
+                fprintf(stderr, "  [SPY]   vertex %u:", v);
+                for (k = 0; k < NUM_ATTRS; k++)
+                    if (attr_at[k] >= 0) {
+                        const float *a = &vbuf[(size_t)v * stride_floats + attr_at[k]];
+                        fprintf(stderr, "  v%d(%.4g %.4g %.4g %.4g)", k, a[0], a[1], a[2], a[3]);
+                    }
+                fprintf(stderr, "\n");
+            } }
+          fflush(stderr);
+          spy_done: ;
+      } }
+
+    { static int hg = -1; static int shown;
+      if (hg < 0) hg = getenv("RECOMP_GL_HUGE") ? 1 : 0;
+      if (hg && shown < 40 && slot >= 0 && out_n >= 3 && out_n <= 96
+             && S.xf_mode != NV2A_XF_MODE_FIXED) {
+          Nv2aVshProgram vp;
+          uint32_t pstart = S.prog_start < NV2A_VSH_MAX_INSNS ? S.prog_start : 0;
+          int len = nv2a_vsh_decode(S.prog + pstart * 4,
+                                    (int)(NV2A_VSH_MAX_INSNS - pstart), &vp);
+          if (len > 0) {
+              float lo[2] = { 1e30f, 1e30f }, hi[2] = { -1e30f, -1e30f }, wlo = 1e30f, whi = -1e30f;
+              float v0first[4] = { 0, 0, 0, 0 }; uint32_t vtx; int ok = 0;
+              for (vtx = 0; vtx < out_n; vtx++) {
+                  float vin[16][4], op[4]; int k;
+                  memset(vin, 0, sizeof vin);
+                  for (k = 0; k < NUM_ATTRS; k++) {
+                      if (attr_at[k] >= 0)
+                          memcpy(vin[k], &vbuf[(size_t)vtx * stride_floats + attr_at[k]], 16);
+                      else memcpy(vin[k], S.const_attr[k], 16);
+                  }
+                  if (!vtx) memcpy(v0first, vin[0], 16);
+                  if (!nv2a_vsh_interp(&vp, vin, S.u.c, op)) continue;
+                  ok++;
+                  if (op[0] < lo[0]) lo[0] = op[0]; if (op[0] > hi[0]) hi[0] = op[0];
+                  if (op[1] < lo[1]) lo[1] = op[1]; if (op[1] > hi[1]) hi[1] = op[1];
+                  if (op[3] < wlo) wlo = op[3]; if (op[3] > whi) whi = op[3];
+              }
+              if (ok && S.draws > 30000 && (hi[0] - lo[0] > 2700.0f || hi[1] - lo[1] > 2000.0f
+                         || lo[0] < -2000.0f || hi[0] > 3000.0f || lo[1] < -2000.0f || hi[1] > 3000.0f)) {
+                  shown++;
+                  fprintf(stderr, "  [HUGE] draw %u flip %u surf %08X slot %d prim %u n %u: x %.0f..%.0f y %.0f..%.0f w %.3g..%.3g"
+                                  " | v0 %.4g %.4g %.4g %.4g | tex0 %08X %ux%u en%d | vpoff %.1f %.1f c59 %.1f %.1f c58 %.1f %.1f"
+                                  " | blend %d alpha %d ztest %d prog %d insns\n",
+                          S.draws, S.flips, S.color_offset, slot, S.prim, out_n, lo[0], hi[0], lo[1], hi[1], wlo, whi,
+                          v0first[0], v0first[1], v0first[2], v0first[3],
+                          S.tex[0].offset, S.tex[0].width, S.tex[0].height, S.tex[0].enabled,
+                          S.u.vp_off[0], S.u.vp_off[1], S.u.c[59][0], S.u.c[59][1], S.u.c[58][0], S.u.c[58][1],
+                          S.blend_enable, S.alpha_test, S.depth_test, len);
+                  fprintf(stderr, "  [HUGE]   c97 %.3g %.3g %.3g %.3g | blend %04X/%04X | alpha func %X ref %.2f | depth func %X mask %d | stages 0x%05X | cull %d | tex0 fmt %02X\n",
+                          S.u.c[97][0], S.u.c[97][1], S.u.c[97][2], S.u.c[97][3],
+                          S.blend_src, S.blend_dst, S.alpha_func, S.alpha_ref, S.depth_func, S.depth_mask,
+                          S.shader_stage_prog, S.cull_enable, S.tex[0].format & 0xFF);
+                  if (shown <= 3) { static char dis[16384];
+                      if (nv2a_vsh_disasm(&vp, dis, sizeof dis)) fprintf(stderr, "%s", dis); }
+                  fflush(stderr);
+              }
+          }
+      } }
+
     { static int dcen = -1;
       static uint64_t dw[2][8], dn[2][8]; static uint32_t dlast;
       static const float edges[7] = { 50, 100, 200, 400, 800, 1600, 3200 };
@@ -4603,7 +4775,8 @@ static void do_draw(void)
               fflush(stderr);
           }
       } }
-    if (S.xf_mode == NV2A_XF_MODE_FIXED) S.tris_ff += out_n / 3;
+    if (S.xf_mode == NV2A_XF_MODE_FIXED) { S.tris_ff += out_n / 3;
+                                           if (S.ff_lighting) S.tris_ff_lit += out_n / 3; }
     else                                 S.tris_pm += out_n / 3;
 }
 
@@ -5406,6 +5579,36 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
      * Deriving the component from the address then writes all four to the
      * first one and leaves the rest stale, which produces a viewport that is
      * almost right and a picture that is scaled by a few hundred. */
+    /* The per-light block: NV097_SET_LIGHT_* at 0x1000 + light * 0x80.
+     * Colours and vectors are three floats, the spot direction four. Light 0's
+     * values are logged the first few times they change, to see what the
+     * title's sun looks like. */
+    if (method >= 0x1000 && method < 0x1000 + 8 * 0x80) {
+        uint32_t li = (method - 0x1000) / 0x80, off = (method - 0x1000) % 0x80, c = (off & 0xC) / 4; float fv;
+        memcpy(&fv, &param, 4);
+        switch (off & ~0xCu) {
+        case 0x00: if (c < 3) S.light_amb[li][c] = fv; break;
+        case 0x0C: if (c < 3) S.light_dif[li][c] = fv; break;   /* 0x0C..0x14 */
+        case 0x18: if (c < 3) S.light_spc[li][c] = fv; break;   /* 0x18..0x20 */
+        case 0x24: if (c == 0) S.light_range[li] = fv; break;
+        case 0x28: if (c < 3) S.light_half[li][c] = fv; break;  /* 0x28..0x30 */
+        case 0x34: if (c < 3) S.light_dir[li][c] = fv; break;   /* 0x34..0x3C */
+        case 0x40: if (c < 3) S.light_spot_falloff[li][c] = fv; break;
+        case 0x4C: if (c < 4) S.light_spot_dir[li][c] = fv; break;
+        case 0x5C: if (c < 3) S.light_pos[li][c] = fv; break;
+        case 0x68: if (c < 3) S.light_att[li][c] = fv; break;
+        default: break;
+        }
+        if (li == 0 && off == 0x3C) { static int said; if (said++ < 4)
+            fprintf(stderr, "  [LIGHT] light0 amb %.2f %.2f %.2f dif %.2f %.2f %.2f spc %.2f %.2f %.2f dir %.3f %.3f %.3f half %.3f %.3f %.3f at draw %u\n",
+                    S.light_amb[0][0], S.light_amb[0][1], S.light_amb[0][2], S.light_dif[0][0], S.light_dif[0][1], S.light_dif[0][2],
+                    S.light_spc[0][0], S.light_spc[0][1], S.light_spc[0][2], S.light_dir[0][0], S.light_dir[0][1], S.light_dir[0][2],
+                    S.light_half[0][0], S.light_half[0][1], S.light_half[0][2], S.draws); }
+        return;
+    }
+    if (method >= 0x181C && method < 0x181C + 16) {   /* NV097_SET_EYE_POSITION */
+        memcpy(&S.eye_position[(method - 0x181C) / 4], &param, 4); return;
+    }
     if (method >= M_SET_VIEWPORT_OFFSET && method < M_SET_VIEWPORT_OFFSET + 0x10) {
         static uint32_t last, sub;
         sub = (method == last) ? ((sub + 1) & 3)
@@ -5516,6 +5719,28 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
     case M_SET_COMBINER_SPECFOG_CW0: S.psh.final_abcd = param; break;
     case M_SET_COMBINER_SPECFOG_CW1: S.psh.final_efg = param; break;
     case M_SET_FOG_COLOR:            S.fog_color = param; break;
+    /* The texture shaders: what each of the four stages does with its
+     * coordinates before the combiners see it. Not decoded before -- every
+     * bound stage was a plain 2D sample. Logged per distinct value first,
+     * because a stage set to CLIPPLANE discards fragments and a stage set
+     * to NONE is never sampled, and either would explain a title screen
+     * that flashes whole quads the console never shows. */
+    case M_SET_SHADER_STAGE_PROGRAM:
+        if (param != S.shader_stage_prog) {
+            static uint32_t seen[16]; static int nseen; int i, fresh = 1;
+            for (i = 0; i < nseen; i++) if (seen[i] == param) { fresh = 0; break; }
+            if (fresh && nseen < 16) { seen[nseen++] = param;
+                fprintf(stderr, "  [GL] shader stage program #%d: 0x%05X = stages %u/%u/%u/%u"
+                                " (0 none 1 2D 4 passthru 5 clipplane 6 bumpenv) at draw %u\n",
+                        nseen, param, param & 31, (param >> 5) & 31, (param >> 10) & 31,
+                        (param >> 15) & 31, S.draws); fflush(stderr); }
+        }
+        S.shader_stage_prog = param; break;
+    case M_SET_SHADER_CLIP_PLANE_MODE:
+        if (param != S.shader_clip_mode) {
+            static int said; if (said++ < 8) fprintf(stderr, "  [GL] shader clip plane mode 0x%08X at draw %u\n", param, S.draws); }
+        S.shader_clip_mode = param; break;
+    case M_SET_SHADER_OTHER_STAGE_INPUT: S.shader_other_input = param; break;
     case M_SET_FOG_MODE:             S.fog_mode = param; break;
     case M_SET_FOG_GEN_MODE:         S.fog_gen_mode = param; break;
     case M_SET_FOG_ENABLE:           S.fog_enable = param; break;
@@ -5598,6 +5823,32 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
                       "(the backend assumed 0 .. 16777215)\n",
                       (double)S.u.z_clip[0], (double)S.u.z_clip[1]);
           } }
+        break;
+    case 0x03BC: /* NV097_SET_LIGHT_ENABLE_MASK */
+        if (param != S.light_enable_mask) { static int said;
+            if (said++ < 6) fprintf(stderr, "  [LIGHT] enable mask %08X (light0 %u light1 %u light2 %u light3 %u) at draw %u\n",
+                                    param, param & 3, (param >> 2) & 3, (param >> 4) & 3, (param >> 6) & 3, S.draws); }
+        S.light_enable_mask = param; break;
+    case 0x0298: /* NV097_SET_COLOR_MATERIAL */
+        if (param != S.color_material) { static int said;
+            if (said++ < 6) fprintf(stderr, "  [LIGHT] color material %08X at draw %u\n", param, S.draws); }
+        S.color_material = param; break;
+    case 0x0294: /* NV097_SET_LIGHT_CONTROL */
+        if (param != S.light_control) { static int said;
+            if (said++ < 6) fprintf(stderr, "  [LIGHT] light control %08X at draw %u\n", param, S.draws); }
+        S.light_control = param; break;
+    case 0x03A4: S.normalization = param; break;   /* NV097_SET_NORMALIZATION_ENABLE */
+    case 0x03B8: S.specular_enable = param; break; /* NV097_SET_SPECULAR_ENABLE */
+    case 0x03B4: memcpy(&S.material_alpha, &param, 4); break;
+    case 0x0A10: case 0x0A14: case 0x0A18:
+        memcpy(&S.scene_ambient[(method - 0x0A10) / 4], &param, 4);
+        if (method == 0x0A18) { static int said; if (said++ < 4)
+            fprintf(stderr, "  [LIGHT] scene ambient %.3f %.3f %.3f at draw %u\n", S.scene_ambient[0], S.scene_ambient[1], S.scene_ambient[2], S.draws); }
+        break;
+    case 0x03A8: case 0x03AC: case 0x03B0:
+        memcpy(&S.material_emission[(method - 0x03A8) / 4], &param, 4);
+        if (method == 0x03B0) { static int said; if (said++ < 4)
+            fprintf(stderr, "  [LIGHT] material emission %.3f %.3f %.3f at draw %u\n", S.material_emission[0], S.material_emission[1], S.material_emission[2], S.draws); }
         break;
     case M_SET_LIGHTING_ENABLE:
         /* Whether the hardware T&L unit is lighting these vertices.
@@ -5810,7 +6061,7 @@ void nv2a_gl_report(void)
         "  [GL] %u inline batches, %u array batches, %u with depth testing\n"
         "  [GL] %u surface switches, %u scene draws\n"
         "  [GL] transform mode: %u fixed-function, %u program (%u/%u other)\n"
-        "  [GL] triangles by pipeline: %u fixed-function, %u program\n"
+        "  [GL] triangles by pipeline: %u fixed-function (%u of them lit), %u program\n"
         "  [GL] %u draws confined by a window clip rectangle\n"
         "  [GL] %u fixed-function draws asked for vertex blending\n"
         "  [GL] surfaces:%s%s%s%s%s%s%s%s\n"
@@ -5822,7 +6073,7 @@ void nv2a_gl_report(void)
         S.draws_inline, S.draws_array, S.draws_depth_on, S.surface_switches,
         S.draws_3d,
         S.draws_xf[0], S.draws_xf[1], S.draws_xf[2], S.draws_xf[3],
-        S.tris_ff, S.tris_pm, S.wclip_applied,
+        S.tris_ff, S.tris_ff_lit, S.tris_pm, S.wclip_applied,
         S.draws_skinned,
         surf_desc(0), surf_desc(1), surf_desc(2), surf_desc(3),
         surf_desc(4), surf_desc(5), surf_desc(6), surf_desc(7),
