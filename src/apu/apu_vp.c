@@ -839,11 +839,11 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         if (trace && v < MCPX_HW_MAX_VOICES) {
             int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
             if (now - last_ms[v] >= 1000) {
-                uint32_t base = (uint32_t)(ba & 0x03FFFFFF);
+                const uint8_t *base = apu_phys_ptr(ba);
                 int k, pk = 0;
                 for (k = 0; k < 256; k++) {
-                    int a = (int16_t)((uint16_t)d->ram_ptr[base + 2 * k]
-                          | ((uint16_t)d->ram_ptr[base + 2 * k + 1] << 8));
+                    int a = (int16_t)((uint16_t)base[2 * k]
+                          | ((uint16_t)base[2 * k + 1] << 8));
                     if (a < 0) a = -a;
                     if (a > pk) pk = a;
                 }
@@ -948,8 +948,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 uint32_t linear_addr = block_index * (uint32_t)block_size;
                 if (stream) {
                     hwaddr addr = segment_offset + linear_addr;
-                    memcpy(adpcm_block, &d->ram_ptr[addr & 0x03FFFFFF],
-                           block_size);
+                    memcpy(adpcm_block, apu_phys_ptr(addr), block_size);
                 } else {
                     linear_addr += ba;
                     for (unsigned int word_index = 0;

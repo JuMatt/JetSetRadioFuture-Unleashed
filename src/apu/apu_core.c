@@ -31,6 +31,10 @@
  * ============================================================ */
 
 uint8_t *g_apu_ram_ptr = NULL;
+/* RECOMP_APU_WINDOW_ALL=1 sends every physical read back through the
+ * contiguous window, the way it worked before the two routes were told
+ * apart -- for comparing the two on one run. */
+int g_apu_window_only = 0;
 
 MCPXAPUState *g_state = NULL;
 
@@ -319,8 +323,15 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
          * rather than at the source keeps the timing the title sees identical,
          * so this changes nothing except what reaches the speakers. */
         { static int mute = -1;
-          if (mute < 0) mute = getenv("RECOMP_MUTE") ? 1 : 0;
-          if (mute) g_audio_muted = 1; }
+          /* The VALUE, not merely the presence of the variable.
+           *
+           * This used to mute whenever RECOMP_MUTE was set at all, so the
+           * documented way to turn sound on -- RECOMP_MUTE=0 -- muted exactly
+           * as hard as RECOMP_MUTE=1 did, and every measurement taken while
+           * "unmuted" was taken on a silenced output. */
+          if (mute < 0) { const char *v = getenv("RECOMP_MUTE");
+                          mute = v ? atoi(v) : 0; }
+          g_audio_muted = mute; }
 
         if (g_audio_muted)
             memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
@@ -578,6 +589,7 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     }
 
     g_apu_ram_ptr = ram_ptr;
+    g_apu_window_only = getenv("RECOMP_APU_WINDOW_ALL") ? 1 : 0;
     g_state = d;
     d->ram_ptr = ram_ptr;
 

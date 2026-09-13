@@ -93,34 +93,63 @@ static inline void qemu_thread_join(QemuThread *t) {
  * We access Xbox RAM via a global pointer, same as NV2A.
  * ============================================================ */
 
-extern uint8_t *g_apu_ram_ptr; /* Set at init to point at Xbox 64MB RAM */
+extern uint8_t *g_apu_ram_ptr;   /* the contiguous window, at guest 0x80000000 */
+extern int g_apu_window_only;    /* RECOMP_APU_WINDOW_ALL=1: the old behaviour */
+
+/*
+ * A physical address, as this runtime means it.
+ *
+ * The console has one address space; this runtime has two. Ordinary RAM holds
+ * the loaded image and the title's heap at the addresses the title knows them
+ * by, and the contiguous window at 0x80000000 is SEPARATE storage for whatever
+ * MmAllocateContiguousMemory handed out -- a physical-memory view that the
+ * general heap has no page in. MmGetPhysicalAddress is the identity here, so a
+ * "physical" address the title gives the hardware is really a guest VA, and
+ * which of the two routes it belongs to is decided by bit 31: set means the
+ * window, clear means ordinary RAM.
+ *
+ * Every APU read used to take the window unconditionally. JSRF's DirectSound
+ * fills its scatter-gather table with heap and image addresses -- voice 68's
+ * buffer resolves to physical 0x001A77B0 -- so each voice was decoded from
+ * the window at that offset instead, which is the GPU's arena: pushbuffer
+ * segments and index buffers. Played as 16-bit stereo that is a loud buzz with
+ * a four-sample period (0, 0, N, N+1 -- consecutive vertex indices), which is
+ * exactly what came out of the speakers.
+ */
+static inline uint8_t *apu_phys_ptr(hwaddr addr)
+{
+    uint32_t a = (uint32_t)addr;
+    if (!g_apu_window_only && !(a & 0x80000000u))
+        return g_apu_ram_ptr - 0x80000000u + (a & 0x03FFFFFFu);
+    return g_apu_ram_ptr + (a & 0x03FFFFFFu);
+}
 
 /* Little-endian physical memory reads */
 static inline uint32_t ldl_le_phys(void *as, hwaddr addr) {
     (void)as;
-    return *(uint32_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF));
+    return *(uint32_t *)apu_phys_ptr(addr);
 }
 static inline uint16_t lduw_le_phys(void *as, hwaddr addr) {
     (void)as;
-    return *(uint16_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF));
+    return *(uint16_t *)apu_phys_ptr(addr);
 }
 static inline uint8_t ldub_phys(void *as, hwaddr addr) {
     (void)as;
-    return *(uint8_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF));
+    return *(uint8_t *)apu_phys_ptr(addr);
 }
 
 /* Little-endian physical memory writes */
 static inline void stl_le_phys(void *as, hwaddr addr, uint32_t val) {
     (void)as;
-    *(uint32_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF)) = val;
+    *(uint32_t *)apu_phys_ptr(addr) = val;
 }
 static inline void stw_le_phys(void *as, hwaddr addr, uint16_t val) {
     (void)as;
-    *(uint16_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF)) = val;
+    *(uint16_t *)apu_phys_ptr(addr) = val;
 }
 static inline void stb_phys(void *as, hwaddr addr, uint8_t val) {
     (void)as;
-    *(uint8_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF)) = val;
+    *(uint8_t *)apu_phys_ptr(addr) = val;
 }
 
 /* Stub address space - just passed to ldl_le_phys etc. (ignored) */
