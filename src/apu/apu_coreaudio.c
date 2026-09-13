@@ -22,6 +22,8 @@
 #include <stdatomic.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
 
 #define CA_RATE        48000
 #define CA_CHANNELS    2
@@ -36,6 +38,7 @@ static int                 g_active;
 static int16_t          g_ring[CA_RING_FRAMES][CA_CHANNELS];
 static _Atomic uint32_t g_wr, g_rd;
 static _Atomic uint32_t g_underruns;
+static _Atomic uint32_t g_drops;
 
 static void ca_callback(void *user, AudioQueueRef q, AudioQueueBufferRef buf)
 {
@@ -141,7 +144,38 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
     if ((uint32_t)num_samples > space) {
         uint32_t drop = (uint32_t)num_samples - space;
         atomic_store_explicit(&g_rd, rd + drop, memory_order_release);
+        atomic_fetch_add_explicit(&g_drops, drop, memory_order_relaxed);
     }
+
+    /*
+     * RECOMP_APU_STATS=1: how the ring is doing, once a second.
+     *
+     * Correct samples that arrive unevenly sound broken in a way that is
+     * indistinguishable, by ear, from samples that are wrong: the queue plays
+     * silence whenever it is starved and the guest's audio drops whenever it
+     * is full, and both are heard as crackle. The underrun counter was only
+     * printed at shutdown, and these runs are killed rather than shut down,
+     * so it had never been read. Occupancy is the honest measure: it should
+     * sit at a steady few hundred frames, not swing between empty and full.
+     */
+    { static int on = -1; static uint64_t last_ms; static uint32_t lu, ld;
+      if (on < 0) on = getenv("RECOMP_APU_STATS") ? 1 : 0;
+      if (on) {
+          struct timespec ts; uint64_t now;
+          clock_gettime(CLOCK_MONOTONIC, &ts);
+          now = (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
+          if (!last_ms) last_ms = now;
+          if (now - last_ms >= 1000) {
+              uint32_t u = atomic_load(&g_underruns), dr = atomic_load(&g_drops);
+              fprintf(stderr, "  [APU] ring %u/%u frames (%.0f ms), "
+                      "%u underruns/s, %u frames dropped/s\n",
+                      wr - rd, (unsigned)CA_RING_FRAMES,
+                      (double)(wr - rd) * 1000.0 / CA_RATE,
+                      u - lu, dr - ld);
+              fflush(stderr);
+              lu = u; ld = dr; last_ms = now;
+          }
+      } }
     for (i = 0; i < num_samples; i++)
         memcpy(g_ring[(wr + (uint32_t)i) & (CA_RING_FRAMES - 1)],
                &samples[i * CA_CHANNELS], sizeof g_ring[0]);

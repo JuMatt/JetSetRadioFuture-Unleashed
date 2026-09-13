@@ -5675,6 +5675,9 @@ static int g_kernel_dispatch_slot = -1;
  * RECOMP_GUEST_LOCK=0 disables it. */
 static CRITICAL_SECTION g_guest_lock;
 static volatile unsigned long g_lock_owner;   /* see xbox_guest_lock_report */
+/* How many guest threads are queueing for the lock right now. Used by the
+ * yield to decide whether standing back is worth anything. */
+static volatile int g_lock_waiters;
 static volatile long long     g_lock_since;
 
 /* Per-thread queueing statistics, kept in a small fixed table so that
@@ -5772,7 +5775,9 @@ void xbox_guest_lock_acquire(void)
     { long long t0 = 0;
       int watch = lock_watch();
       if (watch) t0 = (long long)GetTickCount64();
+      __atomic_add_fetch(&g_lock_waiters, 1, __ATOMIC_RELAXED);
       EnterCriticalSection(&g_guest_lock);
+      __atomic_sub_fetch(&g_lock_waiters, 1, __ATOMIC_RELAXED);
       if (watch) {
           long long w = (long long)GetTickCount64() - t0;
           unsigned slot = lock_slot();
@@ -5907,9 +5912,42 @@ void xbox_guest_lock_yield_now(void)
         }
     }
     if (!t_guest_holds) return;
-    if ((long long)GetTickCount64() - t_guest_since < 4) return;
+    { static long long slice = -1;
+      if (slice < 0) { const char *e = getenv("RECOMP_SLICE_MS");
+                       slice = e ? atoll(e) : 4; if (slice < 0) slice = 0; }
+      if ((long long)GetTickCount64() - t_guest_since < slice) return; }
     xbox_guest_lock_release();
-    SwitchToThread();
+    /*
+     * Hand the lock over, rather than merely offering it.
+     *
+     * The guest lock is not FIFO: releasing it wakes a waiter, but waking is
+     * not instant and this thread is already running, so it wins the race for
+     * the lock it just dropped almost every time. SwitchToThread does not
+     * help, because the waiters are blocked on the lock rather than merely
+     * runnable. The result is that one thread keeps the lock and the others
+     * get whatever is left.
+     *
+     * Measured on the title screen: the title's ADX server thread, which has
+     * to refill the music ring 38 times a second, ran between 4 and 20 times
+     * a second, and the music played as correct fragments in the wrong order
+     * because the voice read the ring faster than the thread could fill it.
+     *
+     * So when anyone is queueing, stand back for a moment instead of
+     * re-entering. A few tens of microseconds is long enough for the woken
+     * thread to take the lock and far shorter than the slice just used.
+     * RECOMP_HANDOFF_US=0 restores the old behaviour.
+     */
+    { static long handoff = -1;
+      if (handoff < 0) { const char *e = getenv("RECOMP_HANDOFF_US");
+                         handoff = e ? atol(e) : 60; if (handoff < 0) handoff = 0; }
+      if (handoff && g_lock_waiters > 0) {
+          /* Sleep(0) yields only to equal-priority runnable threads, which a
+           * thread blocked on the lock is not; Sleep(1) is the shortest wait
+           * this shim guarantees actually leaves the CPU. */
+          Sleep(handoff > 1000 ? (DWORD)(handoff / 1000) : 1);
+      } else {
+          SwitchToThread();
+      } }
     xbox_guest_lock_acquire();
 }
 /* Give the guest lock up across a wait that is not a kernel call.

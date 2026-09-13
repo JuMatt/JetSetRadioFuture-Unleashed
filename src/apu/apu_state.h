@@ -369,12 +369,27 @@ typedef struct MCPXAPUVPSSLData {
     int ssl_seg;
 } MCPXAPUVPSSLData;
 
+/* Source frames held for the resampler between calls. A voice whose sample
+ * rate is well below the APU's 48 kHz needs fewer source frames than output
+ * frames, but a pitched-up effect needs more, so the buffer is several times
+ * a frame and is refilled on demand. */
+#define RS_CHUNK 128
+
 typedef struct MCPXAPUVoiceFilter {
     uint16_t voice;
     float resample_buf[NUM_SAMPLES_PER_FRAME * 2];
     SRC_STATE *resampler;
     sv_filter svf[2];
     HrtfFilter hrtf;
+
+    /* Linear resampler state (see voice_resample). rs_prev and rs_cur are the
+     * two source frames the current output sample sits between, rs_phase is
+     * where between them it sits. */
+    float rs_buf[RS_CHUNK][2];
+    int   rs_have, rs_pos;
+    float rs_prev[2], rs_cur[2];
+    float rs_phase;
+    int   rs_primed;
 } MCPXAPUVoiceFilter;
 
 typedef struct VoiceWorkItem {

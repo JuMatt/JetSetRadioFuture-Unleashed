@@ -75,6 +75,13 @@ static void voice_reset_filters(MCPXAPUState *d, uint16_t v)
     if (d->vp.filters[v].resampler) {
         src_reset(d->vp.filters[v].resampler);
     }
+    /* A voice starting again starts its resampler again: the two source
+     * frames it was interpolating between belong to whatever it was playing
+     * before. */
+    d->vp.filters[v].rs_primed = 0;
+    d->vp.filters[v].rs_phase = 0.0f;
+    d->vp.filters[v].rs_have = 0;
+    d->vp.filters[v].rs_pos = 0;
 }
 
 static bool voice_should_mute(uint16_t v)
@@ -1079,32 +1086,111 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
 }
 
 /* ============================================================
- * Voice resampling (simplified - no libsamplerate)
+ * Voice resampling.
  *
- * Since libsamplerate is stubbed, we do a simple nearest-neighbor
- * resample. This gives us functional audio at the cost of quality.
+ * A voice carries its own sample rate as a pitch register, and the APU runs
+ * at 48 kHz: NV_PAVS_VOICE_TAR_PITCH_LINK gives the ratio of the two, which
+ * voice_process turns into `rate` -- output frames per source frame, exactly
+ * libsamplerate's src_ratio, which is what xemu hands its sinc resampler.
+ *
+ * This used to ignore the rate entirely and hand back source samples one for
+ * one, so every voice played at 48 kHz whatever rate it was recorded at.
+ * JSRF's are 22.05 and 32 kHz: a 22.05 kHz voice came out 2.18x too fast and
+ * an octave and a fifth too high, with everything the resampler would have
+ * interpolated away turning into hiss. Measured on the title screen, a fifth
+ * of the output's energy sat above 8 kHz and its spectral flatness was 0.3 --
+ * the shape of noise, not of music.
+ *
+ * Linear interpolation between the two source frames the output sample falls
+ * between. xemu uses a sinc resampler and notes in the same breath that the
+ * hardware may well be linear; linear costs nothing here and is a world away
+ * from no resampling at all. RECOMP_APU_NO_RESAMPLE=1 restores the old
+ * behaviour for comparison.
  * ============================================================ */
+
+/* The next source frame, refilling from the voice in chunks. Returns 0 when
+ * the voice has run out -- looping voices never do. */
+static int rs_next_frame(MCPXAPUState *d, uint16_t v,
+                         MCPXAPUVoiceFilter *filter, float out[2])
+{
+    if (filter->rs_pos >= filter->rs_have) {
+        filter->rs_have = 0;
+        filter->rs_pos = 0;
+        while (filter->rs_have < RS_CHUNK) {
+            int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                                        NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
+            int n;
+            if (!active) break;
+            n = voice_get_samples(d, v, &filter->rs_buf[filter->rs_have],
+                                  RS_CHUNK - filter->rs_have);
+            if (n <= 0) break;
+            filter->rs_have += n;
+        }
+        if (filter->rs_have <= 0) return 0;
+    }
+    out[0] = filter->rs_buf[filter->rs_pos][0];
+    out[1] = filter->rs_buf[filter->rs_pos][1];
+    filter->rs_pos++;
+    return 1;
+}
 
 static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
                           int requested_num, float rate)
 {
-    /* Without libsamplerate, just fetch raw samples at native rate.
-     * Rate < 1.0 means we need more source samples than output samples.
-     * For initial functionality, just get the samples directly. */
-    int sample_count = 0;
-    while (sample_count < requested_num) {
-        int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
-                                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
-        if (!active) break;
+    MCPXAPUVoiceFilter *filter = &d->vp.filters[v];
+    float step;
+    int i;
 
-        int count = voice_get_samples(d, v, &samples[sample_count],
-                                      requested_num - sample_count);
-        if (count < 0) break;
-        if (count == 0) return -1;
-        sample_count += count;
+    { static int off = -1;
+      if (off < 0) off = getenv("RECOMP_APU_NO_RESAMPLE") ? 1 : 0;
+      if (off) {
+          int sample_count = 0;
+          while (sample_count < requested_num) {
+              int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                                          NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
+              int count;
+              if (!active) break;
+              count = voice_get_samples(d, v, &samples[sample_count],
+                                        requested_num - sample_count);
+              if (count < 0) break;
+              if (count == 0) return -1;
+              sample_count += count;
+          }
+          return sample_count;
+      } }
+
+    /* Source frames consumed per output frame. Guarded because the pitch
+     * register is the title's to write and a silly value must not spin here. */
+    step = (rate > 1.0e-4f) ? 1.0f / rate : 1.0f;
+    if (step > 64.0f) step = 64.0f;
+    if (step < 1.0f / 64.0f) step = 1.0f / 64.0f;
+
+    if (!filter->rs_primed) {
+        if (!rs_next_frame(d, v, filter, filter->rs_prev)) return -1;
+        if (!rs_next_frame(d, v, filter, filter->rs_cur)) {
+            filter->rs_cur[0] = filter->rs_prev[0];
+            filter->rs_cur[1] = filter->rs_prev[1];
+        }
+        filter->rs_phase = 0.0f;
+        filter->rs_primed = 1;
     }
-    (void)rate; /* Ignored until we add proper resampling */
-    return sample_count;
+
+    for (i = 0; i < requested_num; i++) {
+        float t = filter->rs_phase;
+        samples[i][0] = filter->rs_prev[0] + (filter->rs_cur[0] - filter->rs_prev[0]) * t;
+        samples[i][1] = filter->rs_prev[1] + (filter->rs_cur[1] - filter->rs_prev[1]) * t;
+        filter->rs_phase += step;
+        while (filter->rs_phase >= 1.0f) {
+            filter->rs_prev[0] = filter->rs_cur[0];
+            filter->rs_prev[1] = filter->rs_cur[1];
+            if (!rs_next_frame(d, v, filter, filter->rs_cur)) {
+                /* Out of source: hand back what was produced. */
+                return i > 0 ? i : -1;
+            }
+            filter->rs_phase -= 1.0f;
+        }
+    }
+    return requested_num;
 }
 
 /* ============================================================
@@ -1269,6 +1355,62 @@ static void voice_process(MCPXAPUState *d,
         }
     }
 
+    /*
+     * RECOMP_APU_VDUMP=<voice>:<path>: the samples one voice actually
+     * decodes, in the order it decodes them, as 48 kHz stereo s16.
+     *
+     * The buffer a streaming voice reads is refilled by the title as the
+     * voice consumes it, so "the bytes in the buffer are correct" and "the
+     * voice plays the music" are different claims: a read position that runs
+     * at the wrong speed, or a refill that lands on samples not yet played,
+     * scrambles correct bytes into a wash. The buffer dump answers the first
+     * question and this answers the second -- and it can be laid directly
+     * against a reference decode of the title's own .adx.
+     */
+    { static int init; static FILE *vf; static int want = -1;
+      if (!init) { const char *e = getenv("RECOMP_APU_VDUMP");
+          init = 1;
+          if (e) { const char *c = strchr(e, ':');
+                   if (c) { want = atoi(e); vf = fopen(c + 1, "wb");
+                            if (vf) fprintf(stderr, "  [APU] dumping voice %d's "
+                                    "decoded stream to %s\n", want, c + 1); } } }
+      if (vf && v == (uint16_t)want) {
+          int16_t out[NUM_SAMPLES_PER_FRAME][2]; int i;
+          for (i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+              float l = samples[i][0], r = samples[i][1];
+              l = l > 1.0f ? 1.0f : l < -1.0f ? -1.0f : l;
+              r = r > 1.0f ? 1.0f : r < -1.0f ? -1.0f : r;
+              out[i][0] = (int16_t)(l * 32767.0f);
+              out[i][1] = (int16_t)(r * 32767.0f);
+          }
+          fwrite(out, sizeof out, 1, vf);
+          fflush(vf);
+      } }
+
+    /*
+     * RECOMP_APU_CBO=<voice>: the read position, ten times a second.
+     *
+     * The other half of the same question: the title refills the ring from
+     * one side while the voice reads from the other, and the only way they
+     * can stay apart is if the position the voice reports advances at the
+     * rate the title expects. Sampled often enough to see a jump, not so
+     * often as to fill the log.
+     */
+    { static int want = -2; static uint64_t last_ms; static uint32_t prev; static int n;
+      if (want == -2) { const char *e = getenv("RECOMP_APU_CBO");
+                        want = e ? atoi(e) : -1; }
+      if (want >= 0 && v == (uint16_t)want) {
+          uint64_t now = (uint64_t)qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+          if (now - last_ms >= 100 && n++ < 200) {
+              uint32_t cbo_now = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_OFFSET,
+                                                NV_PAVS_VOICE_PAR_OFFSET_CBO);
+              fprintf(stderr, "  [CBO] voice %u  cbo %6u  (+%6d since %llu ms)\n",
+                      v, cbo_now, (int)(cbo_now - prev),
+                      (unsigned long long)(last_ms ? now - last_ms : 0));
+              prev = cbo_now; last_ms = now; fflush(stderr);
+          }
+      } }
+
     /* RECOMP_APU_VOICE=1: where a voice's sound is lost.
      *
      * An active voice that produces silence has three quite different causes
@@ -1290,7 +1432,9 @@ static void voice_process(MCPXAPUState *d,
                     if (a > pk) pk = a;
                 }
                 fprintf(stderr, "  [VOICE %3u] decoded peak %.4f  envelope %.4f"
-                        "  bins/vols", v, (double)pk, (double)ea_value);
+                        "  rate %.3f (~%.0f Hz source)"
+                        "  bins/vols", v, (double)pk, (double)ea_value,
+                        (double)rate, (double)(rate > 1e-4f ? 48000.0f / rate : 0.0f));
                 for (b = 0; b < 8; b++)
                     fprintf(stderr, " %u:%.3f", bin[b],
                             (double)attenuate(vol[b]));
