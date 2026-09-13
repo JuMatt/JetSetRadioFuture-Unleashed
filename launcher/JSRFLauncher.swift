@@ -139,6 +139,13 @@ enum Game {
             "RECOMP_GL_SCALE": "1",
             "RECOMP_ABI_RESTORE": "1",
             "RECOMP_MUTE": "0",
+            // Without this the engine renders offscreen and opens nothing.
+            // It is how the diagnostic runs work -- they dump frames to disk
+            // and never want a window -- and copying that list into a launcher
+            // produced an app that played the soundtrack to an empty screen.
+            "RECOMP_WINDOW": "1",
+            "RECOMP_WINDOW_W": "1280",
+            "RECOMP_WINDOW_H": "960",
         ]
         for (k, v) in base { env[k] = v }
         for entry in UserDefaults.standard.stringArray(forKey: "env") ?? [] {
@@ -153,7 +160,6 @@ enum Game {
 // MARK: - app
 
 final class Launcher: NSObject, NSApplicationDelegate {
-    private var child: Process?
     private var logURL: URL?
 
     func applicationDidFinishLaunching(_ note: Notification) {
@@ -262,48 +268,41 @@ final class Launcher: NSObject, NSApplicationDelegate {
 
     // MARK: running
 
+    /// Hand this process over to the engine.
+    ///
+    /// Not a subprocess. macOS decides whether a process may put a window on
+    /// screen from the bundle it was launched as, and only the bundle's main
+    /// executable qualifies -- anything else started out of Contents/MacOS is
+    /// a helper tool, and its request to become a foreground application is
+    /// refused without an error anyone can see. The engine then runs happily,
+    /// plays its music, and draws nothing: sound has no such rule.
+    ///
+    /// exec replaces the image but keeps the process, so what carries on
+    /// running IS the application the system launched, with its window rights
+    /// intact. This is the usual shape of a wrapper that has a question to ask
+    /// before the real program starts.
     private func start(_ folder: URL) {
         let log = Library.root.appendingPathComponent("last-run.log")
-        FileManager.default.createFile(atPath: log.path, contents: nil)
         logURL = log
 
-        let p = Process()
-        p.executableURL = Game.binary
-        p.arguments = [folder.path]
-        p.environment = Game.environment(gameDir: folder)
-        p.currentDirectoryURL = folder
-        if let handle = try? FileHandle(forWritingTo: log) {
-            p.standardOutput = handle
-            p.standardError = handle
-        }
-        p.terminationHandler = { proc in
-            DispatchQueue.main.async { self.finished(proc) }
-        }
-        do { try p.run() } catch {
-            fail("The game wouldn't start.", error.localizedDescription); return
-        }
-        child = p
-        // The game opens its own window; this one has nothing left to say.
-        NSApp.setActivationPolicy(.accessory)
-    }
+        for (k, v) in Game.environment(gameDir: folder) { setenv(k, v, 1) }
+        FileManager.default.changeCurrentDirectoryPath(folder.path)
 
-    private func finished(_ p: Process) {
-        // A clean exit is the user quitting the game: follow it out quietly.
-        if p.terminationStatus == 0 || p.terminationReason == .uncaughtSignal {
-            NSApp.terminate(nil); return
-        }
-        NSApp.setActivationPolicy(.regular)
-        NSApp.activate(ignoringOtherApps: true)
-        let a = NSAlert()
-        a.messageText = "The game stopped unexpectedly."
-        a.informativeText = "Exit status \(p.terminationStatus).\n\n"
-                          + "The output is in:\n\(logURL?.path ?? "—")"
-        a.addButton(withTitle: "Show Log")
-        a.addButton(withTitle: "Quit")
-        if a.runModal() == .alertFirstButtonReturn, let log = logURL {
-            NSWorkspace.shared.activateFileViewerSelecting([log])
-        }
-        NSApp.terminate(nil)
+        // The engine writes its diagnosis to stdout and stderr; after exec
+        // there is nobody left to collect them, so point them at the log now.
+        freopen(log.path, "w", stdout)
+        freopen(log.path, "a", stderr)   // append: "w" twice gives two writers
+                                         // at offset zero, interleaving the
+                                         // start of the log into nonsense
+
+        let exe = Game.binary.path
+        var argv: [UnsafeMutablePointer<CChar>?] =
+            [strdup(exe), strdup(folder.path), nil]
+        execv(exe, &argv)
+
+        // Only reached if exec failed, which leaves this process intact.
+        let err = String(cString: strerror(errno))
+        fail("The game wouldn't start.", "\(exe)\n\n\(err)")
     }
 
     private func fail(_ message: String, _ detail: String) {
@@ -322,10 +321,6 @@ final class Launcher: NSObject, NSApplicationDelegate {
         }
     }
 
-    func applicationShouldTerminate(_ s: NSApplication) -> NSApplication.TerminateReply {
-        if let c = child, c.isRunning { c.terminate() }
-        return .terminateNow
-    }
 }
 
 let app = NSApplication.shared

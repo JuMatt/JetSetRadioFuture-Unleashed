@@ -53,8 +53,15 @@ for extra in "$(dirname "$engine")"/*.metallib "$(dirname "$engine")"/*.glsl; do
   [ -e "$extra" ] && cp "$extra" "$app/Contents/MacOS/" || true
 done
 
+# The icon is kept as an .iconset of PNGs rather than a built .icns, so it can
+# be read and changed in the repository. Build it here if it is not already.
+if [ ! -f "$here/AppIcon.icns" ] && [ -d "$here/icon/AppIcon.iconset" ]; then
+  iconutil -c icns "$here/icon/AppIcon.iconset" -o "$here/AppIcon.icns" 2>/dev/null || true
+fi
 if [ -f "$here/AppIcon.icns" ]; then
   cp "$here/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
+else
+  echo "note: no icon built (needs iconutil); the app gets the generic one"
 fi
 
 # Ad-hoc signature. Without one, Gatekeeper kills the app on first launch with

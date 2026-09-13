@@ -32,3 +32,6 @@ bin/
 *.obj
 *.exe
 tools/split/output/
+
+# Built from launcher/icon/AppIcon.iconset by launcher/build_app.sh
+launcher/AppIcon.icns
