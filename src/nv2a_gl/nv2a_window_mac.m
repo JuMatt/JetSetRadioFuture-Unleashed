@@ -192,6 +192,114 @@ int nv_window_keys(unsigned short *buttons, unsigned char *analog)
     return any;
 }
 
+
+/* ---- the menu bar --------------------------------------------------------
+ *
+ * An app with no menu bar has no Quit, no About, and no way to change
+ * anything without an environment variable -- which is fine for a diagnostic
+ * run driven from a shell and not fine for something someone double-clicks.
+ *
+ * Resolution is the one setting worth putting in front of a player. The game
+ * draws a 640x480 surface and always will; what changes is the resolution the
+ * renderer works at internally, and the window follows it so the picture is
+ * presented one-to-one instead of being stretched. At 1x in a 1280x960 window
+ * every pixel is doubled and it looks like it: the default is 2x.
+ *
+ * The choice is stored rather than applied live, because the render targets,
+ * the depth buffer and the texture cache are all sized at startup, and tearing
+ * them down mid-frame to avoid a relaunch would be a great deal of machinery
+ * for a setting people change once. Choosing a scale restarts the game.
+ */
+
+static int scale_clamp(int s) { return s < 1 ? 1 : s > 4 ? 4 : s; }
+
+int nv_window_pref_scale(void);
+int nv_window_pref_scale(void)
+{
+    /* An explicit RECOMP_GL_SCALE in the environment wins: someone who set it
+     * on a command line means it, and should not be overruled by a menu they
+     * cannot see. */
+    const char *e = getenv("RECOMP_GL_SCALE");
+    if (e && *e) return scale_clamp(atoi(e));
+    @autoreleasepool {
+        NSInteger v = [[NSUserDefaults standardUserDefaults] integerForKey:@"glScale"];
+        return scale_clamp(v ? (int)v : 2);
+    }
+}
+
+@interface NvMenuTarget : NSObject
+- (void)pickScale:(id)sender;
+@end
+
+@implementation NvMenuTarget
+- (void)pickScale:(id)sender
+{
+    NSInteger want = [(NSMenuItem *)sender tag];
+    [[NSUserDefaults standardUserDefaults] setInteger:want forKey:@"glScale"];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+
+    {
+        extern void recomp_restart_self(void) __attribute__((weak));
+        if (recomp_restart_self) {
+            recomp_restart_self();           /* does not return on success */
+        }
+        {
+            NSAlert *a = [[NSAlert alloc] init];
+            a.messageText = @"Restart to change the resolution";
+            a.informativeText = @"The renderer is set up once at startup. "
+                                 "Quit and launch again and it will be at the "
+                                 "size you picked.";
+            [a runModal];
+        }
+    }
+}
+@end
+
+static NvMenuTarget *g_menu_target;
+
+static void build_menu(void)
+{
+    NSString *app = [[NSProcessInfo processInfo] processName];
+    NSMenu *bar = [[NSMenu alloc] init];
+    NSMenuItem *appItem = [[NSMenuItem alloc] init];
+    NSMenu *appMenu = [[NSMenu alloc] init];
+    NSMenuItem *videoItem = [[NSMenuItem alloc] init];
+    NSMenu *video = [[NSMenu alloc] initWithTitle:@"Video"];
+    NSMenu *res = [[NSMenu alloc] initWithTitle:@"Resolution"];
+    NSMenuItem *resItem = [[NSMenuItem alloc] initWithTitle:@"Resolution"
+                                                    action:nil keyEquivalent:@""];
+    int cur = nv_window_pref_scale();
+    int i;
+
+    g_menu_target = [[NvMenuTarget alloc] init];
+
+    [appMenu addItemWithTitle:[@"Hide " stringByAppendingString:app]
+                       action:@selector(hide:) keyEquivalent:@"h"];
+    [appMenu addItem:[NSMenuItem separatorItem]];
+    [appMenu addItemWithTitle:[@"Quit " stringByAppendingString:app]
+                       action:@selector(terminate:) keyEquivalent:@"q"];
+    [appItem setSubmenu:appMenu];
+    [bar addItem:appItem];
+
+    for (i = 1; i <= 4; i++) {
+        NSMenuItem *it = [[NSMenuItem alloc]
+            initWithTitle:[NSString stringWithFormat:@"%dx  (%d x %d)",
+                                                     i, 640 * i, 480 * i]
+                   action:@selector(pickScale:)
+            keyEquivalent:[NSString stringWithFormat:@"%d", i]];
+        [it setTag:i];
+        [it setTarget:g_menu_target];
+        [it setState:(i == cur) ? NSControlStateValueOn : NSControlStateValueOff];
+        [res addItem:it];
+    }
+    [resItem setSubmenu:res];
+    [video addItem:resItem];
+    [videoItem setSubmenu:video];
+    [bar addItem:videoItem];
+
+    [NSApp setMainMenu:bar];
+}
+
 /* ---- the window ---------------------------------------------------------- */
 
 /* Must be called on the main thread: AppKit refuses to create a window
@@ -231,6 +339,7 @@ int nv_window_prepare(int width, int height, const char *title)
         [g_view setWantsBestResolutionOpenGLSurface:YES];
         [g_window setContentView:g_view];
         [g_window makeFirstResponder:g_view];
+        build_menu();
         [g_window makeKeyAndOrderFront:nil];
         [NSApp activateIgnoringOtherApps:YES];
 

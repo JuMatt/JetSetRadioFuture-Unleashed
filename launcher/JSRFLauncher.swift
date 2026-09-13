@@ -136,7 +136,6 @@ enum Game {
             "RECOMP_TRACE_BUDGET": "0",
             "RECOMP_GL_READBACK": "0",
             "RECOMP_FPS": "60",
-            "RECOMP_GL_SCALE": "1",
             "RECOMP_ABI_RESTORE": "1",
             "RECOMP_MUTE": "0",
             // Without this the engine renders offscreen and opens nothing.
@@ -144,15 +143,24 @@ enum Game {
             // and never want a window -- and copying that list into a launcher
             // produced an app that played the soundtrack to an empty screen.
             "RECOMP_WINDOW": "1",
-            "RECOMP_WINDOW_W": "1280",
-            "RECOMP_WINDOW_H": "960",
         ]
+        // Deliberately absent: RECOMP_GL_SCALE and the window size. The engine
+        // reads the resolution from the Video menu's stored choice and sizes
+        // its window to match; setting them here would silently overrule the
+        // menu, which is the one setting a player can actually reach.
+
         for (k, v) in base { env[k] = v }
         for entry in UserDefaults.standard.stringArray(forKey: "env") ?? [] {
             let parts = entry.split(separator: "=", maxSplits: 1).map(String.init)
             if parts.count == 2 { env[parts[0]] = parts[1] }
         }
         env["JSRF_GAME_DIR"] = gameDir.path
+        // Saves belong to the player, not to the disc they were made from:
+        // the game folder may be read-only, may be a mounted image, and is
+        // not somewhere anyone expects their progress to be kept.
+        let saves = Library.root.appendingPathComponent("save")
+        try? FileManager.default.createDirectory(at: saves, withIntermediateDirectories: true)
+        env["JSRF_SAVE_DIR"] = saves.path
         return env
     }
 }

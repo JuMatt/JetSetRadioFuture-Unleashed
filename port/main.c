@@ -52,6 +52,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <math.h>
 
 /* xboxrecomp runtime headers */
@@ -116,6 +117,22 @@ extern ptrdiff_t g_xbox_mem_offset;
  * running it by hand from the build tree behaves exactly as before.
  */
 static const char *g_game_dir_arg;
+
+/* Kept so the process can relaunch itself. Changing the render resolution
+ * means rebuilding every render target, the depth buffer and the texture
+ * cache, all of which are sized once at startup -- so the menu stores the
+ * choice and comes back through here rather than tearing the renderer down
+ * underneath a frame in flight. */
+static char **g_argv;
+
+void recomp_restart_self(void);
+void recomp_restart_self(void)
+{
+    if (!g_argv || !g_argv[0]) return;
+    fflush(stdout); fflush(stderr);
+    execv(g_argv[0], g_argv);          /* only returns on failure */
+    fprintf(stderr, "  [WIN] could not relaunch: %s\n", strerror(errno));
+}
 
 static const char *game_dir(void)
 {
@@ -558,7 +575,8 @@ static int host_main(void)
     /* Step 4: Set game directory for file I/O path translation */
     {
         extern void xbox_path_init(const char *game_dir, const char *save_dir);
-        xbox_path_init(game_dir(), "save");
+        const char *sv = getenv("JSRF_SAVE_DIR");
+        xbox_path_init(game_dir(), (sv && sv[0]) ? sv : "save");
     }
 
     /* Step 5: Initialize kernel bridge (thunk table in Xbox memory) */
@@ -697,7 +715,20 @@ static int host_main(void)
          * frame arrives, scaled to fit. Measured on an M2 Pro, four times the
          * internal resolution costs nothing at all, so there is no reason for
          * the window to stay at the console's. */
-        int win_w = 1280, win_h = 960;
+        int win_w, win_h;
+        {
+            /* The window follows the internal resolution, so the finished
+             * frame is presented one-to-one instead of being stretched. A
+             * 640x480 frame blown up into a 1280x960 window is every pixel
+             * doubled, and it looks exactly like that. */
+            extern int nv_window_pref_scale(void) __attribute__((weak));
+            int scale = nv_window_pref_scale ? nv_window_pref_scale() : 2;
+            char buf[8];
+            snprintf(buf, sizeof buf, "%d", scale);
+            setenv("RECOMP_GL_SCALE", buf, 1);   /* before the renderer starts */
+            win_w = 640 * scale;
+            win_h = 480 * scale;
+        }
         { const char *w = getenv("RECOMP_WINDOW_W");
           const char *h = getenv("RECOMP_WINDOW_H");
           if (w) win_w = atoi(w);
@@ -802,6 +833,7 @@ static BOOL load_xbe(const char *path, void **out_data, size_t *out_size)
 /* Console entry point (for debugging -- lets you see printf output) */
 int main(int argc, char **argv)
 {
+    g_argv = argv;
     if (argc > 1) g_game_dir_arg = argv[1];
     return host_main();
 }
