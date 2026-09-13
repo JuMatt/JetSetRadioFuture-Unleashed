@@ -228,6 +228,22 @@ void xbox_WatchdogStart(void);
 /** Base VA for kernel data exports (XboxHardwareInfo, XboxKrnlVersion, etc.)
  *  These are kernel exports that are DATA, not functions. The game reads
  *  their thunk entries and dereferences them to access the data. */
+/* Marker bit the runtime sets in PCRTC_INTR_0 when it raises a vertical-blank
+ * interrupt, cleared implicitly by the title acknowledging it.
+ *
+ * The NV2A aperture here is plain memory, so a write-1-to-clear register does
+ * the opposite of what the hardware does: the title's acknowledging write sets
+ * the pending bit rather than clearing it. The busy-bit thread used to answer
+ * that by holding the interrupt-status registers at zero, which is true only
+ * while nothing raises a GPU interrupt. The vertical-blank source does, and a
+ * status bit wiped 200 us after it was raised is gone before the title's DPC
+ * reads it. Raising with this reserved bit set makes the acknowledging write
+ * observable -- the title writes the register whole, as 1, so the marker
+ * disappears -- and the runtime can then complete the acknowledgement the way
+ * the hardware would. Bit 30 is reserved in PCRTC_INTR_0 and the title only
+ * ever tests bit 0. */
+#define NV2A_VBLANK_PENDING_TAG 0x40000000u
+
 #define XBOX_KERNEL_DATA_BASE   0x00740000
 #define XBOX_KERNEL_DATA_SIZE   4096   /* 4 KB - plenty for all data exports */
 

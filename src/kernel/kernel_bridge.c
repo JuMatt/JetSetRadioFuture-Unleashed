@@ -2083,6 +2083,9 @@ static int kernel_run_dpc_locked(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
         return 0;
     }
 
+    { extern void xbox_waitlog_dpc(uint32_t routine) __attribute__((weak));
+      if (xbox_waitlog_dpc) xbox_waitlog_dpc(routine); }
+
     BRIDGE_MEM32(dpc_va + 20) = arg1;
     BRIDGE_MEM32(dpc_va + 24) = arg2;
 
@@ -2308,7 +2311,12 @@ static void kernel_vblank_tick(void)
     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
         return;
 
-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) |= NV2A_PCRTC_INTR_VBLANK;
+    /* Raised with the pending marker set, so the busy-bit thread can tell an
+     * interrupt the title has not looked at yet from one it has acknowledged.
+     * Without that distinction the status bits were wiped 200 us after this
+     * line and the DPC below found nothing pending -- see vblank_intr_tick(). */
+    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) |=
+        NV2A_PCRTC_INTR_VBLANK | NV2A_VBLANK_PENDING_TAG;
     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   |= NV2A_PMC_INTR_PCRTC;
 
     g_vblank_count++;
@@ -5981,6 +5989,225 @@ void xbox_guest_lock_mark_idle(void)
     xbox_guest_lock_release();
     t_guest_idle = 1;
 }
+
+/* ---- RECOMP_WAITLOG: who waits on what, and whether it is ever signalled --
+ *
+ * The audio fault is a starved producer: the title's ADX server thread runs
+ * eight to twenty times a second where it needs thirty-eight, and the shape of
+ * that -- a rate set by a round number of milliseconds rather than by work --
+ * says it is waking on a timeout rather than on a signal. Proving it needs
+ * three facts per blocking call that no existing counter carries: which object
+ * the thread asked for, how long it actually spent there, and whether it came
+ * back signalled or timed out. Paired with a count of signals per object, a
+ * row reading "1000 waits, 1000 timeouts, object never signalled" names the
+ * missing wakeup outright.
+ *
+ * Keyed on (thread, ordinal, object) so the same event waited on by two
+ * threads stays two rows: the question is which thread is starved.
+ */
+#define WAITLOG_SLOTS 64
+typedef struct {
+    unsigned long long tid;
+    uint32_t ordinal, object, caller;
+    unsigned long long waits, timeouts;
+    long long total_ms, max_ms;
+    long long last_timeout_ms;   /* the timeout the caller asked for, ms */
+} WaitRow;
+static WaitRow g_waitlog[WAITLOG_SLOTS];
+static volatile long g_waitlog_n;
+#define WAITSIG_SLOTS 64
+typedef struct { uint32_t object; uint32_t ordinal; uint32_t caller;
+                 unsigned long long signals; } SigRow;
+/* Deferred routines, counted where they actually run. A vblank interrupt
+ * that queues a DPC sixty times a second and an event signalled twice a
+ * second cannot both be right, and the DPC is the only step between them. */
+#define WAITDPC_SLOTS 32
+typedef struct { uint32_t routine; unsigned long long runs; } DpcRow;
+static DpcRow g_waitdpc[WAITDPC_SLOTS];
+static volatile long g_waitdpc_n;
+static SigRow g_waitsig[WAITSIG_SLOTS];
+static volatile long g_waitsig_n;
+static CRITICAL_SECTION g_waitlog_cs;
+static int g_waitlog_on = -1;
+
+static int waitlog_on(void)
+{
+    if (g_waitlog_on < 0) {
+        const char *e = getenv("RECOMP_WAITLOG");
+        g_waitlog_on = (e && *e && *e != '0') ? 1 : 0;
+        if (g_waitlog_on) InitializeCriticalSection(&g_waitlog_cs);
+    }
+    return g_waitlog_on;
+}
+
+static int waitlog_is_wait(ULONG o)
+{
+    /* 277 (RtlEnterCriticalSection) is in the list because a starved thread
+     * and a thread queued behind a lock look identical from outside, and the
+     * two are cured by opposite changes. */
+    return o == 99 || o == 158 || o == 159 || o == 233 || o == 234 || o == 235
+        || o == 277;
+}
+static int waitlog_is_signal(ULONG o)
+{
+    /* KeSetEvent, KeSetTimer, KeSetTimerEx, NtPulseEvent, NtSetEvent,
+     * NtReleaseSemaphore, KeReleaseSemaphore, KeInsertQueueDpc. */
+    return o == 145 || o == 149 || o == 150 || o == 205 || o == 225
+        || o == 222 || o == 119;
+}
+
+/* The timeout the caller asked for, in ms; -1 means "wait forever". The
+ * argument is a pointer to a signed 64-bit 100ns interval, negative for
+ * relative -- the same convention NT uses. */
+static long long waitlog_timeout_ms(ULONG ordinal)
+{
+    uint32_t p = 0;
+    switch (ordinal) {
+    case  99: p = STACK_ARG(2); break;   /* KeDelayExecutionThread */
+    case 159: p = STACK_ARG(4); break;
+    case 158: p = STACK_ARG(6); break;
+    case 233: p = STACK_ARG(2); break;
+    case 234: p = STACK_ARG(2); break;
+    case 235: p = STACK_ARG(5); break;
+    default:  return -1;
+    }
+    if (!p) return -1;
+    {
+        long long t = (long long)((uint64_t)BRIDGE_MEM32(p)
+                    | ((uint64_t)BRIDGE_MEM32(p + 4) << 32));
+        return (t < 0) ? (-t) / 10000 : 0;
+    }
+}
+
+static void waitlog_record(ULONG ordinal, uint32_t object, uint32_t caller,
+                           long long ms, long long asked_ms, uint32_t status)
+{
+    long i, n;
+    WaitRow *r = NULL;
+    unsigned long long tid = (unsigned long long)GetCurrentThreadId();
+    EnterCriticalSection(&g_waitlog_cs);
+    n = g_waitlog_n;
+    for (i = 0; i < n; i++)
+        if (g_waitlog[i].tid == tid && g_waitlog[i].ordinal == (uint32_t)ordinal
+            && g_waitlog[i].object == object) { r = &g_waitlog[i]; break; }
+    if (!r && n < WAITLOG_SLOTS) {
+        r = &g_waitlog[n];
+        r->tid = tid; r->ordinal = (uint32_t)ordinal; r->object = object;
+        r->caller = caller;
+        g_waitlog_n = n + 1;
+    }
+    if (r) {
+        r->waits++;
+        r->total_ms += ms;
+        if (ms > r->max_ms) r->max_ms = ms;
+        r->last_timeout_ms = asked_ms;
+        if (status == 0x102u) r->timeouts++;
+    }
+    LeaveCriticalSection(&g_waitlog_cs);
+}
+
+static void waitlog_signal_record(ULONG ordinal, uint32_t object, uint32_t caller)
+{
+    long i, n;
+    EnterCriticalSection(&g_waitlog_cs);
+    n = g_waitsig_n;
+    for (i = 0; i < n; i++)
+        if (g_waitsig[i].object == object && g_waitsig[i].ordinal == (uint32_t)ordinal
+            && g_waitsig[i].caller == caller) {
+            g_waitsig[i].signals++;
+            LeaveCriticalSection(&g_waitlog_cs);
+            return;
+        }
+    if (n < WAITSIG_SLOTS) {
+        g_waitsig[n].object = object;
+        g_waitsig[n].ordinal = (uint32_t)ordinal;
+        g_waitsig[n].caller = caller;
+        g_waitsig[n].signals = 1;
+        g_waitsig_n = n + 1;
+    }
+    LeaveCriticalSection(&g_waitlog_cs);
+}
+
+/* Called from the DPC runner, which is not in the kernel-call path. */
+void xbox_waitlog_dpc(uint32_t routine);
+void xbox_waitlog_dpc(uint32_t routine)
+{
+    long i, n;
+    if (!waitlog_on()) return;
+    EnterCriticalSection(&g_waitlog_cs);
+    n = g_waitdpc_n;
+    for (i = 0; i < n; i++)
+        if (g_waitdpc[i].routine == routine) {
+            g_waitdpc[i].runs++;
+            LeaveCriticalSection(&g_waitlog_cs);
+            return;
+        }
+    if (n < WAITDPC_SLOTS) {
+        g_waitdpc[n].routine = routine;
+        g_waitdpc[n].runs = 1;
+        g_waitdpc_n = n + 1;
+    }
+    LeaveCriticalSection(&g_waitlog_cs);
+}
+
+void xbox_waitlog_report(void);
+void xbox_waitlog_report(void)
+{
+    long i, n;
+    static WaitRow prev[WAITLOG_SLOTS];
+    static SigRow  prevs[WAITSIG_SLOTS];
+    static long long last_ms;
+    long long now = (long long)GetTickCount64();
+    double secs;
+    if (!waitlog_on()) return;
+    if (!last_ms) { last_ms = now; return; }
+    secs = (double)(now - last_ms) / 1000.0;
+    if (secs < 0.001) return;
+    last_ms = now;
+    EnterCriticalSection(&g_waitlog_cs);
+    n = g_waitlog_n;
+    fprintf(stderr, "  [WAITLOG] %.1f s window\n", secs);
+    for (i = 0; i < n; i++) {
+        WaitRow *r = &g_waitlog[i];
+        unsigned long long dw = r->waits - prev[i].waits;
+        unsigned long long dt = r->timeouts - prev[i].timeouts;
+        long long dms = r->total_ms - prev[i].total_ms;
+        prev[i] = *r;
+        if (!dw) continue;
+        fprintf(stderr, "  [WAITLOG] tid %-6llu ord %-3u obj 0x%08X from 0x%08X:"
+                " %.1f waits/s (%llu), %llu timeouts (%.0f%%), %.0f ms/s inside,"
+                " %.1f ms each, asked %s (%lld), max %lld ms\n",
+                r->tid, r->ordinal, r->object, r->caller,
+                (double)dw / secs, (unsigned long long)dw,
+                (unsigned long long)dt, dw ? 100.0 * (double)dt / (double)dw : 0.0,
+                (double)dms / secs, (double)dms / (double)dw,
+                r->last_timeout_ms < 0 ? "forever" : "a timeout",
+                r->last_timeout_ms, r->max_ms);
+    }
+    n = g_waitsig_n;
+    for (i = 0; i < n; i++) {
+        unsigned long long ds = g_waitsig[i].signals - prevs[i].signals;
+        prevs[i] = g_waitsig[i];
+        if (!ds) continue;
+        fprintf(stderr, "  [WAITLOG] signal ord %-3u obj 0x%08X from 0x%08X:"
+                " %.1f/s (%llu)\n",
+                g_waitsig[i].ordinal, g_waitsig[i].object, g_waitsig[i].caller,
+                (double)ds / secs, (unsigned long long)ds);
+    }
+    n = g_waitdpc_n;
+    for (i = 0; i < n; i++) {
+        static DpcRow prevd[WAITDPC_SLOTS];
+        unsigned long long dr = g_waitdpc[i].runs - prevd[i].runs;
+        prevd[i] = g_waitdpc[i];
+        if (!dr) continue;
+        fprintf(stderr, "  [WAITLOG] dpc routine 0x%08X ran %.1f/s (%llu)\n",
+                g_waitdpc[i].routine, (double)dr / secs,
+                (unsigned long long)dr);
+    }
+    LeaveCriticalSection(&g_waitlog_cs);
+    fflush(stderr);
+}
+
 /* Kernel calls that can block: the lock is dropped across them so another
  * guest thread can make the progress this one is waiting for. */
 static int kernel_call_blocks(ULONG ordinal)
@@ -6284,9 +6511,35 @@ static void kernel_thunk_dispatch(void)
 
     if (bridge) {
         int blocks = kernel_call_blocks(ordinal);
+        int wl = waitlog_on();
+        long long wl_t0 = 0, wl_asked = -1;
+        uint32_t wl_obj = 0, wl_caller = 0;
+        if (wl && (waitlog_is_wait(ordinal) || waitlog_is_signal(ordinal))) {
+            wl_obj = (ordinal == 99) ? 0u : STACK_ARG(0);
+            wl_caller = g_xbox_kernel_caller;
+            if (waitlog_is_wait(ordinal)) {
+                wl_asked = waitlog_timeout_ms(ordinal);
+                wl_t0 = (long long)GetTickCount64();
+            }
+        } else {
+            wl = 0;
+        }
         if (blocks) xbox_guest_lock_release();
         bridge();
         if (blocks) xbox_guest_lock_acquire();
+        if (wl) {
+            if (waitlog_is_wait(ordinal))
+                waitlog_record(ordinal, wl_obj, wl_caller,
+                               (long long)GetTickCount64() - wl_t0,
+                               wl_asked, g_eax);
+            else
+                waitlog_signal_record(ordinal, wl_obj, wl_caller);
+        }
+        if (waitlog_on()) {
+            static long long wl_last;
+            long long wl_now = (long long)GetTickCount64();
+            if (wl_now - wl_last >= 1000) { wl_last = wl_now; xbox_waitlog_report(); }
+        }
         { KThreadState *k = t_kthread;
           if (k) k->left_ms = (long long)GetTickCount64(); }
     } else {

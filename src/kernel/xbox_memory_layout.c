@@ -172,13 +172,13 @@ static const struct { uint32_t offset; uint32_t busy_mask; } NV2A_ACK[] = {
      * acknowledge, reads it back still pending, and recurses into a native
      * stack overflow.
      *
-     * Holding them at zero is correct rather than convenient: nothing here
-     * ever raises a GPU interrupt, so "none pending" is the truth. */
-    { 0x000100, 0xFFFFFFFFu },  /* PMC_INTR_0    */
+     * Holding them at zero is correct rather than convenient for every source
+     * nothing here raises. The vertical blank is the exception -- the runtime
+     * does raise that one -- so PMC_INTR_0 and PCRTC_INTR_0 are handled by
+     * vblank_intr_tick() below instead of being wiped from here. */
     { 0x001100, 0xFFFFFFFFu },  /* PBUS_INTR_0   */
     { 0x002100, 0xFFFFFFFFu },  /* PFIFO_INTR_0  */
     { 0x400100, 0xFFFFFFFFu },  /* PGRAPH_INTR   */
-    { 0x600100, 0xFFFFFFFFu },  /* PCRTC_INTR_0  */
 };
 
 /*
@@ -547,10 +547,52 @@ static void framebuffer_probe_tick(void)
     fflush(stderr);
 }
 
+/* The vertical-blank interrupt, acknowledged the way the hardware does.
+ *
+ * This was the whole of the music fault. The runtime raises a vblank sixty
+ * times a second: it sets PCRTC_INTR_0's VBLANK bit and PMC_INTR_0's PCRTC
+ * bit, then calls the title's interrupt service routine, which queues a DPC
+ * and returns. The DPC -- running later, on the timer thread -- reads
+ * PMC_INTR_0 to find out which unit interrupted, and only then signals the
+ * device's vertical-blank event.
+ *
+ * Between those two steps sat this thread, wiping both registers to zero
+ * every 200 us. So the DPC ran fifty-nine times a second and found nothing
+ * pending fifty-seven of them. D3DDevice_BlockUntilVerticalBlank, which waits
+ * on that event with no timeout, returned one to three times a second, and
+ * the two threads parked in it -- one of them CRI's ADX server -- ran at that
+ * rate too. A music stream that must be refilled thirty-eight times a second
+ * was refilled twice, which is why the title's own decoder produced correct
+ * audio in the wrong order.
+ *
+ * Both registers are write-1-to-clear on hardware and plain RAM here, so the
+ * title's acknowledging write cannot be seen as a clear. It can be seen as a
+ * write: it stores the register whole, as 1, so the marker bit the raise sets
+ * is gone afterwards. Pending while the marker is there, acknowledged when it
+ * is not -- and the acknowledgement de-asserts PMC_INTR_0's PCRTC bit, which
+ * is what the handler's own spin loop is waiting for.
+ */
+static void vblank_intr_tick(volatile uint32_t *regs)
+{
+    volatile uint32_t *pcrtc = (volatile uint32_t *)((char *)regs + 0x600100);
+    volatile uint32_t *pmc   = (volatile uint32_t *)((char *)regs + 0x000100);
+    uint32_t v = *pcrtc;
+
+    if (v & NV2A_VBLANK_PENDING_TAG)
+        return;                       /* raised, not yet acknowledged */
+
+    /* Acknowledged (or never raised): complete it. */
+    if (v)
+        *pcrtc = 0;
+    if (*pmc)
+        *pmc = 0;
+}
+
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        vblank_intr_tick(regs);
         for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
             volatile uint32_t *r =
                 (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
