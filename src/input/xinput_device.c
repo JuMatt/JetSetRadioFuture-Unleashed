@@ -231,9 +231,29 @@ int  nv_gc_poll(unsigned port, unsigned short *buttons,
 static BOOL  g_connected[XBOX_MAX_CONTROLLERS];
 static DWORD g_packet[XBOX_MAX_CONTROLLERS];
 
+/* RECOMP_HOST_PAD=0 leaves the GameController framework alone entirely.
+ *
+ * For unattended runs driven by RECOMP_AUTO_INPUT. Headless, the guest's
+ * main thread is the process's main thread, and the framework is called
+ * from whichever guest thread reads the pad while it holds the guest lock.
+ * On 23 Sep one such first call never returned (the holder sat in
+ * mach_msg2_trap for the whole run, before the title) -- with nobody at
+ * the keyboard there is nothing to gain from the host pad and a whole run
+ * to lose. */
+static int host_pad_off(void)
+{
+    static int off = -1;
+    if (off < 0) {
+        const char *e = getenv("RECOMP_HOST_PAD");
+        off = (e && e[0] == '0') ? 1 : 0;
+    }
+    return off;
+}
+
 void xbox_InputInit(void)
 {
-    nv_gc_init();
+    if (!host_pad_off())
+        nv_gc_init();
 }
 
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
@@ -251,7 +271,8 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     memset(analog, 0, sizeof analog);
     memset(axes, 0, sizeof axes);
 
-    int have_pad = nv_gc_poll((unsigned)dwPort, &btn, analog, axes);
+    int have_pad = host_pad_off() ? 0
+                 : nv_gc_poll((unsigned)dwPort, &btn, analog, axes);
 
     /* The window's keyboard, merged in rather than instead.
      *
@@ -274,7 +295,27 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
             if (kb & 0x0008u) out |= XBOX_GAMEPAD_DPAD_RIGHT;
             if (kb & 0x0010u) out |= XBOX_GAMEPAD_START;
             if (kb & 0x0020u) out |= XBOX_GAMEPAD_BACK;
+            if (kb & 0x0400u) out |= XBOX_GAMEPAD_LEFT_THUMB;
+            if (kb & 0x0800u) out |= XBOX_GAMEPAD_RIGHT_THUMB;
             for (i = 0; i < 8; i++) if (ka[i]) analog[i] = ka[i];
+            /* The same four keys also push the left stick, and the arrows the
+             * right one: the skater only reads the stick (the d-pad is for
+             * menus). Full deflection, a diagonal scaled onto the circle.
+             * A held key replaces the pad's stick; nothing held leaves it. */
+            {
+                int lx = ((kb & 0x0008u) ? 1 : 0) - ((kb & 0x0004u) ? 1 : 0);
+                int ly = ((kb & 0x0001u) ? 1 : 0) - ((kb & 0x0002u) ? 1 : 0);
+                int rx = ((kb & 0x0200u) ? 1 : 0) - ((kb & 0x0100u) ? 1 : 0);
+                int ry = ((kb & 0x0040u) ? 1 : 0) - ((kb & 0x0080u) ? 1 : 0);
+                if (lx || ly) {
+                    short v = (lx && ly) ? 23170 : 32767;
+                    axes[0] = (short)(lx * v); axes[1] = (short)(ly * v);
+                }
+                if (rx || ry) {
+                    short v = (rx && ry) ? 23170 : 32767;
+                    axes[2] = (short)(rx * v); axes[3] = (short)(ry * v);
+                }
+            }
         }
     }
 

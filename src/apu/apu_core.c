@@ -82,6 +82,100 @@ static void update_irq(MCPXAPUState *d)
     }
 }
 
+/* Is the APU asking for its interrupt line?
+ *
+ * Asked by the kernel's timer thread once a millisecond, which is what
+ * delivers it: the standalone build has no PCI bus, pci_irq_assert() is a
+ * no-op, and until now nothing ever called the routine DirectSound connects
+ * to vector 5. DirectSound retires voices, clears its "stop pending" flags
+ * and refills streaming buffers from that ISR, so without it the title's
+ * main thread spins forever waiting for a voice to retire (pressing Start on
+ * the title screen), the ADX streamer never learns a buffer was consumed
+ * (music decays to silence), and its retry loop hammers the CRT heap lock.
+ *
+ * Same gate as update_irq(): the global enable, and at least one enabled
+ * source pending. GINTSTS is set here for the ISR to find, exactly as the
+ * hardware would present it. */
+int mcpx_apu_irq_pending(MCPXAPUState *d)
+{
+    uint32_t ien, ists;
+    if (!d) return 0;
+
+    /* A trapped front end asserts its interrupt for as long as it is trapped.
+     *
+     * update_irq() sets FETINTSTS from FECTL, but update_irq only runs when a
+     * register is written. So when the title puts the front end into TRAPPED
+     * mode and then waits for the interrupt that says so, nothing ever writes
+     * a register again, ISTS stays zero, no interrupt is raised, the driver
+     * never services the trap, and the front end stays trapped forever. The
+     * measurement that found it: FECTL reading TRAPPED HALTED with ISTS
+     * exactly zero, the whole voice pipeline stopped, not one buffer segment
+     * finished in a hundred seconds -- and a DirectSound thread spinning on a
+     * voice stop that only that interrupt could have retired.
+     *
+     * A level-triggered line is asserted by the condition, not by the edge
+     * that created it. Re-derive it here, where the condition is actually
+     * being asked about. */
+    if (qatomic_read(&d->regs[NV_PAPU_FECTL]) & NV_PAPU_FECTL_FEMETHMODE_TRAPPED)
+        qatomic_or(&d->regs[NV_PAPU_ISTS], NV_PAPU_ISTS_FETINTSTS);
+
+    ien  = qatomic_read(&d->regs[NV_PAPU_IEN]);
+    ists = qatomic_read(&d->regs[NV_PAPU_ISTS]);
+    if (!(ien & NV_PAPU_ISTS_GINTSTS)) return 0;
+    if (!(ists & ~NV_PAPU_ISTS_GINTSTS & ien)) return 0;
+    qatomic_or(&d->regs[NV_PAPU_ISTS], NV_PAPU_ISTS_GINTSTS);
+    return 1;
+}
+/* One line of APU state for whoever is diagnosing a stall, in a form that
+ * needs none of this file's types. IEN and ISTS say whether the hardware is
+ * asking for its interrupt and whether the title has enabled the source; the
+ * two counters say whether there was ever anything to ask about. */
+void mcpx_apu_debug_line(char *buf, unsigned long n);
+void mcpx_apu_debug_line(char *buf, unsigned long n)
+{
+    extern MCPXAPUState *g_apu_state;
+    extern unsigned long g_apu_notifies, g_apu_voice_offs;
+    extern unsigned g_apu_fe_on, g_apu_fe_off, g_apu_fe_total;
+    extern unsigned long g_apu_seg_done, g_apu_notify_ssl, g_apu_notify_persist;
+    extern unsigned long g_apu_voices_seen, g_apu_stream_voices, g_apu_voices_paused;
+    MCPXAPUState *d = g_apu_state;
+    if (!d) { snprintf(buf, (size_t)n, "no APU"); return; }
+    snprintf(buf, (size_t)n,
+             "SECTL=0x%08X(xcnt=%u) FECTL=0x%08X%s%s -> pipeline %s; "
+             "IEN=0x%08X ISTS=0x%08X -- %lu notifications raised, %lu voices "
+             "turned off; the title has sent %u methods (%u VOICE_ON, "
+             "%u VOICE_OFF); streaming: %lu segments finished, %lu SSL "
+             "notifications, %lu persist notifications; voices processed "
+             "%lu (%lu in stream format, %lu paused)",
+             (unsigned)qatomic_read(&d->regs[NV_PAPU_SECTL]),
+             (unsigned)GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
+                                NV_PAPU_SECTL_XCNTMODE),
+             (unsigned)qatomic_read(&d->regs[NV_PAPU_FECTL]),
+             (qatomic_read(&d->regs[NV_PAPU_FECTL])
+              & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) ? " TRAPPED" : "",
+             (qatomic_read(&d->regs[NV_PAPU_FECTL])
+              & NV_PAPU_FECTL_FEMETHMODE_HALTED) ? " HALTED" : "",
+             ((GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
+                        NV_PAPU_SECTL_XCNTMODE) != NV_PAPU_SECTL_XCNTMODE_OFF)
+              && !(qatomic_read(&d->regs[NV_PAPU_FECTL])
+                   & NV_PAPU_FECTL_FEMETHMODE_TRAPPED)
+              && !(qatomic_read(&d->regs[NV_PAPU_FECTL])
+                   & NV_PAPU_FECTL_FEMETHMODE_HALTED)) ? "RUNNING" : "STOPPED",
+             (unsigned)qatomic_read(&d->regs[NV_PAPU_IEN]),
+             (unsigned)qatomic_read(&d->regs[NV_PAPU_ISTS]),
+             g_apu_notifies, g_apu_voice_offs,
+             g_apu_fe_total, g_apu_fe_on, g_apu_fe_off,
+             g_apu_seg_done, g_apu_notify_ssl, g_apu_notify_persist,
+             g_apu_voices_seen, g_apu_stream_voices, g_apu_voices_paused);
+}
+
+/* The kernel does not know the APU's types: a plain query on the global. */
+int mcpx_apu_irq_pending_global(void)
+{
+    extern MCPXAPUState *g_apu_state;
+    return mcpx_apu_irq_pending(g_apu_state);
+}
+
 /* ============================================================
  * MMIO Read / Write
  * ============================================================ */

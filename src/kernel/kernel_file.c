@@ -283,6 +283,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 {
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
+        xbox_dir_context_release(Handle);
         CloseHandle(Handle);
         return STATUS_SUCCESS;
     }
@@ -600,6 +601,23 @@ static DIR_CONTEXT* find_or_create_dir_context(HANDLE FileHandle, BOOL create)
     return NULL;
 }
 
+/* See the POSIX twin below: a closed directory handle's enumeration must not
+ * outlive it, or the next handle given the same value continues it. */
+void xbox_dir_context_release(HANDLE FileHandle)
+{
+    if (!s_dir_cs_init || !FileHandle) return;
+    EnterCriticalSection(&s_dir_cs);
+    for (int i = 0; i < MAX_DIR_CONTEXTS; i++) {
+        if (s_dir_contexts[i].file_handle != FileHandle) continue;
+        if (s_dir_contexts[i].find_handle && s_dir_contexts[i].find_handle != INVALID_HANDLE_VALUE)
+            FindClose(s_dir_contexts[i].find_handle);
+        s_dir_contexts[i].find_handle = NULL;
+        s_dir_contexts[i].file_handle = NULL;
+        s_dir_contexts[i].first_done = FALSE;
+    }
+    LeaveCriticalSection(&s_dir_cs);
+}
+
 NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length,
@@ -908,6 +926,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 {
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
+        xbox_dir_context_release(Handle);
         CloseHandle(Handle);
         return STATUS_SUCCESS;
     }
@@ -1087,6 +1106,15 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
                 info->TotalAllocationUnits.QuadPart = 1048576;
                 info->AvailableAllocationUnits.QuadPart = 524288;
             }
+            { static int n;   /* what a title's free-space check is told */
+              if (n++ < 12) {
+                  const char *p = w32_handle_path(FileHandle);
+                  fprintf(stderr, "  [FILE] free space on %s: %llu of %llu units of %u bytes%s\n",
+                          p ? p : "?", (unsigned long long)info->AvailableAllocationUnits.QuadPart,
+                          (unsigned long long)info->TotalAllocationUnits.QuadPart,
+                          (unsigned)(info->BytesPerSector * info->SectorsPerAllocationUnit),
+                          fd >= 0 ? "" : " (no fd: made-up numbers)");
+              } }
             IoStatusBlock->Status = STATUS_SUCCESS;
             IoStatusBlock->Information = sizeof(XBOX_FILE_FS_SIZE_INFORMATION);
             return STATUS_SUCCESS;
@@ -1146,6 +1174,33 @@ static DIR_CONTEXT s_dir_contexts[MAX_DIR_CONTEXTS];
 static CRITICAL_SECTION s_dir_cs;
 static BOOL s_dir_cs_init = FALSE;
 
+/* Called from NtClose. XAPI's FindFirstFile opens the directory, reads the
+ * one entry matching its pattern and closes the handle -- the enumeration is
+ * never run to its end, which was the only place a context was let go. The
+ * context then outlived its handle, and the host allocator hands the same
+ * handle value to a later open: the next FindFirstFile on it was taken for a
+ * FindNextFile of the dead search, resumed the old directory stream with the
+ * old pattern, found nothing and failed. CRI's file-size query goes through
+ * FindFirstFile, so a failed one made an ADX stream zero bytes long -- the
+ * stream "ended" before its first read, the tutorial music never started and
+ * the DJ K scene waited forever on its voice track (a black screen). About
+ * half the launches, depending on how the allocator reused the address.
+ * RECOMP_DIR_KEEPCTX=1 restores the old behaviour for comparison. */
+void xbox_dir_context_release(HANDLE FileHandle)
+{
+    static int keep = -1;
+    if (keep < 0) keep = getenv("RECOMP_DIR_KEEPCTX") ? 1 : 0;
+    if (keep || !s_dir_cs_init || !FileHandle) return;
+    EnterCriticalSection(&s_dir_cs);
+    for (int i = 0; i < MAX_DIR_CONTEXTS; i++) {
+        if (s_dir_contexts[i].handle != FileHandle) continue;
+        if (s_dir_contexts[i].dir) closedir(s_dir_contexts[i].dir);
+        s_dir_contexts[i].dir = NULL;
+        s_dir_contexts[i].handle = NULL;
+    }
+    LeaveCriticalSection(&s_dir_cs);
+}
+
 NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length,
@@ -1170,6 +1225,14 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         ctx->dir = NULL;
     }
 
+    /* A pattern comes only with the first query on a handle. Finding an
+     * enumeration already open here means a context outlived its handle. */
+    if (ctx->dir && !RestartScan && FileName && FileName->Buffer && FileName->Length > 0) {
+        static int n;
+        if (n++ < 8)
+            fprintf(stderr, "  [DIR] stale enumeration on handle %p: new pattern '%.*s', old '%s'\n",
+                    FileHandle, (int)FileName->Length, FileName->Buffer, ctx->pattern);
+    }
     if (RestartScan || ctx->dir == NULL) {
         if (ctx->dir) { closedir(ctx->dir); ctx->dir = NULL; }
         const char* dpath = w32_handle_path(FileHandle);

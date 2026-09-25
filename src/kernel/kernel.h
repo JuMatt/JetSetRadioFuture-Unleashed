@@ -672,6 +672,8 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length,
     PXBOX_ANSI_STRING FileName, BOOLEAN RestartScan);
+/* Drop the enumeration state of a directory handle being closed (NtClose). */
+void xbox_dir_context_release(HANDLE FileHandle);
 
 NTSTATUS __stdcall xbox_NtFsControlFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,

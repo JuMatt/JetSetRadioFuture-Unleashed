@@ -47,9 +47,32 @@ static const struct {
  * Notify status helper
  * ============================================================ */
 
+/* How often the voice processor has told the title something finished, and
+ * how many voices it has turned off. Counted because "DirectSound never
+ * retires the voice" has two halves -- the APU not saying so, or the title
+ * not hearing it -- and no amount of reading either side's code distinguishes
+ * them. Reported by the freeze watchdog. */
+unsigned long g_apu_notifies;
+unsigned long g_apu_voice_offs;
+/* What the title has asked the audio hardware to do, in total. */
+unsigned g_apu_fe_on, g_apu_fe_off, g_apu_fe_cfg, g_apu_fe_other, g_apu_fe_total;
+/* The streaming path, counted separately from everything else.
+ *
+ * On a console the interrupt that drains DirectSound's pending-stop queue is
+ * raised by ANY voice notification, and a title streaming music raises one
+ * every buffer segment -- hundreds a second. Here a whole run raises one to
+ * four. If stream voices are never reaching the end of a segment, that is the
+ * reason the queue never drains and the reason the music decays, and those
+ * are the same bug seen from two sides. These four counters say which step
+ * stops: voices seen in stream format, segments completed, and each of the
+ * two places a stream voice can report itself done. */
+unsigned long g_apu_stream_voices, g_apu_seg_done, g_apu_notify_ssl, g_apu_notify_persist;
+unsigned long g_apu_voices_seen, g_apu_voices_paused;
+
 static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
                               int status)
 {
+    g_apu_notifies++;
     hwaddr notify_offset = d->regs[NV_PAPU_FENADDR];
     notify_offset += 16 * (MCPX_HW_NOTIFIER_BASE_OFFSET +
                            v * MCPX_HW_NOTIFIER_COUNT + notifier);
@@ -134,6 +157,7 @@ static void voice_set_mask(MCPXAPUState *d, uint16_t voice_handle,
 
 static void voice_off(MCPXAPUState *d, uint16_t v)
 {
+    g_apu_voice_offs++;
     voice_set_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE, 0);
 
@@ -198,9 +222,20 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
     {
         static int trace = -1;
         static int64_t last_ms;
-        static unsigned n_on, n_off, n_cfg, n_other, n_total;
+#define n_on    g_apu_fe_on
+#define n_off   g_apu_fe_off
+#define n_cfg   g_apu_fe_cfg
+#define n_other g_apu_fe_other
+#define n_total g_apu_fe_total
         if (trace < 0) trace = getenv("RECOMP_APU_TRACE") ? 1 : 0;
-        if (trace) {
+        /* Counted unconditionally now, not only under the trace switch.
+         *
+         * "The front end stopped being called" and "the front end is being
+         * called and the title is not asking for anything" are different
+         * failures with the same silence, and the freeze report needs to tell
+         * them apart without a second run under a different environment. The
+         * counting is four increments on a path that already does real work. */
+        {
             int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
             n_total++;
             if (method == NV1BA0_PIO_VOICE_ON) n_on++;
@@ -209,7 +244,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
                   && method < NV1BA0_PIO_SET_VOICE_CFG_VBIN + 0x100) n_cfg++;
             else n_other++;
             if (!last_ms) last_ms = now;
-            if (now - last_ms >= 2000) {
+            if (trace && now - last_ms >= 2000) {
                 fprintf(stderr, "  [APU-FE] %u methods: VOICE_ON %u, VOICE_OFF "
                         "%u, voice cfg %u, other %u\n",
                         n_total, n_on, n_off, n_cfg, n_other);
@@ -217,6 +252,11 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
                 last_ms = now;
             }
         }
+#undef n_on
+#undef n_off
+#undef n_cfg
+#undef n_other
+#undef n_total
     }
 
     unsigned int slot;
@@ -236,6 +276,28 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 
     case NV1BA0_PIO_VOICE_ON: {
         selected_handle = argument & NV1BA0_PIO_VOICE_ON_HANDLE;
+        /* What format each voice is started in.
+         *
+         * The voice processor ran 378,000 voice-frames in a hundred seconds
+         * and reported NOT ONE in stream format, which is why the music never
+         * advances a buffer segment and why CRI stops asking for sectors after
+         * the first few. Either the title never starts a streaming voice, or
+         * DATA_TYPE is not being read from where the title wrote it. Printing
+         * the format word at the moment the voice is switched on settles
+         * which, and there are only a handful of these per run. */
+        { uint32_t fmt = voice_get_mask(d, (uint16_t)selected_handle,
+                                        NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFF);
+          fprintf(stderr, "  [VOICE] on %u: CFG_FMT=0x%08X data_type=%u "
+                          "(%s) loop=%u\n",
+                  selected_handle, fmt,
+                  (unsigned)voice_get_mask(d, (uint16_t)selected_handle,
+                        NV_PAVS_VOICE_CFG_FMT, NV_PAVS_VOICE_CFG_FMT_DATA_TYPE),
+                  voice_get_mask(d, (uint16_t)selected_handle,
+                        NV_PAVS_VOICE_CFG_FMT,
+                        NV_PAVS_VOICE_CFG_FMT_DATA_TYPE) ? "STREAM" : "buffer",
+                  (unsigned)voice_get_mask(d, (uint16_t)selected_handle,
+                        NV_PAVS_VOICE_CFG_FMT, NV_PAVS_VOICE_CFG_FMT_LOOP));
+          fflush(stderr); }
 
         bool locked = is_voice_locked(d, (uint16_t)selected_handle);
         if (!locked) voice_lock(d, (uint16_t)selected_handle, true);
@@ -593,7 +655,15 @@ uint64_t mcpx_apu_vp_read(void *opaque, hwaddr addr, unsigned int size)
 
     switch (addr) {
     case NV1BA0_PIO_FREE:
-        return 0x80; /* Always pretend queue is empty */
+        /* Free space in the voice-processor method FIFO. The XDK's
+         * DirectSound polls this before every batch of methods, in some
+         * thirty tight loops, each waiting for ">= N dwords free", and
+         * some of those N are computed from voice counts. Methods here are
+         * executed synchronously, so the queue really is always empty:
+         * answer with a size no batch can exceed rather than 0x80, which
+         * left a batch needing more than 32 dwords spinning forever with
+         * the guest lock held. */
+        return 0x1000;
     default:
         break;
     }
@@ -807,6 +877,17 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                                  NV_PAVS_VOICE_CFG_FMT_DATA_TYPE) != 0;
     bool paused = voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_STATE,
                                  NV_PAVS_VOICE_PAR_STATE_PAUSED) != 0;
+
+    /* Which voices the processor actually sees, and what state they are in.
+     *
+     * "0 segments finished" says a stream voice never reaches the end of its
+     * buffer, and there are three quite different reasons that could be true:
+     * no voice is in stream format at all, stream voices exist but are paused,
+     * or they run and their offsets never advance. Counting the voices as they
+     * are processed separates those without another build. */
+    g_apu_voices_seen++;
+    if (stream) g_apu_stream_voices++;
+    if (paused) g_apu_voices_paused++;
     bool loop = voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_CFG_FMT,
                                NV_PAVS_VOICE_CFG_FMT_LOOP) != 0;
     uint32_t ebo = voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_NEXT,
@@ -911,6 +992,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 d->vp.ssl[v].ssl_index = 0;
                 voice_off(d, (uint16_t)v);
             } else {
+                g_apu_notify_persist++;
                 set_notify_status(d, v, MCPX_HW_NOTIFIER_SSLA_DONE +
                                   d->vp.ssl[v].ssl_index,
                                   NV1BA0_NOTIFICATION_STATUS_DONE_SUCCESS);
@@ -1059,6 +1141,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
 
     if (cbo >= ebo) {
         if (stream) {
+            g_apu_seg_done++;
             d->vp.ssl[v].ssl_seg += 1;
             cbo = 0;
             if (d->vp.ssl[v].ssl_seg < d->vp.ssl[v].count[ssl_index]) {
@@ -1067,6 +1150,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 int next_index = (ssl_index + 1) % 2;
                 d->vp.ssl[v].ssl_index = next_index;
                 d->vp.ssl[v].ssl_seg = 0;
+                g_apu_notify_ssl++;
                 set_notify_status(d, v, MCPX_HW_NOTIFIER_SSLA_DONE + ssl_index,
                                   NV1BA0_NOTIFICATION_STATUS_DONE_SUCCESS);
             }

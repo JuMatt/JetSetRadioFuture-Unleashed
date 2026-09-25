@@ -184,6 +184,16 @@ uint32_t xbox_GetDisplayFramebuffer(uint32_t *pitch);
  * below 256 MB, or 0 when the arena is exhausted. */
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment);
 uint32_t xbox_ContiguousAllocatedBytes(void);
+/* Free a block xbox_ContiguousAlloc handed out: 1 if it was one (now free),
+ * 0 if the address is not in the window (try the general heap). */
+int xbox_ContiguousFree(uint32_t xbox_va);
+/* Bytes from the address to the end of its live block, or 0. */
+uint32_t xbox_ContiguousBlockSize(uint32_t xbox_va);
+/* A number unique to the allocation holding the address, 0 if none. */
+uint32_t xbox_ContiguousBlockSerial(uint32_t xbox_va);
+/* Wake the NV2A acknowledgement thread now (D3D KickOff). */
+void xbox_nv2a_kick(void);
+void xbox_nv2a_hurry(int on);
 
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
                          uint32_t put_off, uint32_t get_ptr_off);

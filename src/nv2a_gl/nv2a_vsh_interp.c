@@ -96,6 +96,9 @@ static float safe_rcp(float x) { return x != 0.0f ? 1.0f / x : 0.0f; }
  * shared with the test that checks it against the generated shader and this
  * is a diagnostic hook rather than part of what it computes. Single-threaded
  * by construction: it is called from the draw path, which is one thread. */
+float    g_interp_out[16][4];
+uint16_t g_interp_written;
+
 static int *g_a0_out;
 static int  g_a0_n, g_a0_max;
 
@@ -267,5 +270,14 @@ int nv2a_vsh_interp(const Nv2aVshProgram *p,
     }
 
     for (k = 0; k < 4; k++) out_pos[k] = m.out[NV2A_OREG_POS][k];
+    /* Every output, for a caller that wants to know what colour the program
+     * hands the combiner and not only where it puts the vertex. The isolated
+     * render showed humanoid characters coming out near black while vehicles
+     * and trees in the same frame came out in full colour, so the vertex
+     * colour is the thing to look at, and it is right here already computed.
+     * Single-threaded by construction, like the address hook above: this is
+     * called from the draw path, which is one thread. */
+    memcpy(g_interp_out, m.out, sizeof g_interp_out);
+    g_interp_written = m.written;
     return (m.written & (1u << NV2A_OREG_POS)) ? 1 : 0;
 }

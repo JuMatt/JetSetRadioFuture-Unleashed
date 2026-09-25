@@ -83,6 +83,7 @@ extern void xbox_guest_lock_retake(int)  __attribute__((weak));
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern uint32_t  xbox_ContiguousAllocatedBytes(void);
+extern uint32_t  xbox_ContiguousBlockSerial(uint32_t va);
 
 #ifndef XBOX_CONTIG_BASE
 #define XBOX_CONTIG_BASE 0x80000000u
@@ -258,6 +259,10 @@ typedef struct {
     uint32_t offset, format, addr, control0, control1, filter, image_rect;
     uint32_t width, height, pitch, color, levels;
     int      enabled;
+    /* NV097_SET_TEXTURE_SET_BUMP_ENV_MAT/_SCALE/_OFFSET, in this stage's own
+     * block: the 2x2 matrix a BUMPENVMAP stage applies to the (du, dv) it
+     * reads from its source stage, and the luminance scale and offset. */
+    float    bump_mat[4], bump_scale, bump_off;
 } TexStage;
 
 static struct {
@@ -394,6 +399,7 @@ static struct {
                                    * divide, the way the hardware does */
     uint32_t draws_inline, draws_array, draws_depth_on, surface_switches;
     uint32_t draws_xf[4];   /* draws by transform execution mode */
+    int      surf_dirty;    /* offset or clip changed since the last bind */
 } S;
 
 /* ── where a frame's CPU time goes ────────────────────────────────────────
@@ -539,15 +545,45 @@ static EGLSurface g_egl_surf;
  * counters still climb, and the picture is black. Keying the framebuffer on
  * the surface's address costs a few megabytes and makes the two independent,
  * which is also what render-to-texture will need. */
-#define SURF_CACHE 8
+/*
+ * Sixteen, evicted least-recently-used. It was eight, evicting slot 0 --
+ * and slot 0 is the first surface a title draws into, which for JSRF is the
+ * off-screen frame everything is built in. The boost dash's blur uses three
+ * more targets, the eager binding below added four phantom ones, the ninth
+ * evicted slot 0 and the next bind of the real frame evicted it straight
+ * back: every frame of the effect started from an empty picture.
+ */
+#define SURF_CACHE 16
 static struct {
     uint32_t offset, w, h;
     GLuint   fbo, tex, depth;
     int      used;
+    uint32_t last_use;    /* bind order, for eviction */
+    uint32_t last_draw;   /* S.draws when last drawn or cleared into */
+    uint32_t fmt;         /* SET_SURFACE_FORMAT when it was last bound */
+    uint32_t serial;      /* allocation holding its memory when last bound */
 } g_surf[SURF_CACHE];
+static uint32_t g_surf_clock;
+static int      g_dump_burst_left, g_dump_burst_every = 1;
+static int      g_present_slot = -1;  /* set at FLIP_STALL, see present() */
+static uint32_t g_last_flip_draws;    /* S.draws at the last FLIP_STALL */
 static int      g_cur_surf = -1;
+/* nv2a_gl_trace_frames(): per-pass log for the next few frames. */
+static uint32_t g_pass_trace_until;
 static GLuint   g_fbo, g_color_tex, g_depth_rb;
 static uint32_t g_fbo_w, g_fbo_h;
+#define SLOTCENSUS_MAX 4096
+static uint32_t g_slot_draws[SLOTCENSUS_MAX];
+/* The finished frame's counts.
+ *
+ * The dump and the per-frame reset both happen inside present(), and the
+ * reset ran first -- so the census written beside each screenshot counted
+ * one draw, not the thousands the picture was made of. Keep the completed
+ * frame's totals and write those: they are the frame the screenshot shows. */
+static uint32_t g_slot_prev[SLOTCENSUS_MAX];
+/* Which frame the per-draw hunt should examine. Set either from the env at
+ * the hunt itself, or by the end-of-frame brightness watcher below. */
+int g_darkhunt_at = -1;
 /* The raster's real size. Equal to the logical size unless RECOMP_GL_SCALE
  * asks for more -- see gl_scale(). Everything the title can observe uses the
  * logical size; only the pixels use this one. */
@@ -605,10 +641,12 @@ static struct {
     uint32_t last_draw; /* for eviction, if a title ever does fill this */
     GLuint   prog;
     GLint    u_c, u_vpScale, u_vpOff, u_vpSurface, u_posMode, u_drawTint;
+    GLint    u_fogEnable;
     GLint    u_ffMat, u_ffTexMat;   /* fixed-function transform, see S.ff_* */
     GLint    u_ffVpOff;
     GLint    u_litAmbient, u_zClip;
     GLint    u_tex[4], u_texScale[4], u_fogColor, u_alphaFunc, u_alphaRef;
+    GLint    u_bumpMat[4], u_bumpScale[4], u_bumpOff[4], u_texOff[4];
     uint16_t inputs;
     uint8_t  uses_a0;   /* indexes the constant file through the address register */
     uint8_t  a0_input;  /* the v register the index comes from, 0xFF if unknown */
@@ -687,6 +725,7 @@ static int pcache_alloc(uint32_t hash)
 static struct {
     uint32_t layout;        /* which arrays are enabled, and where each sits */
     uint32_t const_mask;    /* attributes currently set as constants */
+    float    const_attr[NUM_ATTRS][4];   /* and the values they were set to */
     int      prog_slot;
     GLuint   tex0;
     int      tex_enable;
@@ -699,6 +738,8 @@ static struct {
     int      valid;
 } g_last;
 static int g_last_cm_reset;   /* a clear forced the colour mask on */
+static uint32_t g_frame_chars;       /* big skinned batches this frame */
+static uint32_t g_frame_chars_prev;  /* ... and in the frame just finished */
 
 /*
  * Room for a level, not just a menu.
@@ -1014,6 +1055,15 @@ static int gl_init(uint32_t w, uint32_t h)
 
 #endif /* NV2A_GL_USE_SDL */
 
+/* Which contiguous allocation holds a surface offset now (0: none, or not
+ * in the window). Surfaces are physical offsets; the window maps physical P
+ * at XBOX_CONTIG_BASE + P. */
+static uint32_t surf_serial(uint32_t offset)
+{
+    offset &= 0x0FFFFFFFu;
+    return offset < XBOX_CONTIG_SIZE ? xbox_ContiguousBlockSerial(XBOX_CONTIG_BASE + offset) : 0;
+}
+
 /* Make the framebuffer for `offset` current, creating it if this is the first
  * time the title has drawn there. */
 static void surface_bind(uint32_t offset, uint32_t w, uint32_t h)
@@ -1027,7 +1077,19 @@ static void surface_bind(uint32_t offset, uint32_t w, uint32_t h)
          && g_surf[i].w == w && g_surf[i].h == h) { slot = i; break; }
         if (!g_surf[i].used && slot < 0) slot = i;
     }
-    if (slot < 0) slot = 0;                       /* evict the oldest */
+    if (slot < 0) {
+        /* Full: evict the least recently bound, never the current one. */
+        uint32_t oldest = 0xFFFFFFFFu;
+        for (i = 0; i < SURF_CACHE; i++)
+            if (i != g_cur_surf && g_surf[i].last_use < oldest) {
+                oldest = g_surf[i].last_use; slot = i;
+            }
+        if (slot < 0) slot = 0;
+        fprintf(stderr, "  [GL] surface cache full: %08X %ux%u evicted for %08X %ux%u\n",
+                g_surf[slot].offset, g_surf[slot].w, g_surf[slot].h, offset, w, h);
+    }
+    g_surf[slot].last_use = ++g_surf_clock;
+    g_surf[slot].serial = surf_serial(offset);
 
     if (!g_surf[slot].used || g_surf[slot].offset != offset
      || g_surf[slot].w != w || g_surf[slot].h != h) {
@@ -1087,15 +1149,31 @@ static void surface_bind(uint32_t offset, uint32_t w, uint32_t h)
  * surface it has just drawn is doing render-to-texture, and the answer has to
  * be the live framebuffer rather than whatever stale bytes sit at that
  * address in guest memory. */
+/* Which cached surface a texture at `offset` is, or -1. With several at one
+ * address, the one whose size matches the texture's, else the one drawn into
+ * most recently -- that is the one whose pixels the memory holds. The current
+ * surface counts only when `allow_cur` is set: sampling it while drawing into
+ * it needs a copy (see surface_texture_for). */
+static int surface_find(uint32_t offset, uint32_t w, uint32_t h, int allow_cur)
+{
+    int i, best = -1;
+    for (i = 0; i < SURF_CACHE; i++) {
+        if (!g_surf[i].used || g_surf[i].offset != offset) continue;
+        if (i == g_cur_surf && !allow_cur) continue;
+        /* The title freed this target and the memory holds something else
+         * now (contiguous memory is reused since the allocator frees): what
+         * is there is a texture, not the picture drawn into it last stage. */
+        if (g_surf[i].serial != surf_serial(offset)) continue;
+        if (w && h && g_surf[i].w == w && g_surf[i].h == h) return i;
+        if (best < 0 || g_surf[i].last_draw > g_surf[best].last_draw) best = i;
+    }
+    return best;
+}
+
 static GLuint surface_texture(uint32_t offset, uint32_t w, uint32_t h)
 {
-    int i;
-    for (i = 0; i < SURF_CACHE; i++)
-        if (g_surf[i].used && g_surf[i].offset == offset
-         && (!w || g_surf[i].w == w) && (!h || g_surf[i].h == h)
-         && i != g_cur_surf)
-            return g_surf[i].tex;
-    return 0;
+    int i = surface_find(offset, w, h, 0);
+    return i >= 0 ? g_surf[i].tex : 0;
 }
 
 /* ---- shaders ------------------------------------------------------------ */
@@ -1215,7 +1293,19 @@ static void psh_sync_textures(void)
         /* The stage's texture shader mode decides whether it is sampled at
          * all: NONE means the sampler is never touched, whatever is bound. */
         { uint32_t mode = (S.shader_stage_prog >> (5 * i)) & 31u;
+          static int nobump = -1;
+          if (nobump < 0) nobump = getenv("RECOMP_GL_NOBUMP") ? 1 : 0;
+          /* RECOMP_GL_NOBUMP=1: sample a BUMPENVMAP stage as plain 2D,
+           * the way every stage was sampled before it was implemented. */
+          if (nobump && (mode == 6 || mode == 7)) mode = 1;
           S.psh.tex_mode[i] = (uint8_t)mode;
+          /* Which earlier stage a BUMPENVMAP stage takes its (du, dv) from:
+           * stage 1 always from 0; 2 and 3 from SET_SHADER_OTHER_STAGE_INPUT
+           * (xemu psh.c, input_tex). */
+          S.psh.bump_src[i] = (uint8_t)(i == 2 ? ((S.shader_other_input >> 16) & 1u)
+                                      : i == 3 ? ((S.shader_other_input >> 20) & 3u) : 0u);
+          if (S.psh.bump_src[i] >= i) S.psh.bump_src[i] = 0;
+          S.psh.tex_signed[i] = 0;   /* set below for bump sources */
           S.psh.clip_cmp[i] = (uint8_t)((S.shader_clip_mode >> (4 * i)) & 15u);
           if (mode == 0 || mode == 4 || mode == 5) live = 0; }
         S.psh.tex_bound[i] = (uint8_t)(live ? 1 : 0);
@@ -1224,6 +1314,26 @@ static void psh_sync_textures(void)
         S.psh.tex_alpha_only[i] = (uint8_t)((t->color == 0x19 || t->color == 0x1F)
                                             ? 1 : 0);
     }
+    /* Keep the bump fields out of the program key unless a stage uses them:
+     * a signed bit on a texture nobody bumps from changes nothing. */
+    /* A bump stage's (du, dv) are signed bytes whatever the title's sign
+     * bits say (xemu reads them as two's complement unless the texture is
+     * already signed). A source decoded from guest memory is uploaded with
+     * those two bytes offset by 0x80 (g_upload_bias_bg) so that filtering
+     * interpolates them as numbers rather than as bit patterns -- two's
+     * complement read unsigned jumps from 255 to 0 at every zero crossing,
+     * and a linear filter turns each crossing into a spike. A surface used
+     * as a source cannot be re-encoded and is read raw.
+     * tex_signed: 0x10 = offset-binary source, 0x20 = raw two's complement. */
+    { uint8_t need[4] = { 0, 0, 0, 0 }; int k;
+      for (k = 1; k < 4; k++)
+          if (S.psh.tex_mode[k] == 6 || S.psh.tex_mode[k] == 7) need[S.psh.bump_src[k]] = 1;
+          else S.psh.bump_src[k] = 0;
+      S.psh.bump_src[0] = 0;
+      for (k = 0; k < 4; k++)
+          S.psh.tex_signed[k] = !need[k] ? 0
+              : surface_find(S.tex[k].offset, S.tex[k].width, S.tex[k].height, 1) >= 0
+                ? 0x20 : 0x10; }
     S.psh.alpha_test = (uint8_t)(S.alpha_test ? 1 : 0);
     S.psh.alpha_func = (uint32_t)S.alpha_func;
     S.psh.alpha_ref  = S.alpha_ref;
@@ -1251,6 +1361,7 @@ static void pcache_locate_uniforms(int slot)
     g_pcache[slot].u_vpOff      = glGetUniformLocation(prog, "vpOff");
     g_pcache[slot].u_vpSurface  = glGetUniformLocation(prog, "vpSurface");
     g_pcache[slot].u_posMode    = glGetUniformLocation(prog, "posMode");
+    g_pcache[slot].u_fogEnable  = glGetUniformLocation(prog, "fogEnable");
     g_pcache[slot].u_drawTint   = glGetUniformLocation(prog, "drawTint");
     g_pcache[slot].u_ffMat      = glGetUniformLocation(prog, "ffMat");
     g_pcache[slot].u_ffTexMat   = glGetUniformLocation(prog, "ffTexMat");
@@ -1263,6 +1374,14 @@ static void pcache_locate_uniforms(int slot)
         g_pcache[slot].u_tex[i] = glGetUniformLocation(prog, nm);
         snprintf(nm, sizeof nm, "texScale%d", i);
         g_pcache[slot].u_texScale[i] = glGetUniformLocation(prog, nm);
+        snprintf(nm, sizeof nm, "texOff%d", i);
+        g_pcache[slot].u_texOff[i] = glGetUniformLocation(prog, nm);
+        snprintf(nm, sizeof nm, "bumpMat%d", i);
+        g_pcache[slot].u_bumpMat[i] = glGetUniformLocation(prog, nm);
+        snprintf(nm, sizeof nm, "bumpScale%d", i);
+        g_pcache[slot].u_bumpScale[i] = glGetUniformLocation(prog, nm);
+        snprintf(nm, sizeof nm, "bumpOffset%d", i);
+        g_pcache[slot].u_bumpOff[i] = glGetUniformLocation(prog, nm);
     }
     g_pcache[slot].u_fogColor   = glGetUniformLocation(prog, "fogColor");
     g_pcache[slot].u_alphaFunc  = glGetUniformLocation(prog, "alphaFunc");
@@ -1738,6 +1857,55 @@ static void tex_alpha_census(const uint8_t *rgba, uint32_t w, uint32_t h,
 }
 
 static GLuint upload_texture_inner(const TexStage *t);
+/*
+ * The texture for a stage whose address is a surface this backend renders
+ * into, or 0 when it is not one.
+ *
+ * A linear texture is addressed in texels, and texel (x, y) of a texture
+ * laid over a surface is pixel (x, y) of that surface -- so the scale that
+ * normalises its coordinates is the surface's size, not the size the texture
+ * was declared with. The two differ when a title samples part of a target.
+ *
+ * Sampling the surface that is being drawn into is a feedback loop GL leaves
+ * undefined; the console reads whatever is there. The surface is copied
+ * first and the copy is sampled.
+ */
+static int g_upload_bias_bg;   /* see psh_sync_textures: bump sources */
+static GLuint g_fb_copy_tex;
+static uint32_t g_fb_copy_w, g_fb_copy_h;
+static int g_fb_copies;
+static GLuint surface_texture_for(const TexStage *t, float *sx, float *sy, int *slot_out)
+{
+    int i = surface_find(t->offset, t->width, t->height, 1);
+    int linear;
+    uint32_t pw, ph;
+    if (slot_out) *slot_out = i;
+    if (i < 0) return 0;
+    linear = !fmt_is_swz(t->color) && !fmt_is_dxt(t->color);
+    *sx = linear ? 1.0f / (float)g_surf[i].w : 1.0f;
+    *sy = linear ? 1.0f / (float)g_surf[i].h : 1.0f;
+    if (i != g_cur_surf) return g_surf[i].tex;
+    pw = g_surf[i].w * gl_scale(); ph = g_surf[i].h * gl_scale();
+    if (!g_fb_copy_tex) glGenTextures(1, &g_fb_copy_tex);
+    glBindTexture(GL_TEXTURE_2D, g_fb_copy_tex);
+    if (g_fb_copy_w != pw || g_fb_copy_h != ph) {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)pw, (GLsizei)ph, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        g_fb_copy_w = pw; g_fb_copy_h = ph;
+    }
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, g_surf[i].fbo);
+    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, (GLsizei)pw, (GLsizei)ph);
+    glBindFramebuffer(GL_FRAMEBUFFER, g_surf[i].fbo);
+    if (g_fb_copies++ < 4)
+        fprintf(stderr, "  [GL] draw %u samples surface %08X while drawing into it:"
+                        " sampling a copy\n", S.draws, g_surf[i].offset);
+    return g_fb_copy_tex;
+}
+
 static GLuint upload_texture(const TexStage *t)
 {
     GLuint r; PROF_T0();
@@ -1790,6 +1958,7 @@ static GLuint upload_texture_inner(const TexStage *t)
         for (i = 0; i < bytes && step; i += step)
             hash = hash * 31u + src[i];
         hash = hash * 31u + bytes;
+        if (g_upload_bias_bg) hash ^= 0x9E3779B9u;   /* a different upload */
     }
     key = (t->offset ^ (w << 16) ^ (h << 4) ^ t->color) * 2246822519u;
     for (i = 0; i < TEX_CACHE; i++) {
@@ -1840,6 +2009,7 @@ static GLuint upload_texture_inner(const TexStage *t)
             for (x = 0; x < w; x++) {
                 uint32_t argb = 0xFF000000u;
                 d3d8_dxt_decode_texel(src, t->color, x, y, w, &argb);
+                if (g_upload_bias_bg) argb ^= 0x00008080u;
                 rgba[((size_t)y * w + x) * 4 + 0] = (uint8_t)(argb >> 16);
                 rgba[((size_t)y * w + x) * 4 + 1] = (uint8_t)(argb >> 8);
                 rgba[((size_t)y * w + x) * 4 + 2] = (uint8_t)argb;
@@ -1868,6 +2038,7 @@ static GLuint upload_texture_inner(const TexStage *t)
                     p = src + (size_t)y * (t->pitch ? t->pitch : w * bpp)
                             + (size_t)x * bpp;
                 argb = decode_texel(lin, p);
+                if (g_upload_bias_bg) argb ^= 0x00008080u;
                 rgba[((size_t)y * w + x) * 4 + 0] = (uint8_t)(argb >> 16);
                 rgba[((size_t)y * w + x) * 4 + 1] = (uint8_t)(argb >> 8);
                 rgba[((size_t)y * w + x) * 4 + 2] = (uint8_t)argb;
@@ -2249,14 +2420,14 @@ static void write_bmp(const char *nm, const uint8_t *buf,
     hdr[26] = 1; hdr[28] = 24;
     fwrite(hdr, 1, sizeof hdr, f);
     /* A BMP with a positive height is stored bottom row first, which is also
-     * the order glReadPixels returns -- so writing straight through looks
-     * like the obviously correct thing to do, and produces an upside-down
-     * picture. What is in the framebuffer is already mirrored: the title
-     * hands over D3D screen coordinates with y increasing downward, GL
-     * rasterises them into a buffer whose y increases upward, and both the
-     * window and the guest readback undo that on the way out. */
+     * the order glReadPixels returns, and the framebuffer holds the picture
+     * the GL way up (the vertex stage sends screen y = 0 to NDC +1) -- so
+     * the rows go out in the order they came. This used to write them
+     * reversed, which showed every surface the title renders into upside
+     * down and only a surface that had been through one render-to-texture
+     * copy (which turned it over) the right way up. */
     for (y = 0; y < ph; y++) {
-        const uint8_t *r = buf + (size_t)(ph - 1 - y) * pw * 4;
+        const uint8_t *r = buf + (size_t)y * pw * 4;
         uint8_t pad[3] = { 0, 0, 0 };
         for (x = 0; x < pw; x++) fwrite(r + x * 4, 1, 3, f);
         fwrite(pad, 1, row - pw * 3, f);
@@ -2356,6 +2527,36 @@ static void dump_fbo(const char *prefix, int *counter, int limit)
  * NV2A's index list is already expanded in the pushbuffer, and a flat array
  * sidesteps having to reproduce the hardware's per-attribute strides on the
  * GL side. It costs a little bandwidth and removes a whole class of bug. */
+/*
+ * Bind the surface the title has set up, at the moment it is used.
+ *
+ * It used to be bound as each surface method arrived. D3D's SetRenderTarget
+ * sends the colour offset first and the clip after it, so every switch passed
+ * through a surface that does not exist -- the new offset at the old size --
+ * and each of those got a framebuffer of its own. JSRF's boost dash switches
+ * between a 640x480 frame, a 512x512 copy and a 128x128 one, which made four
+ * phantoms (003E8000 640x480, 00084000 512x512, 00568000 640x480, 00084000
+ * 128x128): they filled the cache, evicted the real frame, and a texture
+ * lookup by address could land on one of them. A draw or a clear is the
+ * only point where offset and size are known to belong together.
+ */
+static void surface_sync(void)
+{
+    if (!g_ready) return;
+    if (S.surf_dirty) {
+        S.surf_dirty = 0;
+        backend()->surface(S.color_offset, S.clip_w, S.clip_h, gl_scale());
+        if (g_pass_trace_until && S.frames < g_pass_trace_until)
+            fprintf(stderr, "[PASS] f%u d%u bind surface %08X %ux%u pitch %u fmt %02X zeta %08X\n",
+                    S.frames, S.draws, S.color_offset, S.clip_w, S.clip_h,
+                    S.surf_pitch, S.surf_format & 0xFF, S.zeta_offset);
+    }
+    if (g_cur_surf >= 0) {
+        g_surf[g_cur_surf].last_draw = S.draws + 1;
+        g_surf[g_cur_surf].fmt = S.surf_format & 0xFFFFu;
+    }
+}
+
 static void do_draw(void)
 {
     static float *vbuf;
@@ -2373,6 +2574,7 @@ static void do_draw(void)
     uint32_t const_mask = 0;          /* read, but supplied as a constant */
 
     if (!g_ready || !S.prim) return;
+    surface_sync();
 
     mode = gl_prim(S.prim, &fan_expand);
     if (!mode) return;
@@ -2787,11 +2989,19 @@ static void do_draw(void)
         /* An attribute the program reads with no array behind it is one value
          * for the whole draw. GL has a per-attribute constant for exactly
          * this, so it costs one call rather than four floats in every vertex. */
-        if (const_mask && g_last.const_mask != const_mask) {
+        /* The mask says WHICH attributes are constant, not what they are.
+         * Comparing only the mask meant a draw that supplied the same set of
+         * constant attributes with different values inherited the previous
+         * object's -- every batch after the first in a run of them. Remember
+         * the values too, and re-send when either changes. */
+        if (const_mask && (g_last.const_mask != const_mask
+                           || memcmp(g_last.const_attr, S.const_attr,
+                                     sizeof g_last.const_attr))) {
             for (i = 0; i < NUM_ATTRS; i++)
                 if (const_mask & (1u << i))
                     glVertexAttrib4fv(i, S.const_attr[i]);
             g_last.const_mask = const_mask;
+            memcpy(g_last.const_attr, S.const_attr, sizeof g_last.const_attr);
         }
     }
 
@@ -2923,6 +3133,10 @@ static void do_draw(void)
       use = (mode == 9) ? (S.xf_mode == NV2A_XF_MODE_FIXED ? 0 : 1) : mode;
       if (g_pcache[slot].u_posMode >= 0)
           glUniform1i(g_pcache[slot].u_posMode, use); }
+    /* Whether the fog register carries a real factor or a flat 1.0. Uniforms
+     * belong to the program object, so this goes in per draw like the rest. */
+    if (g_pcache[slot].u_fogEnable >= 0)
+        glUniform1i(g_pcache[slot].u_fogEnable, S.fog_enable ? 1 : 0);
     /*
      * RECOMP_GL_DRAWID: paint each draw with its own index instead of its
      * colour, so the finished frame says which draw owns which pixel.
@@ -3119,28 +3333,97 @@ static void do_draw(void)
      * title rendered into a moment ago is render-to-texture, and the live
      * framebuffer is the answer rather than the bytes at that address. */
     {
-        int st;
+        int st, srcslot[4] = { -1, -1, -1, -1 };
         for (st = 0; st < 4; st++) {
             GLuint tex = 0;
             float sx = 1.0f, sy = 1.0f;
 
+            int sslot = -1;
+
+            /* The unit first: an upload or a feedback copy binds a texture,
+             * and before this it did so on the previous stage's unit --
+             * a cache miss on stage 1 rebound stage 0 for that draw. */
+            glActiveTexture((GLenum)(GL_TEXTURE0 + st));
             if (S.psh.tex_bound[st]) {
-                tex = surface_texture(S.tex[st].offset, 0, 0);
-                if (!tex) tex = upload_texture(&S.tex[st]);
-                if (tex && !fmt_is_swz(S.tex[st].color)
-                        && !fmt_is_dxt(S.tex[st].color)) {
-                    sx = 1.0f / (float)S.tex[st].width;
-                    sy = 1.0f / (float)S.tex[st].height;
+                tex = surface_texture_for(&S.tex[st], &sx, &sy, &sslot);
+                if (!tex) {
+                    sx = sy = 1.0f;
+                    g_upload_bias_bg = (S.psh.tex_signed[st] & 0x10) != 0;
+                    tex = upload_texture(&S.tex[st]);
+                    g_upload_bias_bg = 0;
+                    if (tex && !fmt_is_swz(S.tex[st].color)
+                            && !fmt_is_dxt(S.tex[st].color)) {
+                        sx = 1.0f / (float)S.tex[st].width;
+                        sy = 1.0f / (float)S.tex[st].height;
+                    }
                 }
             }
-            glActiveTexture((GLenum)(GL_TEXTURE0 + st));
             glBindTexture(GL_TEXTURE_2D, tex);
+            /* A surface this backend rendered holds its picture the GL way
+             * up: the vertex stage sends screen y = 0 to NDC +1, so the top
+             * row of the picture is the LAST row of the framebuffer. A
+             * texture decoded from guest memory is the other way up (row 0
+             * is the top), and the coordinates are the title's, so sampling
+             * a surface has to turn t around: t' = 1 - t.
+             *
+             * Without it every render-to-texture pass turned the picture
+             * over. JSRF's normal frame passes through exactly one (the
+             * off-screen frame copied into the display buffer), which the
+             * window and the BMP writer had been compensating for by showing
+             * framebuffers upside down. The boost dash adds a second pass --
+             * the world rendered to a 512x512 and a 128x128 target and
+             * copied into the frame -- so during a boost the world was drawn
+             * upside down under a HUD that was the right way up. */
             if (g_pcache[slot].u_tex[st] >= 0)
                 glUniform1i(g_pcache[slot].u_tex[st], st);
             if (g_pcache[slot].u_texScale[st] >= 0)
-                glUniform2f(g_pcache[slot].u_texScale[st], sx, sy);
+                glUniform2f(g_pcache[slot].u_texScale[st], sx, sslot >= 0 ? -sy : sy);
+            if (g_pcache[slot].u_texOff[st] >= 0)
+                glUniform2f(g_pcache[slot].u_texOff[st], 0.0f, sslot >= 0 ? 1.0f : 0.0f);
+            if (g_pcache[slot].u_bumpMat[st] >= 0)
+                glUniformMatrix2fv(g_pcache[slot].u_bumpMat[st], 1, GL_FALSE,
+                                   S.tex[st].bump_mat);
+            if (g_pcache[slot].u_bumpScale[st] >= 0)
+                glUniform1f(g_pcache[slot].u_bumpScale[st], S.tex[st].bump_scale);
+            if (g_pcache[slot].u_bumpOff[st] >= 0)
+                glUniform1f(g_pcache[slot].u_bumpOff[st], S.tex[st].bump_off);
+            srcslot[st] = sslot;
         }
         g_last.tex0 = 0;    /* unit 0 is no longer what the cache remembers */
+
+        /* [PASS]: every draw while nv2a_gl_trace_frames() is active, and the
+         * first draws that use a BUMPENVMAP stage: what each stage samples,
+         * from where, and the bump matrices. */
+        { static int bump_said;
+          int bump = 0, k;
+          for (k = 1; k < 4; k++)
+              if (S.psh.tex_bound[k] && (S.psh.tex_mode[k] == 6 || S.psh.tex_mode[k] == 7)) bump = 1;
+          if ((g_pass_trace_until && S.frames < g_pass_trace_until)
+           || (bump && bump_said < 12)) {
+              char line[1400]; int len = 0;
+              if (bump) bump_said++;
+              len += snprintf(line + len, sizeof line - len,
+                      "[PASS] f%u d%u surf %08X %ux%u prim %u n %u modes %05X blend %d %X/%X ztest %d cm %08X comb %08X |",
+                      S.frames, S.draws, S.color_offset, S.clip_w, S.clip_h, S.prim,
+                      S.inline_count ? S.inline_count : S.idx_count,
+                      S.shader_stage_prog, S.blend_enable, S.blend_src, S.blend_dst,
+                      S.depth_test, S.color_mask, S.psh.control);
+              for (k = 0; k < 4; k++) {
+                  const TexStage *t = &S.tex[k];
+                  if (!S.psh.tex_bound[k]) continue;
+                  len += snprintf(line + len, sizeof line - len,
+                          " t%d %08X %ux%u c%02X p%u f%08X a%08X %s", k, t->offset,
+                          t->width, t->height, t->color, t->pitch, t->filter, t->addr,
+                          srcslot[k] >= 0 ? "FBO" : "mem");
+                  if (S.psh.tex_mode[k] == 6 || S.psh.tex_mode[k] == 7)
+                      len += snprintf(line + len, sizeof line - len,
+                              " bump<-t%d m(%.4f %.4f %.4f %.4f) s%.3f o%.3f",
+                              S.psh.bump_src[k], t->bump_mat[0], t->bump_mat[1],
+                              t->bump_mat[2], t->bump_mat[3], t->bump_scale, t->bump_off);
+                  if (len >= (int)sizeof line - 1) break;
+              }
+              fprintf(stderr, "%s\n", line);
+          } }
     }
     if (g_pcache[slot].u_fogColor >= 0)
         glUniform4f(g_pcache[slot].u_fogColor,
@@ -3403,7 +3686,1036 @@ static void do_draw(void)
                   pw != 0 ? 2.0f * (pz/pw) / 16777215.0f - 1.0f : 0.0f);
           fflush(stderr);
       } }
-    { PROF_T0(); glDrawArrays(mode, 0, (GLsizei)out_n); PROF_ADD(draw); }
+    /* The full-screen black curtain.
+     *
+     * One draw is responsible for the black tutorial: four vertices covering
+     * exactly the viewport, no texture on any stage, diffuse RGB zero, alpha
+     * around 0.93, blended SRC_ALPHA/ONE_MINUS_SRC_ALPHA. It takes the frame
+     * from a mean of 80 to a mean of 5, which is black to the eye, and the
+     * HUD drawn after it survives -- exactly what the picture shows.
+     *
+     * Two things are wanted here and neither is a fix yet: what its alpha
+     * does over time (a fade that ramps and stops is a different bug from one
+     * that never ramps), and what the frame looks like without it.
+     *
+     * RECOMP_GL_CURTAIN=log   report the alpha once a second
+     * RECOMP_GL_CURTAIN=skip  drop the draw entirely, and report
+     */
+    int curtain_skip = 0;
+    { static int mode_c = -1;
+      if (mode_c < 0) { const char *v = getenv("RECOMP_GL_CURTAIN");
+                        mode_c = !v ? 0 : !strcmp(v, "skip") ? 2 : 1; }
+      if (mode_c && out_n == 4 && S.blend_enable
+          && !S.tex[0].enabled && !S.tex[1].enabled
+          && attr_at[3] >= 0 && attr_at[0] >= 0) {
+          const float *c = &vbuf[(size_t)attr_at[3]];
+          const float *p0 = &vbuf[(size_t)attr_at[0]];
+          const float *p3 = &vbuf[(size_t)3 * stride_floats + (size_t)attr_at[0]];
+          if (c[0] == 0.0f && c[1] == 0.0f && c[2] == 0.0f && c[3] > 0.05f
+              && p0[0] == 0.0f && p0[1] == 0.0f
+              && p3[0] >= 320.0f && p3[1] >= 240.0f) {
+              static double last; static unsigned seen;
+              static uint32_t cur_frame = 0xFFFFFFFFu, per_frame, worst;
+              static float first_alpha;
+              double now = prof_now();
+              seen++;
+              /* How many times PER FRAME, not per second.
+               *
+               * This is the question that decides what the bug is. One quad
+               * at alpha 0.93 dims a frame to 7%, which is dark but not
+               * black; the same quad drawn three times leaves 0.03%, which is
+               * black. A per-second count cannot tell those apart, and a
+               * per-second count is what the first version of this printed.
+               * If the answer is one, the alpha itself is wrong; if it is
+               * more than one, the title is asking for one curtain and this
+               * renderer is drawing several. */
+              if (S.frames != cur_frame) {
+                  if (per_frame > worst) worst = per_frame;
+                  cur_frame = S.frames; per_frame = 0; first_alpha = c[3];
+              }
+              per_frame++;
+              if (now - last > 1.0) {
+                  last = now;
+                  /* What it was TRYING to sample.
+                   *
+                   * This quad carries texture coordinates spanning the whole
+                   * screen, which a fade to black has no use for. That is the
+                   * shape of a composite -- the offscreen surface being drawn
+                   * back over the display -- and the character draws all go to
+                   * surface 0x00084000 while the display framebuffer is
+                   * 0x001B2000. If this quad is the blit that brings that
+                   * surface across, then skipping it (the current workaround
+                   * for the black tutorial) is also what removes the
+                   * characters, and the real bug is that its source is not
+                   * being bound. Print every stage's offset even when the
+                   * stage reads as disabled, because "disabled" is exactly
+                   * what the broken case would look like. */
+                  fprintf(stderr, "  [CURTAIN] full-screen quad %ux%u: "
+                          "alpha %.3f, %u this frame (worst %u), %u total%s | "
+                          "tex0 en=%d off=%08X %ux%u fmt=%08X | tex1 en=%d "
+                          "off=%08X | surf=%08X\n",
+                          (unsigned)p3[0], (unsigned)p3[1], c[3],
+                          per_frame, worst, seen,
+                          mode_c == 2 ? " -- skipping" : "",
+                          S.tex[0].enabled, S.tex[0].offset,
+                          S.tex[0].width, S.tex[0].height, S.tex[0].format,
+                          S.tex[1].enabled, S.tex[1].offset, S.color_offset);
+                  (void)first_alpha;
+                  fflush(stderr);
+              }
+              if (mode_c == 2) curtain_skip = 1;
+          }
+      } }
+    /* Skipped by suppressing the draw call, NOT by returning.
+     *
+     * The first version of this returned from here, which quietly skipped the
+     * eleven hundred lines of bookkeeping that follow every draw in this
+     * function -- counters, and whatever state the next draw expects to have
+     * been left behind. A renderer workaround that silently changes the state
+     * machine is worse than the bug it works around, and harder to see. */
+    /* Draws per program, for THIS frame.
+     *
+     * The question that should have been asked first: which programs draw in
+     * the attract scene and not in the tutorial? The slots present in one and
+     * missing in the other name the missing objects directly. Counting per
+     * frame rather than per run is what makes the comparison honest -- runs
+     * diverge, so two runs compared by dump number are two different scenes,
+     * which is exactly the mistake that cost a day. Written out beside the
+     * screenshot, so the census and the picture are the same frame. */
+    if (slot >= 0 && slot < SLOTCENSUS_MAX) g_slot_draws[slot]++;
+
+    /* Which surface each CLASS of geometry is drawn into.
+     *
+     * The characters in the tutorial are submitted, positioned sensibly,
+     * correctly transformed, textured and blended -- and invisible. Every one
+     * of those checks verifies that a draw is well formed; none of them asks
+     * whether it is going to the surface that ends up on screen. Every
+     * character draw logged so far says surf=00084000, and the display
+     * framebuffer in the same run is 0x001B2000. If the world goes to one and
+     * the movers to another, that is the entire bug and nothing else needs
+     * explaining.
+     *
+     * Split by mover vs world, because that is the split that matters, and
+     * printed every five seconds so a playthrough produces it without any
+     * switches. */
+    { static struct { uint32_t surf; unsigned long mover, world; } cls[8];
+      static int ncls; static double last_cls;
+      int mover = (slot >= 0 && g_pcache[slot].uses_a0
+                   && S.xf_mode != NV2A_XF_MODE_FIXED);
+      int ci;
+      double now_cls = prof_now();
+      for (ci = 0; ci < ncls; ci++) if (cls[ci].surf == S.color_offset) break;
+      if (ci == ncls && ncls < 8) { cls[ncls].surf = S.color_offset; ncls++; }
+      if (ci < ncls) { if (mover) cls[ci].mover++; else cls[ci].world++; }
+      if (now_cls - last_cls > 5.0) {
+          last_cls = now_cls;
+          for (ci = 0; ci < ncls; ci++)
+              fprintf(stderr, "  [SURFACE] %08X: %lu mover draws, %lu world "
+                      "draws\n", cls[ci].surf, cls[ci].mover, cls[ci].world);
+          fflush(stderr);
+      } }
+
+    /* Where the movers are being PUT, once every few seconds, always on.
+     *
+     * Julien's reading of the tutorial is that the characters are in the
+     * wrong place rather than missing, and that is a different bug from
+     * everything tested so far -- every check to date has verified that the
+     * machinery is correct, never that the answer it produces is sensible.
+     * The object matrix's fourth column is the world position, so printing it
+     * for a few movers says immediately whether they are standing next to the
+     * camera or a kilometre underground.
+     *
+     * Always on and rate-limited rather than behind a switch, because the
+     * scripted input reaches the tutorial perhaps one run in four while he
+     * reaches it every time. Instrumentation he can produce by playing is
+     * worth more than instrumentation only I can trigger. */
+    if (slot >= 0 && g_pcache[slot].uses_a0 && out_n >= 3
+        && S.xf_mode != NV2A_XF_MODE_FIXED) {
+        static double last_pos; static int per_burst;
+        double now_pos = prof_now();
+        if (now_pos - last_pos > 5.0) { last_pos = now_pos; per_burst = 0; }
+        if (per_burst < 4 && now_pos - last_pos < 0.25) {
+            Nv2aVshProgram vp2;
+            uint32_t ps2 = S.prog_start < NV2A_VSH_MAX_INSNS ? S.prog_start : 0;
+            int len2 = nv2a_vsh_decode(S.prog + ps2 * 4,
+                                       (int)(NV2A_VSH_MAX_INSNS - ps2), &vp2);
+            int q3, base3 = -1, a0s3[8], na3, k3;
+            float vin3[16][4];
+            for (q3 = 0; q3 < len2; q3++)
+                if (vp2.insns[q3].rel_addr) { base3 = vp2.insns[q3].const_index; break; }
+            if (base3 >= 0) {
+                memset(vin3, 0, sizeof vin3);
+                for (k3 = 0; k3 < NUM_ATTRS; k3++) {
+                    if (attr_at[k3] >= 0)
+                        memcpy(vin3[k3], &vbuf[(size_t)attr_at[k3]], 16);
+                    else memcpy(vin3[k3], S.const_attr[k3], 16);
+                }
+                na3 = nv2a_vsh_interp_a0(&vp2, vin3, S.u.c, a0s3, 8);
+                if (na3 > 0) {
+                    int idx3 = base3 + a0s3[0];
+                    if (idx3 >= 0 && idx3 + 3 < NV2A_VSH_NUM_CONSTS) {
+                        per_burst++;
+                        /* Position alone was not enough: the tutorial's
+                         * characters turned out to be placed perfectly
+                         * sensibly and still not appear. The same programs
+                         * (343, 525, 1893) draw VISIBLE characters on the
+                         * attract screen, so whatever differs is state, and
+                         * the only way to find it is to print the state on
+                         * both sides and diff them. Everything that decides
+                         * whether a fragment survives goes on the line. */
+                        { float dif3[4] = {0,0,0,0};
+                          if (attr_at[3] >= 0) memcpy(dif3, &vbuf[(size_t)attr_at[3]], 16);
+                          else memcpy(dif3, S.const_attr[3], 16);
+                        fprintf(stderr, "  [MOVERPOS] slot %4d verts %4u A0=%d "
+                                "c[%d] -> world (%.1f %.1f %.1f) | diffuse "
+                                "(%.2f %.2f %.2f a=%.2f) | blend=%d(%04X/%04X) "
+                                "alphatest=%d func=%04X ref=%.2f | depth=%d/%04X "
+                                "write=%d | tex0=%d fmt=%08X %ux%u | surf=%08X "
+                                "prim=%u cull=%d/%04X\n",
+                                slot, out_n, a0s3[0], idx3,
+                                S.u.c[idx3][3], S.u.c[idx3+1][3], S.u.c[idx3+2][3],
+                                dif3[0], dif3[1], dif3[2], dif3[3],
+                                S.blend_enable, S.blend_src, S.blend_dst,
+                                S.alpha_test, (unsigned)S.alpha_func, S.alpha_ref,
+                                S.depth_test, S.depth_func, S.depth_mask,
+                                S.tex[0].enabled, S.tex[0].format,
+                                S.tex[0].width, S.tex[0].height,
+                                S.color_offset, S.prim,
+                                S.cull_enable, S.cull_face); }
+                        fflush(stderr);
+                    }
+                }
+            }
+        }
+    }
+    /* ---- [MOVERBOX] and RECOMP_GL_XRAY ---------------------------------
+     *
+     * Every theory so far rested on one premise: that programs 343, 525 and
+     * 1893 draw VISIBLE characters on the attract screen, so the machinery
+     * must work and only the tutorial's state can be wrong. The attract
+     * reference run settles that the premise is false. It compiles four
+     * programs, not one of which indexes the constant palette, and its
+     * surface census counts zero palette-indexed draws in the entire run.
+     * Nothing in this port has ever rendered a skinned mesh visibly. The
+     * skinning path itself is the suspect; the tutorial is simply the first
+     * scene that uses it, which is also why it would fail on every level.
+     *
+     * Two measurements, in one run, that cannot both come back ambiguous.
+     *
+     * [MOVERBOX] runs the CPU interpreter over a sample of the draw's REAL
+     * vertices rather than vertex zero alone. The generated GLSL is checked
+     * against that interpreter instruction by instruction, so it is a
+     * faithful stand-in for what the GPU computes. It reports the clip-space
+     * box the whole mesh occupies, how many vertices fall behind the eye, how
+     * many land on screen, and how many distinct addresses the ARL produces
+     * across the sample. Vertex zero cannot distinguish a correctly placed
+     * mesh from one whose every other vertex is flung across the map by a bad
+     * bone index; the box can. A world draw is measured identically in the
+     * same burst, as a control.
+     *
+     * RECOMP_GL_XRAY (1 by default here) draws every palette-indexed batch
+     * with blending off, alpha test off, culling off and the depth comparison
+     * always passing -- every way a fragment can be discarded, removed. If
+     * the characters appear, the geometry was always right and the loss is in
+     * the pixel path. If they still do not, no pixel state was ever the
+     * problem. One glance answers it.
+     */
+    /* [SINTAB] -- is the game's sine table still a sine table?
+     *
+     * Every joint rotation in this title goes through a 4096-entry table of
+     * (sin, cos) pairs that sub_0014C910 builds once at start-up, in memory
+     * it gets from VirtualAlloc, and whose address it leaves at 0x264BA4.
+     * The characters' skeletons come out folded -- a spine bent a hundred
+     * and thirteen degrees -- in the tutorial but not on the title screen,
+     * and Julien sees them twitch. A table that something else later writes
+     * over produces exactly that: correct early, garbage afterwards, and a
+     * different garbage every frame as the other owner keeps writing.
+     *
+     * Two checks. Every five seconds, compare all 4096 entries with the true
+     * values and say how many are wrong. And the first time the table exists,
+     * arm the store watch on it (RECOMP_WATCH_SINTAB=1): the generator has
+     * finished by then, so any writer the watch reports is the culprit. */
+    { static double last_st; static int armed_st = -1;
+      extern uint32_t g_recomp_watch_lo, g_recomp_watch_span;
+      uint32_t tab = *(const uint32_t *)guest(0x264BA4);
+      double now_st = prof_now();
+      if (armed_st < 0) armed_st = getenv("RECOMP_WATCH_SINTAB") ? 0 : 2;
+      if (tab && armed_st == 0) {
+          g_recomp_watch_lo = tab; g_recomp_watch_span = 0x8000;
+          armed_st = 1;
+          fprintf(stderr, "  [SINTAB] table at %08X; store watch armed on it\n", tab);
+      }
+      if (tab && now_st - last_st > 5.0) {
+          const float *t = (const float *)guest(tab);
+          int bad = 0, first = -1, i;
+          last_st = now_st;
+          for (i = 0; i < 4096; i++) {
+              double a = 2.0 * 3.14159265358979323846 * i / 4096.0;
+              if (fabs(t[2*i] - sin(a)) > 0.002 || fabs(t[2*i+1] - cos(a)) > 0.002) {
+                  if (first < 0) first = i;
+                  bad++;
+              }
+          }
+          fprintf(stderr, "  [SINTAB] table at %08X: %d of 4096 entries wrong",
+                  tab, bad);
+          if (first >= 0)
+              fprintf(stderr, " (first at %d: sin %.4f cos %.4f, should be %.4f"
+                      " %.4f)", first, t[2*first], t[2*first+1],
+                      sin(2.0 * 3.14159265358979323846 * first / 4096.0),
+                      cos(2.0 * 3.14159265358979323846 * first / 4096.0));
+          fprintf(stderr, "\n");
+          fflush(stderr);
+      } }
+
+    /* [PIPE] -- how much geometry each transform path draws, and how big.
+     *
+     * Every probe in this file skips fixed-function draws, so that half of
+     * the renderer has never been measured at all. It also has a known hole:
+     * a batch the title asks the hardware to LIGHT gets `oD0 = v3.rgb +
+     * litAmbient`, and litAmbient is zero unless someone sets an environment
+     * variable -- there is no lighting in the fixed-function path. Anything
+     * substantial drawn that way would come out unlit, which for a character
+     * means a dark silhouette. Whether that matters depends entirely on
+     * whether characters are ever drawn this way, and nothing so far has
+     * asked. Count the draws and their sizes on both paths. */
+    /* Character batches in the frame being built, for a capture that aims
+     * itself. Guessing a present number to dump at has now missed twice --
+     * 9000 was the title screen, 16000 a loading screen -- and each miss
+     * costs a three-minute run. A frame with several big skinned batches in
+     * it IS the tutorial, so let the frame say so. */
+    if (slot >= 0 && g_pcache[slot].uses_a0 && n >= 150
+        && S.xf_mode != NV2A_XF_MODE_FIXED) g_frame_chars++;
+
+    { static double last_pipe; static unsigned long fixed_n, prog_n;
+      static unsigned long fixed_big, prog_big;
+      double now_pipe = prof_now();
+      if (S.xf_mode == NV2A_XF_MODE_FIXED) {
+          fixed_n++; if (n >= 150) fixed_big++;
+      } else {
+          prog_n++;  if (n >= 150) prog_big++;
+      }
+      if (now_pipe - last_pipe > 5.0) {
+          last_pipe = now_pipe;
+          fprintf(stderr, "  [PIPE] fixed-function %lu draws (%lu of them 150+"
+                  " verts) | programmable %lu draws (%lu of them 150+ verts)\n",
+                  fixed_n, fixed_big, prog_n, prog_big);
+          fflush(stderr);
+      } }
+
+    { int is_mover = (slot >= 0 && g_pcache[slot].uses_a0
+                      && S.xf_mode != NV2A_XF_MODE_FIXED);
+      static double last_box; static int box_mover, box_world;
+      int probe_this = 0;
+      { double now_box = prof_now();
+        if (now_box - last_box > 5.0) { last_box = now_box;
+                                        box_mover = 0; box_world = 0; } }
+      /* RECOMP_GL_CHARDIAG=1 turns on everything in this block. It runs a
+       * CPU interpreter over sampled vertices, reads back occlusion queries
+       * (a GPU stall) and prints a great deal, so it stays off in the build
+       * that is actually played. */
+      static int chardiag = -1;
+      if (chardiag < 0) chardiag = getenv("RECOMP_GL_CHARDIAG") ? 1 : 0;
+      if (chardiag && out_n >= 3 && slot >= 0 && S.xf_mode != NV2A_XF_MODE_FIXED
+          /* Characters, not street furniture. Every burst so far was spent
+           * on two-bone lamp posts and bollards, because they are drawn first
+           * and the budget ran out before a skater arrived. A character batch
+           * is hundreds of vertices; a prop is a few dozen. */
+          && (is_mover ? (box_mover < 12 && out_n >= 150) : box_world < 8)) {
+          Nv2aVshProgram vpb;
+          uint32_t psb = S.prog_start < NV2A_VSH_MAX_INSNS ? S.prog_start : 0;
+          int lenb = nv2a_vsh_decode(S.prog + psb * 4,
+                                     (int)(NV2A_VSH_MAX_INSNS - psb), &vpb);
+          float vinb[16][4], opb[4];
+          float lo[3], hi[3], wlo = 1e30f, whi = -1e30f;
+          int kb, nb = 0, behind = 0, onscr = 0, a0seen[16], na0 = 0;
+          uint32_t qb, step = out_n > 64u ? out_n / 64u : 1u;
+          lo[0] = lo[1] = lo[2] =  1e30f;
+          hi[0] = hi[1] = hi[2] = -1e30f;
+          if (is_mover) box_mover++; else box_world++;
+          probe_this = 1;
+          for (qb = 0; qb < out_n; qb += step) {
+              int a0s[8], nas, j;
+              memset(vinb, 0, sizeof vinb);
+              for (kb = 0; kb < NUM_ATTRS; kb++) {
+                  if (attr_at[kb] >= 0)
+                      memcpy(vinb[kb], &vbuf[(size_t)qb * stride_floats
+                                             + attr_at[kb]], 16);
+                  else memcpy(vinb[kb], S.const_attr[kb], 16);
+              }
+              nas = nv2a_vsh_interp_a0(&vpb, vinb, S.u.c, a0s, 8);
+              for (j = 0; j < nas; j++) {
+                  int f, dup = 0;
+                  for (f = 0; f < na0; f++)
+                      if (a0seen[f] == a0s[j]) { dup = 1; break; }
+                  if (!dup && na0 < 16) a0seen[na0++] = a0s[j];
+              }
+              if (!nv2a_vsh_interp(&vpb, vinb, S.u.c, opb)) continue;
+              nb++;
+              if (opb[3] < wlo) wlo = opb[3];
+              if (opb[3] > whi) whi = opb[3];
+              if (opb[3] <= 0.0f) behind++;
+              /* The epilogue's arithmetic, not a guess at it.
+               *
+               * Dividing oPos by w here was wrong and produced depths in the
+               * tens of thousands, which reads as "clipped" and is not what
+               * the shader does: this title's programs apply the viewport
+               * themselves, so oPos.xyz arrives already in screen space and
+               * the epilogue only undoes the viewport to get back to NDC.
+               * Copying its three lines exactly is the only way the number
+               * printed here is the number the GPU used. */
+              { float n3[3]; int a;
+                n3[0] = (opb[0] - S.u.vp_off[0])
+                      / (S.u.vp_scale[0] != 0.0f ? S.u.vp_scale[0] : 1.0f);
+                n3[1] = (opb[1] - S.u.vp_off[1])
+                      / (S.u.vp_scale[1] != 0.0f ? S.u.vp_scale[1] : 1.0f);
+                n3[2] = (S.u.z_clip[1] > S.u.z_clip[0])
+                      ? (opb[2] - S.u.z_clip[0])
+                        / (S.u.z_clip[1] - S.u.z_clip[0])
+                      : opb[2];
+                for (a = 0; a < 3; a++) {
+                    if (n3[a] < lo[a]) lo[a] = n3[a];
+                    if (n3[a] > hi[a]) hi[a] = n3[a];
+                }
+                if (n3[0] >= -1.0f && n3[0] <= 1.0f
+                 && n3[1] >= -1.0f && n3[1] <= 1.0f) onscr++; }
+          }
+          if (nb > 0) {
+              int f;
+              /* What the mesh looks like BEFORE any transform, and what the
+               * title fed in to build it.
+               *
+               * The batches that come out right have one bone; the batches
+               * that vanish have up to sixteen, and their whole mesh lands
+               * inside a handful of pixels -- a 1428-vertex character inside
+               * a 6x12 box is not far away, it is collapsed. Either the
+               * object-space positions arrive collapsed, which is a vertex
+               * decode problem, or they arrive as a character and the blend
+               * collapses them, which is the palette. The input attributes
+               * and the raw v0 extent separate those two, and nothing
+               * printed so far has looked at either. */
+              { float p0lo[3], p0hi[3]; int a2; uint32_t q2;
+                p0lo[0] = p0lo[1] = p0lo[2] =  1e30f;
+                p0hi[0] = p0hi[1] = p0hi[2] = -1e30f;
+                for (q2 = 0; q2 < out_n; q2 += step) {
+                    const float *pv = attr_at[0] >= 0
+                        ? &vbuf[(size_t)q2 * stride_floats + attr_at[0]]
+                        : S.const_attr[0];
+                    for (a2 = 0; a2 < 3; a2++) {
+                        if (pv[a2] < p0lo[a2]) p0lo[a2] = pv[a2];
+                        if (pv[a2] > p0hi[a2]) p0hi[a2] = pv[a2];
+                    }
+                }
+                fprintf(stderr, "  [VERTIN]  %-5s slot %4d | v0 object space"
+                        " x[%.2f %.2f] y[%.2f %.2f] z[%.2f %.2f] | attrs:",
+                        is_mover ? "MOVER" : "world", slot,
+                        p0lo[0], p0hi[0], p0lo[1], p0hi[1], p0lo[2], p0hi[2]);
+                for (a2 = 0; a2 < NUM_ATTRS; a2++) {
+                    const Attr *ad = &S.attr[a2];
+                    if (attr_at[a2] >= 0)
+                        fprintf(stderr, " v%d=type%u/size%u/stride%u",
+                                a2, ad->type, ad->size, ad->stride);
+                    else if (g_pcache[slot].inputs & (1u << a2))
+                        fprintf(stderr, " v%d=const(%.2f %.2f %.2f %.2f)", a2,
+                                S.const_attr[a2][0], S.const_attr[a2][1],
+                                S.const_attr[a2][2], S.const_attr[a2][3]);
+                }
+                /* The scale test.
+                 *
+                 * A perspective camera has one focal length in pixels, and
+                 * every object in the frame obeys it: something h units tall
+                 * at distance w covers h * f / w pixels. Turned around,
+                 * f = pixels * w / units is the SAME number for every draw in
+                 * the frame, whatever its distance and whatever its size.
+                 * Printing it per draw makes a mis-scaled batch obvious
+                 * without needing to know the camera: world geometry agrees
+                 * with itself and sets the reference, and anything that
+                 * disagrees is being drawn at the wrong size. That matters
+                 * here because Julien's reading of the x-ray was "far away or
+                 * not where expected", and too small is what too far away
+                 * looks like.
+                 *
+                 * (An object matrix carrying its own scale shifts this, so a
+                 * few percent means nothing. A factor of two or three does.) */
+                { float du = p0hi[1] - p0lo[1];
+                  float dn = hi[1] - lo[1];
+                  float wm = 0.5f * (wlo + whi);
+                  if (du > 0.05f && dn > 0.0f && wm > 0.0f)
+                      fprintf(stderr, " | focal %.0f px",
+                              dn * 0.5f * (float)g_fbo_h * wm / du);
+                }
+                fprintf(stderr, "\n"); }
+
+              /* [BONES] -- every matrix this batch actually reads.
+               *
+               * Julien's screenshots settle what the numbers could not. The
+               * dog renders correctly. A GG renders too -- but perhaps a
+               * third of the size it should be, lying flat on the pavement
+               * with its limbs splayed. Two speaking characters are absent
+               * from their own dialogue shots. That is not a missing draw,
+               * a rejected fragment or a misplaced object: that is a
+               * skeleton being posed wrongly, and the simple models that
+               * survive are the ones with few bones.
+               *
+               * So print the palette entries themselves, one per distinct
+               * address the ARL produced, with the length of each basis
+               * vector and the determinant. A rigid bone matrix has three
+               * unit-length rows and a determinant of +1. A row that is
+               * short flattens whatever it drives; a determinant near zero
+               * collapses the limb; a wrong row order lays a character on
+               * the floor -- which is the picture. */
+              /* [POSE] -- the character's real dimensions, in world space.
+               *
+               * "Lying down" is a reading of a screenshot; this is the
+               * measurement. Skin each sampled vertex on the CPU with the
+               * first bone its own program selects, and take the extent of
+               * the result. A standing character is about seventeen units
+               * tall and two or three deep. One that is seventeen units long
+               * along the ground and three tall is face down, and the number
+               * says so without anyone having to squint at a frame. */
+              if (is_mover && na0 > 0) {
+                  int base_p = -1, q5;
+                  for (q5 = 0; q5 < lenb; q5++)
+                      if (vpb.insns[q5].rel_addr) {
+                          base_p = vpb.insns[q5].const_index; break;
+                      }
+                  if (base_p >= 0) {
+                      float wlo2[3], whi2[3]; int any = 0, a5;
+                      uint32_t q6;
+                      wlo2[0] = wlo2[1] = wlo2[2] =  1e30f;
+                      whi2[0] = whi2[1] = whi2[2] = -1e30f;
+                      for (q6 = 0; q6 < out_n; q6 += step) {
+                          int a0s2[8], nas2, kk, idx2;
+                          float vv[16][4], wp[3];
+                          memset(vv, 0, sizeof vv);
+                          for (kk = 0; kk < NUM_ATTRS; kk++) {
+                              if (attr_at[kk] >= 0)
+                                  memcpy(vv[kk], &vbuf[(size_t)q6 * stride_floats
+                                                       + attr_at[kk]], 16);
+                              else memcpy(vv[kk], S.const_attr[kk], 16);
+                          }
+                          nas2 = nv2a_vsh_interp_a0(&vpb, vv, S.u.c, a0s2, 8);
+                          if (nas2 < 1) continue;
+                          idx2 = base_p + a0s2[0];
+                          if (idx2 < 0 || idx2 + 2 >= NV2A_VSH_NUM_CONSTS) continue;
+                          for (a5 = 0; a5 < 3; a5++)
+                              wp[a5] = S.u.c[idx2+a5][0] * vv[0][0]
+                                     + S.u.c[idx2+a5][1] * vv[0][1]
+                                     + S.u.c[idx2+a5][2] * vv[0][2]
+                                     + S.u.c[idx2+a5][3];
+                          any = 1;
+                          for (a5 = 0; a5 < 3; a5++) {
+                              if (wp[a5] < wlo2[a5]) wlo2[a5] = wp[a5];
+                              if (wp[a5] > whi2[a5]) whi2[a5] = wp[a5];
+                          }
+                      }
+                      if (any)
+                          fprintf(stderr, "  [POSE]    slot %4d %2d bones:"
+                                  " world size %.1f wide x %.1f tall x %.1f"
+                                  " deep, centred (%.0f %.0f %.0f)\n",
+                                  slot, na0,
+                                  whi2[0] - wlo2[0], whi2[1] - wlo2[1],
+                                  whi2[2] - wlo2[2],
+                                  0.5f * (wlo2[0] + whi2[0]),
+                                  0.5f * (wlo2[1] + whi2[1]),
+                                  0.5f * (wlo2[2] + whi2[2]));
+                  }
+              }
+              if (is_mover && na0 > 0) {
+                  int bi, base_c = -1, q4;
+                  for (q4 = 0; q4 < lenb; q4++)
+                      if (vpb.insns[q4].rel_addr) {
+                          base_c = vpb.insns[q4].const_index; break;
+                      }
+                  fprintf(stderr, "  [BONES]   slot %4d base c[%d], %d bones\n",
+                          slot, base_c, na0);
+                  for (bi = 0; bi < na0 && bi < 6 && base_c >= 0; bi++) {
+                      int idx = base_c + a0seen[bi], r2;
+                      float len[3], det;
+                      if (idx < 0 || idx + 3 >= NV2A_VSH_NUM_CONSTS) {
+                          fprintf(stderr, "  [BONES]     A0=%d -> c[%d] OUT OF"
+                                  " RANGE\n", a0seen[bi], idx);
+                          continue;
+                      }
+                      for (r2 = 0; r2 < 3; r2++) {
+                          const float *rw = S.u.c[idx + r2];
+                          len[r2] = sqrtf(rw[0]*rw[0] + rw[1]*rw[1] + rw[2]*rw[2]);
+                      }
+                      { const float *a = S.u.c[idx], *b2 = S.u.c[idx+1],
+                                    *c2 = S.u.c[idx+2];
+                        det = a[0]*(b2[1]*c2[2] - b2[2]*c2[1])
+                            - a[1]*(b2[0]*c2[2] - b2[2]*c2[0])
+                            + a[2]*(b2[0]*c2[1] - b2[1]*c2[0]); }
+                      fprintf(stderr, "  [BONES]     A0=%3d c[%3d..%3d] row"
+                              " lengths %.3f %.3f %.3f det %+.3f | translation"
+                              " (%.2f %.2f %.2f) | row3 (%.2f %.2f %.2f %.2f)\n",
+                              a0seen[bi], idx, idx + 3,
+                              len[0], len[1], len[2], det,
+                              S.u.c[idx][3], S.u.c[idx+1][3], S.u.c[idx+2][3],
+                              S.u.c[idx+3][0], S.u.c[idx+3][1],
+                              S.u.c[idx+3][2], S.u.c[idx+3][3]);
+                  }
+              }
+              /* [VPCHK] -- the viewport the PROGRAM applied versus the one the
+               * epilogue removes.
+               *
+               * In Corn's dialogue shot every character batch lands at the
+               * right distance and dead centre horizontally, but with NDC y
+               * between -1 and -3.5: below the bottom of the screen. This
+               * title's programs apply a viewport themselves, from their own
+               * constants, and the epilogue then undoes it using the hardware
+               * viewport REGISTERS. Those two only have to disagree once --
+               * say for a letterboxed cutscene, whose black bars are exactly
+               * what that shot has -- for everything drawn by a program to
+               * slide vertically while the fixed-function world, which does
+               * its own divide, stays put. Print both, and the raw position
+               * of vertex zero, for every probed draw. */
+              { float vin0[16][4], op0[4]; int k0;
+                memset(vin0, 0, sizeof vin0);
+                for (k0 = 0; k0 < NUM_ATTRS; k0++) {
+                    if (attr_at[k0] >= 0)
+                        memcpy(vin0[k0], &vbuf[(size_t)attr_at[k0]], 16);
+                    else memcpy(vin0[k0], S.const_attr[k0], 16);
+                }
+                if (nv2a_vsh_interp(&vpb, vin0, S.u.c, op0))
+                    fprintf(stderr, "  [VPCHK] %-5s slot %4d | raw oPos (%.2f %.2f"
+                            " %.1f w=%.3f) | c58 (%.2f %.2f %.1f %.2f) c59 (%.2f"
+                            " %.2f %.1f %.2f) | regs scale (%.1f %.1f) off (%.1f"
+                            " %.1f)\n", is_mover ? "MOVER" : "world", slot,
+                            op0[0], op0[1], op0[2], op0[3],
+                            S.u.c[58][0], S.u.c[58][1], S.u.c[58][2], S.u.c[58][3],
+                            S.u.c[59][0], S.u.c[59][1], S.u.c[59][2], S.u.c[59][3],
+                            S.u.vp_scale[0], S.u.vp_scale[1],
+                            S.u.vp_off[0], S.u.vp_off[1]); }
+
+              /* [CAMDUMP] -- the program and every constant it reads, once in
+               * a dialogue close-up and once on the title screen.
+               *
+               * The viewport the program applies matches the registers, so
+               * the epilogue is innocent: it is the program itself that puts
+               * Corn's vertices at screen y 823 and 2468 on a 480-line frame.
+               * A program only knows the camera through its constants, so the
+               * constants are the question. Same program, same slot, two
+               * scenes -- one where the characters land correctly and one
+               * where they fall off the bottom -- and a diff of what it read. */
+              { static int shown_close, shown_far;
+                float wv = 0.0f;
+                { float vin1[16][4], op1[4]; int k1;
+                  memset(vin1, 0, sizeof vin1);
+                  for (k1 = 0; k1 < NUM_ATTRS; k1++) {
+                      if (attr_at[k1] >= 0)
+                          memcpy(vin1[k1], &vbuf[(size_t)attr_at[k1]], 16);
+                      else memcpy(vin1[k1], S.const_attr[k1], 16);
+                  }
+                  if (nv2a_vsh_interp(&vpb, vin1, S.u.c, op1)) wv = op1[3]; }
+                if (is_mover && slot == 343
+                    && ((wv > 0.0f && wv < 20.0f && shown_close < 2)
+                     || (wv > 100.0f && shown_far < 1))) {
+                    if (wv < 20.0f) shown_close++; else shown_far++;
+                    fprintf(stderr, "===== CAMDUMP slot %d %s (vertex 0 w=%.2f)"
+                            " =====\n", slot, wv < 20.0f ? "DIALOGUE" : "TITLE",
+                            wv);
+                    if (g_pcache[slot].dis) fputs(g_pcache[slot].dis, stderr);
+                    fprintf(stderr, "----- non-palette constants it names -----\n");
+                    if (g_pcache[slot].dis) {
+                        const char *q = g_pcache[slot].dis;
+                        int seen2[NV2A_VSH_NUM_CONSTS];
+                        memset(seen2, 0, sizeof seen2);
+                        while ((q = strstr(q, "c[")) != NULL) {
+                            int n2 = atoi(q + 2);
+                            q += 2;
+                            if (n2 >= 0 && n2 < 107 && !seen2[n2]) {
+                                seen2[n2] = 1;
+                                fprintf(stderr, "  c[%3d] = %12.5f %12.5f %12.5f"
+                                        " %12.5f\n", n2, S.u.c[n2][0],
+                                        S.u.c[n2][1], S.u.c[n2][2], S.u.c[n2][3]);
+                            }
+                        }
+                    }
+                    fprintf(stderr, "----- fixed-function composite (the world's"
+                            " camera) -----\n");
+                    { int r3;
+                      for (r3 = 0; r3 < 4; r3++)
+                          fprintf(stderr, "  ff[%d] = %12.5f %12.5f %12.5f"
+                                  " %12.5f\n", r3, S.u.ff_mat[r3][0],
+                                  S.u.ff_mat[r3][1], S.u.ff_mat[r3][2],
+                                  S.u.ff_mat[r3][3]); }
+                    /* Where the model's own up axis points, as the camera
+                     * sees it. The palette maps model space straight to view
+                     * space (the projection in c[103..106] carries no
+                     * rotation), so column 1 of a bone matrix IS the model's
+                     * up direction in camera terms. Upright relative to the
+                     * camera reads (0, 1, 0); a character lying on the ground
+                     * in front of it reads (0, 0, +-1). */
+                    { int bi2;
+                      for (bi2 = 0; bi2 < na0 && bi2 < 4; bi2++) {
+                          int ix = 107 + a0seen[bi2];
+                          if (ix < 0 || ix + 2 >= NV2A_VSH_NUM_CONSTS) continue;
+                          fprintf(stderr, "  bone A0=%2d: model up -> view (%.3f"
+                                  " %.3f %.3f)  model fwd -> view (%.3f %.3f"
+                                  " %.3f)  at (%.1f %.1f %.1f)\n", a0seen[bi2],
+                                  S.u.c[ix][1], S.u.c[ix+1][1], S.u.c[ix+2][1],
+                                  S.u.c[ix][2], S.u.c[ix+1][2], S.u.c[ix+2][2],
+                                  S.u.c[ix][3], S.u.c[ix+1][3], S.u.c[ix+2][3]);
+                      } }
+                    /* [FINDMAT] removed: it scanned all of guest RAM and
+                     * faulted on the first unmapped page, which crashed the
+                     * game at the first dialogue close-up. It found what it
+                     * was for -- the constant shadow at 0x19BD98. */
+                    fprintf(stderr, "===== end CAMDUMP =====\n");
+                    fflush(stderr);
+                } }
+
+              /* [DIST] -- how far everything in the frame is from the eye.
+               *
+               * The characters measure 16 units tall in world space, standing,
+               * with clean bones -- so they are modelled and posed correctly
+               * and they render about twenty pixels tall only because they sit
+               * 150 to 800 units away. Either that is where they belong, or
+               * they are being placed far behind where the camera expects
+               * them. The world geometry settles it: the pavement directly
+               * under the camera in Julien's screenshots is a few units away,
+               * so if world draws reach small distances and no skinned draw
+               * ever does, the characters are in the wrong place. Printed for
+               * a wide sample of both, one burst every five seconds. */
+              /* Does this program write the fog output at all, and what is
+               * the fog state around it? The isolated render -- characters
+               * alone on black -- showed vehicles and trees in full colour
+               * and every humanoid as a near-black silhouette, which is a
+               * colour fault, not a geometry one. The combiner's fog register
+               * is the one input that can black out a whole batch, so print
+               * who writes it. */
+              /* [RIG] -- is each bone driving one part of the body?
+               *
+               * In a correct rig the vertices that share a bone are a
+               * contiguous lump of the model: an upper arm, a shin, the head.
+               * If the per-vertex bone index is being decoded wrongly, the
+               * vertices on any given bone are scattered over the whole mesh
+               * instead, and the character comes out as a splayed tangle with
+               * roughly the right overall size -- which is precisely what
+               * Julien's fourth screenshot shows, and which every measurement
+               * of bounding boxes and bone matrices so far would call healthy.
+               *
+               * So measure it: group the sampled vertices by the address
+               * their own program's ARL produces, and print how large a slice
+               * of the model each bone covers. A bone whose vertices span the
+               * entire model is the bug, stated as a number. */
+              if (is_mover && na0 > 3) {
+                  float mdl[3], mlo[3], mhi[3]; int b2, a7; uint32_t q9;
+                  mlo[0] = mlo[1] = mlo[2] =  1e30f;
+                  mhi[0] = mhi[1] = mhi[2] = -1e30f;
+                  for (q9 = 0; q9 < out_n; q9 += step) {
+                      const float *pv2 = attr_at[0] >= 0
+                          ? &vbuf[(size_t)q9 * stride_floats + attr_at[0]]
+                          : S.const_attr[0];
+                      for (a7 = 0; a7 < 3; a7++) {
+                          if (pv2[a7] < mlo[a7]) mlo[a7] = pv2[a7];
+                          if (pv2[a7] > mhi[a7]) mhi[a7] = pv2[a7];
+                      }
+                  }
+                  mdl[0] = mhi[0] - mlo[0];
+                  mdl[1] = mhi[1] - mlo[1];
+                  mdl[2] = mhi[2] - mlo[2];
+                  fprintf(stderr, "  [RIG]    slot %4d, model %.1f x %.1f x"
+                          " %.1f, %d bones:\n", slot, mdl[0], mdl[1], mdl[2],
+                          na0);
+                  for (b2 = 0; b2 < na0 && b2 < 6; b2++) {
+                      float blo[3], bhi[3]; int n2 = 0, a6; uint32_t q8;
+                      blo[0] = blo[1] = blo[2] =  1e30f;
+                      bhi[0] = bhi[1] = bhi[2] = -1e30f;
+                      for (q8 = 0; q8 < out_n; q8 += step) {
+                          int a0s3[8], nas3, kk3;
+                          float vv3[16][4];
+                          memset(vv3, 0, sizeof vv3);
+                          for (kk3 = 0; kk3 < NUM_ATTRS; kk3++) {
+                              if (attr_at[kk3] >= 0)
+                                  memcpy(vv3[kk3], &vbuf[(size_t)q8 * stride_floats
+                                                         + attr_at[kk3]], 16);
+                              else memcpy(vv3[kk3], S.const_attr[kk3], 16);
+                          }
+                          nas3 = nv2a_vsh_interp_a0(&vpb, vv3, S.u.c, a0s3, 8);
+                          if (nas3 < 1 || a0s3[0] != a0seen[b2]) continue;
+                          n2++;
+                          for (a6 = 0; a6 < 3; a6++) {
+                              if (vv3[0][a6] < blo[a6]) blo[a6] = vv3[0][a6];
+                              if (vv3[0][a6] > bhi[a6]) bhi[a6] = vv3[0][a6];
+                          }
+                      }
+                      if (n2 > 0)
+                          fprintf(stderr, "  [RIG]      bone A0=%3d drives %3d"
+                                  " verts spanning %.1f x %.1f x %.1f  (%.0f%%"
+                                  " of the model's height)\n",
+                                  a0seen[b2], n2, bhi[0]-blo[0], bhi[1]-blo[1],
+                                  bhi[2]-blo[2],
+                                  mdl[1] > 0.01f
+                                      ? 100.0f * (bhi[1]-blo[1]) / mdl[1] : 0.0f);
+                  }
+              }
+
+              /* [COLOUR] -- what the program hands the combiner.
+               *
+               * Rendering the skinned draws alone on black showed the answer
+               * the statistics never could: vehicles and trees come out in
+               * full colour and every humanoid comes out a near-black
+               * silhouette. So the fault is the colour, and the colour that
+               * matters is the vertex diffuse the program computes. Print it
+               * for the same vertex whose position was just interpreted, with
+               * specular and fog beside it, for skinned draws and world
+               * draws alike so the two can be compared directly. */
+              { float d0[4], d1[4], fg[4]; int kc;
+                float vinc[16][4], opc[4]; int kk2;
+                memset(vinc, 0, sizeof vinc);
+                for (kk2 = 0; kk2 < NUM_ATTRS; kk2++) {
+                    if (attr_at[kk2] >= 0)
+                        memcpy(vinc[kk2], &vbuf[(size_t)attr_at[kk2]], 16);
+                    else memcpy(vinc[kk2], S.const_attr[kk2], 16);
+                }
+                nv2a_vsh_interp(&vpb, vinc, S.u.c, opc);
+                for (kc = 0; kc < 4; kc++) {
+                    d0[kc] = g_interp_out[NV2A_OREG_DIFFUSE][kc];
+                    d1[kc] = g_interp_out[NV2A_OREG_SPECULAR][kc];
+                    fg[kc] = g_interp_out[NV2A_OREG_FOG][kc];
+                }
+                fprintf(stderr, "  [COLOUR] %-5s slot %4d: diffuse"
+                        " (%.3f %.3f %.3f a=%.3f)%s specular"
+                        " (%.3f %.3f %.3f) fog %.3f%s | combiner %05X"
+                        " tex0 %d\n",
+                        is_mover ? "MOVER" : "world", slot,
+                        d0[0], d0[1], d0[2], d0[3],
+                        (g_interp_written & (1u << NV2A_OREG_DIFFUSE))
+                            ? "" : " [NOT WRITTEN]",
+                        d1[0], d1[1], d1[2], fg[0],
+                        (g_interp_written & (1u << NV2A_OREG_FOG))
+                            ? "" : " [NOT WRITTEN]",
+                        S.shader_stage_prog, S.tex[0].enabled); }
+
+              { int writes_fog = 0, q7;
+                for (q7 = 0; q7 < lenb; q7++)
+                    if ((vpb.insns[q7].mac_mask && vpb.insns[q7].mac_temp == NV2A_OREG_FOG)
+                     || (vpb.insns[q7].out_mask && vpb.insns[q7].out_reg == NV2A_OREG_FOG))
+                        { writes_fog = 1; break; }
+                fprintf(stderr, "  [DIST] %-5s slot %4d verts %5u: distance"
+                        " %.0f..%.0f | writes fog: %s | fog enable %d colour"
+                        " %08X\n", is_mover ? "MOVER" : "world", slot,
+                        out_n, wlo, whi, writes_fog ? "yes" : "NO",
+                        S.fog_enable, S.fog_color); }
+              fprintf(stderr, "  [MOVERBOX] %-5s slot %4d verts %5u sampled %3d"
+                      " | ndc x[%6.2f %6.2f] y[%6.2f %6.2f] z[%.6f %.6f]"
+                      " w[%9.2f %9.2f] | behind %3d onscreen %3d | prog %3d"
+                      " | A0 x%d (", is_mover ? "MOVER" : "world", slot,
+                      out_n, nb, lo[0], hi[0], lo[1], hi[1], lo[2], hi[2],
+                      wlo, whi, behind, onscr, lenb, na0);
+              for (f = 0; f < na0 && f < 8; f++)
+                  fprintf(stderr, "%s%d", f ? "," : "", a0seen[f]);
+              fprintf(stderr, ") | blend=%d(%04X/%04X) at=%d/%04X ref=%.2f"
+                      " depth=%d/%04X w=%d tex0=%d cull=%d/%04X/%04X"
+                      " surf=%08X prim=%u\n",
+                      S.blend_enable, S.blend_src, S.blend_dst,
+                      S.alpha_test, (unsigned)S.alpha_func, S.alpha_ref,
+                      S.depth_test, S.depth_func, S.depth_mask,
+                      S.tex[0].enabled, S.cull_enable, S.cull_face,
+                      S.front_face, S.color_offset, S.prim);
+              fflush(stderr);
+          }
+      }
+
+      /* [SAMPLES] -- how many fragments actually survive, counted by the
+       * hardware rather than argued about.
+       *
+       * Everything upstream of the rasteriser now checks out: the bone
+       * indices vary per vertex, the mesh lands on screen, the pixel state
+       * the title asks for is identical to the state of world geometry that
+       * renders. So the question is no longer "is it drawn" but "what
+       * happens to its fragments", and an occlusion query answers exactly
+       * that: it counts the samples that reach the depth test, after
+       * culling, after the fragment shader's alpha-test discard.
+       *
+       * Twice, for the same batch. Once with the state the title asked for,
+       * once with every reject removed. Zero and zero means nothing is being
+       * rasterised at all and the loss is earlier than this. Zero and a large
+       * number names the per-fragment path and, between the two probes, which
+       * switch in it. A large number twice means the characters ARE being
+       * painted and are either the wrong colour or painted over afterwards.
+       *
+       * Both probes write to neither colour nor depth, so the frame they
+       * measure is the frame that would have been drawn anyway.
+       */
+      if (probe_this && !curtain_skip && slot >= 0) {
+          GLuint qo = 0;
+          glGenQueries(1, &qo);
+          if (qo) {
+              /* The four switches are settled: the alpha test rejects
+               * nothing (as-drawn and no-alphatest counts are identical on
+               * every batch), depth rejects a little, culling about half, and
+               * hundreds to tens of thousands of fragments DO reach the
+               * framebuffer. Yet the characters are invisible, and removing
+               * blending is what makes them appear. So the fragments are
+               * being blended to nothing: SRC_ALPHA/ONE_MINUS_SRC_ALPHA with
+               * an alpha just above zero passes an alpha test of "> 0" and
+               * still contributes nothing to the picture.
+               *
+               * The same occlusion query measures that alpha for free. Run
+               * the batch with the test set to "greater than t" for a ladder
+               * of thresholds and the surviving counts ARE the histogram of
+               * the combiner's output alpha -- no readback, no guessing. */
+              int af = S.alpha_test ? (S.alpha_func - 0x0200 + 1) : 0;
+              /* Alpha turned out to be innocent too: the histogram runs
+               * above 0.9 on almost every batch. Depth is the only switch
+               * whose removal changes the counts -- but "the depth test
+               * rejects it" is not yet a bug, because a character genuinely
+               * behind a building SHOULD be rejected.
+               *
+               * What separates the two is where the character sits relative
+               * to what is already in the buffer, and five depth comparisons
+               * measure that directly: ALWAYS is the area the mesh covers,
+               * and the LESS/GREATER pair says which side of the existing
+               * depth it lands on. Nearer than what is there and still
+               * rejected is impossible; farther than everything, for a
+               * character standing in the foreground, names the culprit as
+               * whatever wrote that depth. */
+              static const GLenum dfn[5] = { GL_ALWAYS, GL_LEQUAL, GL_LESS,
+                                             GL_GEQUAL, GL_GREATER };
+              unsigned r[5]; int pass;
+              static const char *names[5] = { "covers", "<=(as drawn)",
+                                              "nearer", ">=", "farther" };
+              glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+              glDepthMask(GL_FALSE);
+              for (pass = 0; pass < 5; pass++) {
+                  /* One switch at a time, then all of them, so the counts
+                   * name the culprit instead of merely proving there is one.
+                   * Each pass starts from the state the title asked for. */
+                  if (S.depth_test) { glEnable(GL_DEPTH_TEST);
+                                      glDepthFunc(gl_depth_func((uint32_t)S.depth_func)); }
+                  else glDisable(GL_DEPTH_TEST);
+                  if (S.cull_enable) glEnable(GL_CULL_FACE);
+                  else glDisable(GL_CULL_FACE);
+                  if (g_pcache[slot].u_alphaFunc >= 0)
+                      glUniform1i(g_pcache[slot].u_alphaFunc, af);
+                  /* Every pass uses "greater than t" so the counts are
+                   * directly comparable; culling stays off throughout so a
+                   * back face does not masquerade as a transparent one. */
+                  glDisable(GL_CULL_FACE);
+                  if (g_pcache[slot].u_alphaFunc >= 0)
+                      glUniform1i(g_pcache[slot].u_alphaFunc, 0);
+                  glEnable(GL_DEPTH_TEST);
+                  glDepthFunc(dfn[pass]);
+
+                  r[pass] = 0;
+                  glBeginQuery(GL_SAMPLES_PASSED, qo);
+                  glDrawArrays(mode, 0, (GLsizei)out_n);
+                  glEndQuery(GL_SAMPLES_PASSED);
+                  glGetQueryObjectuiv(qo, GL_QUERY_RESULT, &r[pass]);
+              }
+              glDeleteQueries(1, &qo);
+
+              fprintf(stderr, "  [SAMPLES] %-5s slot %4d verts %5u |", 
+                      is_mover ? "MOVER" : "world", slot, out_n);
+              for (pass = 0; pass < 5; pass++)
+                  fprintf(stderr, " %s %u |", names[pass], r[pass]);
+              fprintf(stderr, "\n");
+              fflush(stderr);
+
+              /* Put back exactly what this draw asked for. The state cache
+               * believes it already set all of this, so restoring it here is
+               * not optional and cannot be left to the next draw. */
+              if (S.depth_test) { glEnable(GL_DEPTH_TEST);
+                                  glDepthFunc(gl_depth_func((uint32_t)S.depth_func)); }
+              else glDisable(GL_DEPTH_TEST);
+              glDepthMask(S.depth_mask ? GL_TRUE : GL_FALSE);
+              if (S.blend_enable) { glEnable(GL_BLEND);
+                                    glBlendFunc(gl_blend((uint32_t)S.blend_src),
+                                                gl_blend((uint32_t)S.blend_dst)); }
+              else glDisable(GL_BLEND);
+              if (S.cull_enable) glEnable(GL_CULL_FACE);
+              else glDisable(GL_CULL_FACE);
+              if (g_pcache[slot].u_alphaFunc >= 0) {
+                  glUniform1i(g_pcache[slot].u_alphaFunc, af);
+                  glUniform1f(g_pcache[slot].u_alphaRef, S.alpha_ref);
+              }
+              glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+              g_last_cm_reset = 1;
+          }
+      }
+
+      /* [TIMELINE] -- the order things happen inside one frame.
+       *
+       * The characters' pixels are written, opaque, nearer than what is
+       * already there, and passing the depth test -- and still never reach
+       * the screen. That leaves what happens AFTER the draw, and the first
+       * thing to rule in or out is the obvious one. This title builds its
+       * scene in surface 00084000 and composites it into the display buffer
+       * 001B2000 with a full-screen quad. If the skinned batches are
+       * submitted after that composite has already run, their pixels land in
+       * a surface nobody reads again -- which looks exactly like this, and
+       * would explain why the scenery around them is perfectly fine.
+       *
+       * One frame every five seconds, printed as it happens: every surface
+       * the frame switches to, every skinned batch, and every small quad
+       * (six vertices or fewer), which is what a composite looks like. */
+      { static double last_tl; static uint32_t tl_frame = 0xFFFFFFFFu;
+        static uint32_t tl_surf; static int tl_events;
+        static uint32_t tl_seen = 0xFFFFFFFFu; static int tl_arm;
+        double now_tl = prof_now();
+        /* Arming in the middle of a frame shows only its tail, which is
+         * exactly the part that cannot answer the question. Wait for the
+         * frame to turn over, then record that whole frame. */
+        if (tl_frame == 0xFFFFFFFFu && !tl_arm && now_tl - last_tl > 5.0)
+            tl_arm = 1;
+        if (tl_arm && S.frames != tl_seen) {
+            tl_arm = 0; last_tl = now_tl; tl_frame = S.frames;
+            tl_surf = 0xFFFFFFFFu; tl_events = 0;
+            fprintf(stderr, "  [TIMELINE] ---- frame %u ----\n", S.frames);
+        }
+        tl_seen = S.frames;
+        if (tl_frame != 0xFFFFFFFFu) {
+            if (S.frames != tl_frame || tl_events >= 200) {
+                if (tl_frame != 0xFFFFFFFFu && S.frames != tl_frame)
+                    fprintf(stderr, "  [TIMELINE] frame ends at draw %u\n",
+                            S.draws);
+                tl_frame = 0xFFFFFFFFu;
+                fflush(stderr);
+            } else {
+                if (S.color_offset != tl_surf) {
+                    tl_surf = S.color_offset;
+                    fprintf(stderr, "  [TIMELINE]   draw %6u: now drawing into"
+                            " surface %08X\n", S.draws, S.color_offset);
+                    tl_events++;
+                }
+                if (is_mover) {
+                    fprintf(stderr, "  [TIMELINE]   draw %6u: SKINNED slot %d,"
+                            " %u verts\n", S.draws, slot, out_n);
+                    tl_events++;
+                } else if (out_n <= 6) {
+                    fprintf(stderr, "  [TIMELINE]   draw %6u: quad, slot %d,"
+                            " %u verts%s\n", S.draws, slot, out_n,
+                            curtain_skip ? " [curtain, skipped]" : "");
+                    tl_events++;
+                }
+            }
+        } }
+
+      /* The x-ray itself: draw the skinned batches a second time with every
+       * per-fragment reject removed, so the picture on screen says the same
+       * thing the counter above says. Off by default now that the counter
+       * exists; RECOMP_GL_XRAY=1 turns it back on. */
+      { static int xray = -1;
+        if (xray < 0) { const char *v = getenv("RECOMP_GL_XRAY");
+                        xray = v ? atoi(v) : 0; }
+        if (xray && is_mover && !curtain_skip) {
+            glDisable(GL_BLEND);
+            glDisable(GL_CULL_FACE);
+            glDepthFunc(GL_ALWAYS);
+            if (g_pcache[slot].u_alphaFunc >= 0)
+                glUniform1i(g_pcache[slot].u_alphaFunc, 0);
+            PROF_T0(); glDrawArrays(mode, 0, (GLsizei)out_n); PROF_ADD(draw);
+            g_last.blend_enable = -1;
+            g_last.depth_test   = -1;
+            g_last.depth_func   = -1;
+            g_last.alpha_func   = -1;
+            goto xray_done;
+        } }
+    }
+    if (!curtain_skip) { PROF_T0(); glDrawArrays(mode, 0, (GLsizei)out_n); PROF_ADD(draw); }
+    xray_done: ;
     /*
      * RECOMP_GL_DARKHUNT=<n>: which draw makes the frame dark.
      *
@@ -3415,7 +4727,8 @@ static void do_draw(void)
      * it to one. Ruinously slow, which is why it runs for a single frame.
      */
     { static int hunt = -2; static uint32_t hunt_frame; static double prev_mean;
-      static int hunt_tris = -2, hunt_at = -1;
+      static int hunt_tris = -2;
+#define hunt_at g_darkhunt_at
       if (hunt == -2) { const char *v = getenv("RECOMP_GL_DARKHUNT");
                         hunt = v ? atoi(v) : -1;
                         hunt_frame = 0; }
@@ -3430,7 +4743,29 @@ static void do_draw(void)
        * orders of magnitude and does not care how long the disc took. */
       if (hunt_tris == -2) { const char *v = getenv("RECOMP_GL_DARKHUNT_TRIS");
                              hunt_tris = v ? atoi(v) : -1; }
-      if (hunt_tris > 0 && hunt_at < 0 && S.frame_tris >= (uint32_t)hunt_tris) {
+      /* RECOMP_GL_DARKHUNT_AFTER=<presents>: don't arm before here.
+       *
+       * Triangles alone pick the first scene in the run, and the first scene
+       * is the title screen -- a whole city, thousands of triangles, and
+       * perfectly bright. The frame actually worth hunting is the one AFTER
+       * the player has started a level, which no triangle count can
+       * distinguish from the menu it came from. A present count can: it is
+       * the one number that only ever goes up and that a dump run already
+       * reports, so the frame to hunt can be read off a previous run's
+       * screenshots rather than guessed. */
+      { static int after = -2;
+        if (after == -2) { const char *v = getenv("RECOMP_GL_DARKHUNT_AFTER");
+                           after = v ? atoi(v) : 0; }
+        if (after > 0 && S.flips < (uint32_t)after) hunt_tris = hunt_tris; /* not yet */
+        else if (hunt_tris > 0 && hunt_at < 0 && S.frame_tris >= (uint32_t)hunt_tris
+                 && (after <= 0 || S.flips >= (uint32_t)after)) {
+            hunt_at = (int)S.frames + 1;
+            fprintf(stderr, "  [DARK] present %u frame %u had %u triangles;"
+                            " hunting frame %d\n",
+                    S.flips, S.frames, S.frame_tris, hunt_at);
+        }
+      }
+      if (0 && hunt_tris > 0 && hunt_at < 0 && S.frame_tris >= (uint32_t)hunt_tris) {
           hunt_at = (int)S.frames + 1;   /* the next whole frame, from its start */
           fprintf(stderr, "  [DARK] frame %u had %u triangles; hunting frame %d\n",
                   S.frames, S.frame_tris, hunt_at);
@@ -3457,17 +4792,85 @@ static void do_draw(void)
            * a full-screen quad, and that legitimately takes the average from
            * the previous frame's picture down to nothing. What is wanted is a
            * draw that darkens a frame already being built. */
-          if (hunt_frame > 30 && prev_mean > 8.0 && m < prev_mean * 0.80)
+          /* The floor used to be 8.0, which hid the end of the story: the
+           * frame this was written for falls 80 -> 5.3 on one draw and then
+           * 5.3 -> 0 on another, and only the first was ever reported. A
+           * picture at 5 is still not black; whatever finishes the job is as
+           * interesting as whatever started it. */
+          if (hunt_frame > 30 && prev_mean > 0.4 && m < prev_mean * 0.80) {
               fprintf(stderr, "  [DARK] draw %u of this frame: mean %.1f -> "
                       "%.1f  xf=%u  verts=%u  blend=%d(%04X/%04X) "
                       "depth=%d/%04X alpha=%d prog=%d\n",
                       hunt_frame, prev_mean, m, S.xf_mode, out_n,
                       S.blend_enable, S.blend_src, S.blend_dst,
                       S.depth_test, S.depth_func, S.alpha_test, slot);
+              /* What the culprit is actually made of.
+               *
+               * Knowing WHICH draw darkens the frame is only half an answer.
+               * A full-screen alpha-blended quad that covers the scene is
+               * doing its job if its alpha is right and destroying the frame
+               * if its alpha is wrong, and the two are indistinguishable from
+               * the outside. So print where every attribute of this draw came
+               * from -- per-vertex array, or the constant the title left in
+               * SET_VERTEX_DATA4F -- and its value. Attribute 3 is diffuse;
+               * its w is the alpha the fade is asking for. */
+              { int a; uint32_t q;
+                for (a = 0; a < NUM_ATTRS; a++) {
+                    if (attr_at[a] >= 0) {
+                        const float *v0 = &vbuf[(size_t)attr_at[a]];
+                        fprintf(stderr, "  [DARK]   attr %-2d per-vertex:", a);
+                        for (q = 0; q < out_n && q < 4; q++) {
+                            const float *vv = &vbuf[(size_t)q * stride_floats
+                                                    + (size_t)attr_at[a]];
+                            fprintf(stderr, " (%.3f %.3f %.3f %.3f)",
+                                    vv[0], vv[1], vv[2], vv[3]);
+                        }
+                        (void)v0;
+                        fprintf(stderr, "\n");
+                    } else if (S.const_attr[a][0] != 0.0f
+                            || S.const_attr[a][1] != 0.0f
+                            || S.const_attr[a][2] != 0.0f
+                            || S.const_attr[a][3] != 0.0f) {
+                        fprintf(stderr, "  [DARK]   attr %-2d constant : "
+                                "(%.3f %.3f %.3f %.3f)\n", a,
+                                S.const_attr[a][0], S.const_attr[a][1],
+                                S.const_attr[a][2], S.const_attr[a][3]);
+                    }
+                }
+                /* And what it is sampling. A full-screen quad whose diffuse
+                 * is black gets its colour entirely from its texture, so a
+                 * texture that resolved to nothing paints the screen black --
+                 * which is a completely different bug from an alpha that is
+                 * too high, and the two look identical from outside. */
+                { int st;
+                  for (st = 0; st < NUM_STAGES; st++) {
+                      GLuint surf;
+                      if (!S.tex[st].enabled) {
+                          fprintf(stderr, "  [DARK]   tex %d: disabled\n", st);
+                          continue;
+                      }
+                      surf = surface_texture(S.tex[st].offset, 0, 0);
+                      fprintf(stderr, "  [DARK]   tex %d: offset 0x%08X %ux%u "
+                              "fmt 0x%08X -> %s\n", st,
+                              S.tex[st].offset, S.tex[st].width,
+                              S.tex[st].height, S.tex[st].format,
+                              surf ? "a render-target surface"
+                                   : "uploaded from guest memory");
+                  } }
+                fprintf(stderr, "  [DARK]   positions:");
+                for (q = 0; q < out_n && q < 4; q++) {
+                    const float *vv = &vbuf[(size_t)q * stride_floats];
+                    fprintf(stderr, " (%.1f %.1f %.1f %.1f)",
+                            vv[0], vv[1], vv[2], vv[3]);
+                }
+                fprintf(stderr, "\n");
+              }
+          }
           prev_mean = m;
           if (hunt_frame % 50 == 0)
               fprintf(stderr, "  [DARK]   after %u draws: mean %.1f\n",
                       hunt_frame, m);
+#undef hunt_at
       } }
     /*
      * RECOMP_GL_SKINDBG=1: where a skinned draw's constant reads land.
@@ -3636,6 +5039,121 @@ static void do_draw(void)
      * the distribution shows whether objects sit at a sensible spread of
      * ground and rooftop heights or pile up at an impossible one.
      */
+    /* RECOMP_GL_MOVERS=<n>: where the things that move actually end up.
+     *
+     * Two runs over the same frames settled that everything visible is drawn
+     * WITHOUT the constant palette, and everything drawn WITH it -- which is
+     * how this title places anything that moves -- renders nothing at all.
+     * That is the missing characters. It leaves exactly one fork: either the
+     * transform sends them somewhere off screen, or the transform is fine and
+     * the pixels are lost afterwards.
+     *
+     * The CPU interpreter answers it directly. Run the program over real
+     * vertices of a real mover draw, divide by w the way the hardware does,
+     * and print where it lands next to the state that decides whether a pixel
+     * survives. On-screen coordinates with nothing visible means the loss is
+     * in the pixel path; coordinates off in the weeds means it is the matrix.
+     */
+    { static int mv = -1; static int shown; static uint32_t last_frame = ~0u;
+      if (mv < 0) { const char *v = getenv("RECOMP_GL_MOVERS");
+                    mv = v ? atoi(v) : 0; }
+      if (S.frames != last_frame) { last_frame = S.frames; }
+      if (mv > 0 && shown < mv && slot >= 0 && g_pcache[slot].uses_a0
+          && out_n >= 3 && S.xf_mode != NV2A_XF_MODE_FIXED) {
+          Nv2aVshProgram vp;
+          uint32_t pstart = S.prog_start < NV2A_VSH_MAX_INSNS ? S.prog_start : 0;
+          int len = nv2a_vsh_decode(S.prog + pstart * 4,
+                                    (int)(NV2A_VSH_MAX_INSNS - pstart), &vp);
+          float vin[16][4], op[4];
+          int k; uint32_t q;
+          int on = 0, behind = 0;
+          float sx0 = 0, sy0 = 0, sw0 = 0;
+          for (q = 0; q < out_n && q < 32; q++) {
+              memset(vin, 0, sizeof vin);
+              for (k = 0; k < NUM_ATTRS; k++) {
+                  if (attr_at[k] >= 0)
+                      memcpy(vin[k], &vbuf[(size_t)q * stride_floats + attr_at[k]], 16);
+                  else memcpy(vin[k], S.const_attr[k], 16);
+              }
+              if (!nv2a_vsh_interp(&vp, vin, S.u.c, op)) continue;
+              if (op[3] <= 0.0f) { behind++; continue; }
+              { float sx = op[0] / op[3], sy = op[1] / op[3];
+                if (!q) { sx0 = sx; sy0 = sy; sw0 = op[3]; }
+                if (sx >= -1.5f && sx <= 641.5f && sy >= -1.5f && sy <= 481.5f) on++; }
+          }
+          shown++;
+          /* Those coordinates are NORMALISED (x/w), not pixels -- a first
+           * reading of them as pixels says every mover collapses onto the top
+           * left corner, which is wrong and sends you after the matrix. They
+           * sit inside [-1,1], so the transform is fine and the geometry is on
+           * screen. What is left is the pixel path, so print the things that
+           * decide whether a pixel survives it: the colour the vertices carry
+           * (attribute 3 is diffuse; its w is alpha) and the alpha test the
+           * title asked for. An alpha of zero under SRC_ALPHA blending is a
+           * perfectly drawn, perfectly invisible character. */
+          /* And the matrix it is actually reading.
+           *
+           * Everything measured so far verifies the machinery -- the program
+           * translates correctly, A0 is set, the reads are well formed, the
+           * vertices land on screen. None of it has compared the CONSTANTS a
+           * mover reads in the tutorial against a matrix known to be good.
+           * The one dump that showed sane object matrices was taken on the
+           * attract screen, where characters do render, so it proves nothing
+           * about the scene where they do not. A0, the base it indexes from,
+           * and the four rows it lands on are the missing evidence: a row of
+           * zeroes, or a last row that is not (0,0,0,1), is the whole bug. */
+          { int rel_base = -1, q2, na2, a0s2[8];
+            float vin2[16][4];
+            for (q2 = 0; q2 < len; q2++)
+                if (vp.insns[q2].rel_addr) { rel_base = vp.insns[q2].const_index; break; }
+            if (rel_base >= 0) {
+                memset(vin2, 0, sizeof vin2);
+                for (k = 0; k < NUM_ATTRS; k++) {
+                    if (attr_at[k] >= 0)
+                        memcpy(vin2[k], &vbuf[(size_t)attr_at[k]], 16);
+                    else memcpy(vin2[k], S.const_attr[k], 16);
+                }
+                na2 = nv2a_vsh_interp_a0(&vp, vin2, S.u.c, a0s2, 8);
+                if (na2 > 0) {
+                    int idx = rel_base + a0s2[0];
+                    fprintf(stderr, "  [MOVER]   A0=%d base=%d -> c[%d..%d]\n",
+                            a0s2[0], rel_base, idx, idx + 3);
+                    if (idx >= 0 && idx + 3 < NV2A_VSH_NUM_CONSTS) {
+                        int r;
+                        for (r = 0; r < 4; r++)
+                            fprintf(stderr, "  [MOVER]     c[%3d] = %9.3f %9.3f "
+                                    "%9.3f %9.3f\n", idx + r,
+                                    S.u.c[idx+r][0], S.u.c[idx+r][1],
+                                    S.u.c[idx+r][2], S.u.c[idx+r][3]);
+                    } else {
+                        fprintf(stderr, "  [MOVER]     index out of the "
+                                        "constant file\n");
+                    }
+                } else {
+                    fprintf(stderr, "  [MOVER]   no ARL executed for this "
+                                    "draw (A0 stays 0, base=%d)\n", rel_base);
+                }
+            } else {
+                fprintf(stderr, "  [MOVER]   no relative read found\n");
+            } }
+          { float dif[4] = {0,0,0,0};
+            if (attr_at[3] >= 0) memcpy(dif, &vbuf[(size_t)attr_at[3]], 16);
+            else memcpy(dif, S.const_attr[3], 16);
+            fprintf(stderr, "  [MOVER] draw %u slot %d verts %u: v0 ndc "
+                  "(%.2f %.2f) w %.1f | diffuse (%.3f %.3f %.3f a=%.3f)%s | "
+                  "blend=%d(%04X/%04X) alphatest=%d func=%04X ref=%.3f "
+                  "depth=%d/%04X write=%d tex0=%d(fmt 0x%08X)\n",
+                  S.draws, slot, out_n, sx0, sy0, sw0,
+                  dif[0], dif[1], dif[2], dif[3],
+                  attr_at[3] >= 0 ? "" : " [constant]",
+                  S.blend_enable, S.blend_src, S.blend_dst,
+                  S.alpha_test, (unsigned)S.alpha_func, S.alpha_ref,
+                  S.depth_test, S.depth_func, S.depth_mask,
+                  S.tex[0].enabled, S.tex[0].format);
+            (void)on; (void)behind; }
+          fflush(stderr);
+      } }
+
     { static int wy = -1; static uint64_t hist[12]; static uint32_t wlast;
       static const float edges[11] = { -100,-20,-5,0,5,20,50,100,200,500,1000 };
       if (wy < 0) wy = getenv("RECOMP_GL_WORLDY") ? 1 : 0;
@@ -4858,6 +6376,7 @@ static void do_clear(uint32_t param)
     uint32_t rect[4], *rectp = NULL;
 
     if (!g_ready) return;
+    surface_sync();
 
     /* A clear that covers the surface ends the previous frame.
      *
@@ -4967,71 +6486,24 @@ static void fliplog(const char *why)
     fflush(stderr);
 }
 
-static void present(int is_frame)
+/*
+ * Frame pacing.
+ *
+ * The console's frame loop is bounded by the display: a title swaps and
+ * waits. Nothing here made it wait, so the guest was presenting sixteen
+ * hundred times a second -- twenty-seven times faster than it was written
+ * to run. Everything paced by real time loses that race: streaming, the
+ * loader, the music, and any thread that sleeps for a fixed number of
+ * milliseconds expecting the world to have moved on. Some runs sat on the
+ * loading screen forever with seven shaders compiled while the frame loop
+ * spun; the loader was not stuck, it was outnumbered.
+ *
+ * RECOMP_FPS sets the rate; 0 removes the limit, which is what the
+ * diagnostic runs want when they are trying to reach a late phase of a
+ * title quickly.
+ */
+static void frame_pace(void)
 {
-    uint32_t va, bpp, x, y;
-    uint8_t *dst;
-
-    if (!g_ready || !g_fbo_w || !g_fbo_h || !S.color_offset) return;
-    if (is_frame) { S.frames++; prof_report(); }
-
-    /* RECOMP_PACE=1: one line a second saying how the boot is progressing.
-     *
-     * The question it answers is whether this title's start-up is counted in
-     * frames or in seconds. If capping the frame rate stretches the boot in
-     * proportion, the loader is being driven by the frame loop; if the boot
-     * takes the same wall time either way, it is on a clock and the cap costs
-     * nothing. Guessing was cheaper than measuring exactly once. */
-    {
-        static int pace = -1;
-        static struct timespec t0, tprev;
-        static uint32_t fprev, dprev;
-        static unsigned long vprev;
-        if (pace < 0) {
-            pace = getenv("RECOMP_PACE") ? 1 : 0;
-            clock_gettime(CLOCK_MONOTONIC, &t0);
-            tprev = t0;
-        }
-        if (pace) {
-            struct timespec now;
-            double dt, since;
-            clock_gettime(CLOCK_MONOTONIC, &now);
-            dt = (double)(now.tv_sec - tprev.tv_sec)
-               + (double)(now.tv_nsec - tprev.tv_nsec) * 1e-9;
-            if (dt >= 1.0) {
-                since = (double)(now.tv_sec - t0.tv_sec)
-                      + (double)(now.tv_nsec - t0.tv_nsec) * 1e-9;
-                fprintf(stderr, "[PACE] t=%6.1fs frames=%-7u (%5.1f/s) "
-                                "draws=%-8u (%6.0f/s) vbl=%-7lu (%5.1f/s)\n",
-                        since, S.frames, (double)(S.frames - fprev) / dt,
-                        S.draws, (double)(S.draws - dprev) / dt,
-                        (&g_vblank_count ? g_vblank_count : 0UL),
-                        (&g_vblank_count
-                         ? (double)(g_vblank_count - vprev) / dt : 0.0));
-                vprev = (&g_vblank_count ? g_vblank_count : 0UL);
-                fflush(stderr);
-                tprev = now; fprev = S.frames; dprev = S.draws;
-            }
-        }
-    }
-
-    /*
-     * Frame pacing.
-     *
-     * The console's frame loop is bounded by the display: a title swaps and
-     * waits. Nothing here made it wait, so the guest was presenting sixteen
-     * hundred times a second -- twenty-seven times faster than it was written
-     * to run. Everything paced by real time loses that race: streaming, the
-     * loader, the music, and any thread that sleeps for a fixed number of
-     * milliseconds expecting the world to have moved on. Some runs sat on the
-     * loading screen forever with seven shaders compiled while the frame loop
-     * spun; the loader was not stuck, it was outnumbered.
-     *
-     * RECOMP_FPS sets the rate; 0 removes the limit, which is what the
-     * diagnostic runs want when they are trying to reach a late phase of a
-     * title quickly.
-     */
-    if (is_frame) {
         static double period = -1.0;
         static double deadline;
         double now;
@@ -5122,7 +6594,63 @@ static void present(int is_frame)
                 if (held && xbox_guest_lock_retake) xbox_guest_lock_retake(held);
             }
         }
+}
+
+static void present(int is_frame)
+{
+    uint32_t va, bpp, x, y;
+    uint8_t *dst;
+
+    if (!g_ready || !g_fbo_w || !g_fbo_h || !S.color_offset) return;
+    if (is_frame) { S.frames++; prof_report();
+                    /* the census counts one frame, not everything since the
+                     * last dump -- otherwise it measures the gap, not the
+                     * picture next to it */
+                    memcpy(g_slot_prev, g_slot_draws, sizeof g_slot_prev);
+                    memset(g_slot_draws, 0, sizeof g_slot_draws);
+                    g_frame_chars_prev = g_frame_chars; g_frame_chars = 0; }
+
+    /* RECOMP_PACE=1: one line a second saying how the boot is progressing.
+     *
+     * The question it answers is whether this title's start-up is counted in
+     * frames or in seconds. If capping the frame rate stretches the boot in
+     * proportion, the loader is being driven by the frame loop; if the boot
+     * takes the same wall time either way, it is on a clock and the cap costs
+     * nothing. Guessing was cheaper than measuring exactly once. */
+    {
+        static int pace = -1;
+        static struct timespec t0, tprev;
+        static uint32_t fprev, dprev;
+        static unsigned long vprev;
+        if (pace < 0) {
+            pace = getenv("RECOMP_PACE") ? 1 : 0;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            tprev = t0;
+        }
+        if (pace) {
+            struct timespec now;
+            double dt, since;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            dt = (double)(now.tv_sec - tprev.tv_sec)
+               + (double)(now.tv_nsec - tprev.tv_nsec) * 1e-9;
+            if (dt >= 1.0) {
+                since = (double)(now.tv_sec - t0.tv_sec)
+                      + (double)(now.tv_nsec - t0.tv_nsec) * 1e-9;
+                fprintf(stderr, "[PACE] t=%6.1fs frames=%-7u (%5.1f/s) "
+                                "draws=%-8u (%6.0f/s) vbl=%-7lu (%5.1f/s)\n",
+                        since, S.frames, (double)(S.frames - fprev) / dt,
+                        S.draws, (double)(S.draws - dprev) / dt,
+                        (&g_vblank_count ? g_vblank_count : 0UL),
+                        (&g_vblank_count
+                         ? (double)(g_vblank_count - vprev) / dt : 0.0));
+                vprev = (&g_vblank_count ? g_vblank_count : 0UL);
+                fflush(stderr);
+                tprev = now; fprev = S.frames; dprev = S.draws;
+            }
+        }
     }
+
+    if (is_frame) frame_pace();
 
 #if defined(NV2A_GL_USE_CGL)
     /* Put the finished frame on screen.
@@ -5142,10 +6670,22 @@ static void present(int is_frame)
         static uint32_t cap;
         uint32_t pw = g_fbo_pw ? g_fbo_pw : g_fbo_w;
         uint32_t ph = g_fbo_ph ? g_fbo_ph : g_fbo_h;
-        uint32_t need = pw * ph * 4;
+        uint32_t need;
+        GLuint pfbo = g_fbo;
+        /* Show the surface the title has set up when it flips, which is what
+         * the window showed while surfaces were bound as their methods
+         * arrived (JSRF: the display buffer it copies each frame into).
+         * Surfaces are bound when used now, and the last one used at the
+         * flip is the off-screen frame instead. */
+        if (g_present_slot >= 0 && g_present_slot < SURF_CACHE && g_surf[g_present_slot].used) {
+            pfbo = g_surf[g_present_slot].fbo;
+            pw = g_surf[g_present_slot].w * gl_scale();
+            ph = g_surf[g_present_slot].h * gl_scale();
+        }
+        need = pw * ph * 4;
         if (cap < need) { free(shot); shot = (uint8_t *)malloc(need); cap = need; }
         if (shot) {
-            glBindFramebuffer(GL_READ_FRAMEBUFFER, g_fbo);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, pfbo);
             glPixelStorei(GL_PACK_ALIGNMENT, 1);
             glReadPixels(0, 0, (GLsizei)pw, (GLsizei)ph,
                          GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, shot);
@@ -5182,7 +6722,7 @@ static void present(int is_frame)
         static int every = -1, dump_shots;
         static const char *pfx;
         static uint32_t dump_after, dump_every, dump_3d, dump_after_tris;
-        int dump_due;
+        int dump_due, chars_ok = 1;
 
         if (every < 0) {
             const char *v = getenv("RECOMP_GL_READBACK");
@@ -5207,8 +6747,72 @@ static void present(int is_frame)
           prev_tris = S.tris;
           if (*tinit) dump_after_tris = (uint32_t)strtoul(tinit, 0, 0); }
 
+        /* RECOMP_GL_DARKHUNT_DROP=1: hunt the frame where the picture
+         * actually goes dark, instead of one named in advance.
+         *
+         * Aiming the per-draw hunt by hand needs a frame number, and the only
+         * way to get one is a previous run's screenshots -- which are numbered
+         * by presents, on a timeline that moves the moment anything changes.
+         * Two attempts at this landed on bright frames. The frame worth
+         * hunting identifies itself perfectly well: it is the one after the
+         * mean brightness falls off a cliff. One 64x48 readback per frame is
+         * cheap enough to leave on for a whole run, and the fade lasts long
+         * enough that the following frame is still dark, so the per-draw hunt
+         * gets a frame in which the darkening is still happening. */
+        { static int drop = -1; static double prev_mean = -1.0; static int armed;
+          static int drop_tris = -1;
+          if (drop < 0) drop = getenv("RECOMP_GL_DARKHUNT_DROP") ? 1 : 0;
+          /* Only frames with a scene in them.
+           *
+           * The first attempt at this armed at present 1095, on a frame with
+           * THREE triangles: the boot sequence flashes white and then black,
+           * which is a fall from 255 to 0 and tells us nothing. A level frame
+           * is tens of thousands of triangles, so requiring a real scene on
+           * both sides of the fall removes every logo, flash and fade between
+           * menus without needing to know where any of them are. */
+          if (drop_tris < 0) { const char *v = getenv("RECOMP_GL_DARKHUNT_TRIS");
+                               drop_tris = v ? atoi(v) : 5000; }
+          if (drop && !armed && S.frame_tris >= (uint32_t)drop_tris) {
+              static uint8_t strip[64 * 48 * 4];
+              double m = 0.0; int q; GLuint keep_read;
+              glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, (GLint *)&keep_read);
+              glBindFramebuffer(GL_READ_FRAMEBUFFER, g_fbo);
+              glPixelStorei(GL_PACK_ALIGNMENT, 1);
+              glReadPixels(0, (GLint)((g_fbo_ph ? g_fbo_ph : g_fbo_h) / 2),
+                           64, 48, GL_RGBA, GL_UNSIGNED_BYTE, strip);
+              glBindFramebuffer(GL_READ_FRAMEBUFFER, keep_read);
+              for (q = 0; q < 64 * 48; q++)
+                  m += strip[q*4] + strip[q*4+1] + strip[q*4+2];
+              m /= (64.0 * 48.0 * 3.0);
+              if (prev_mean >= 0.0)
+                  fprintf(stderr, "  [DARK] present %u frame %u mean %.1f"
+                                  " (was %.1f) tris %u\n",
+                          S.flips, S.frames, m, prev_mean, S.frame_tris);
+              if (prev_mean > 25.0 && m < prev_mean * 0.45) {
+                  armed = 1;
+                  fprintf(stderr, "  [DARK] the picture fell from %.1f to %.1f"
+                                  " at present %u -- hunting the next frame\n",
+                          prev_mean, m, S.flips);
+                  { extern int g_darkhunt_at; g_darkhunt_at = (int)S.frames + 1; }
+              }
+              prev_mean = m;
+          } }
+
         draw_log_latch();
-        dump_due = pfx && dump_shots < 24
+        /* RECOMP_GL_DUMP_CHARS=<n>: only frames with at least n big skinned
+         * batches in them, which is what a scene with characters in it looks
+         * like and a menu or loading screen never does. */
+        { static int cinit; static uint32_t want_chars;
+          if (!cinit) { const char *v = getenv("RECOMP_GL_DUMP_CHARS");
+                        want_chars = v ? (uint32_t)strtoul(v, 0, 0) : 0;
+                        cinit = 1; }
+          chars_ok = !want_chars || g_frame_chars_prev >= want_chars; }
+        if (g_dump_burst_left > 0 && pfx && is_frame
+         && (S.frames % (uint32_t)g_dump_burst_every) == 0 && dump_shots < 72) {
+            g_dump_burst_left--;
+            dump_due = 1;
+        } else
+        dump_due = pfx && dump_shots < 24 && chars_ok
                 && (dump_after_tris ? S.frame_tris >= dump_after_tris
                     : dump_3d ? S.draws_3d >= dump_3d
                     : S.flips >= dump_after)
@@ -5234,12 +6838,43 @@ static void present(int is_frame)
                 if (!g_surf[k].used) continue;
                 snprintf(pf, sizeof pf, "%s_s%d_", pfx, k);
                 glBindFramebuffer(GL_FRAMEBUFFER, g_surf[k].fbo);
-                { uint32_t sw = g_fbo_w, sh = g_fbo_h;
+                { uint32_t sw = g_fbo_w, sh = g_fbo_h, spw = g_fbo_pw, sph = g_fbo_ph;
                   g_fbo_w = g_surf[k].w; g_fbo_h = g_surf[k].h;
-                  dump_fbo(pf, &per_surf[k], 24);
-                  g_fbo_w = sw; g_fbo_h = sh; }
+                  g_fbo_pw = g_surf[k].w * gl_scale(); g_fbo_ph = g_surf[k].h * gl_scale();
+                  dump_fbo(pf, &per_surf[k], 72);
+                  g_fbo_w = sw; g_fbo_h = sh; g_fbo_pw = spw; g_fbo_ph = sph; }
+            }
+            /* And the one the window shows at this flip, under its own name,
+             * so a headless run can see what a player would. */
+            if (is_frame && g_present_slot >= 0 && g_surf[g_present_slot].used) {
+                char pf[256];
+                static int shown_n;
+                int k2 = g_present_slot;
+                uint32_t sw = g_fbo_w, sh = g_fbo_h, spw = g_fbo_pw, sph = g_fbo_ph;
+                snprintf(pf, sizeof pf, "%s_shown_", pfx);
+                glBindFramebuffer(GL_FRAMEBUFFER, g_surf[k2].fbo);
+                g_fbo_w = g_surf[k2].w; g_fbo_h = g_surf[k2].h;
+                g_fbo_pw = g_surf[k2].w * gl_scale(); g_fbo_ph = g_surf[k2].h * gl_scale();
+                dump_fbo(pf, &shown_n, 72);
+                g_fbo_w = sw; g_fbo_h = sh; g_fbo_pw = spw; g_fbo_ph = sph;
+                fprintf(stderr, "  [GL] shown at this flip: slot %d = surface %08X %ux%u\n",
+                        k2, g_surf[k2].offset, g_surf[k2].w, g_surf[k2].h);
             }
             glBindFramebuffer(GL_FRAMEBUFFER, keep);
+            { char nm[256]; FILE *sf;
+              snprintf(nm, sizeof nm, "%s_slots_%03d.txt",
+                       pfx ? pfx : "dump", dump_shots);
+              sf = fopen(nm, "w");
+              if (sf) {
+                  int s2; uint32_t tot = 0;
+                  for (s2 = 0; s2 < SLOTCENSUS_MAX; s2++) tot += g_slot_prev[s2];
+                  fprintf(sf, "# frame at present %u, %u draws this frame\n",
+                          S.flips, tot);
+                  for (s2 = 0; s2 < SLOTCENSUS_MAX; s2++)
+                      if (g_slot_prev[s2])
+                          fprintf(sf, "%d %u\n", s2, g_slot_prev[s2]);
+                  fclose(sf);
+              } }
             dump_shots++;
             /* dump_fbo did its own read; fall through so the guest surface
              * gets the same frame when a copy is also wanted. */
@@ -5576,6 +7211,10 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
                    t->enabled = (int)((param >> 30) & 1); break;
         case 0x10: t->control1 = param; t->pitch = param >> 16; break;
         case 0x14: t->filter = param; break;
+        case 0x28: case 0x2C: case 0x30: case 0x34:
+            memcpy(&t->bump_mat[(reg - 0x28) / 4], &param, 4); break;
+        case 0x38: memcpy(&t->bump_scale, &param, 4); break;
+        case 0x3C: memcpy(&t->bump_off, &param, 4); break;
         case 0x1C: t->image_rect = param;
                    if (!fmt_is_swz(t->color) && !fmt_is_dxt(t->color)) {
                        t->width  = param >> 16;
@@ -5697,7 +7336,8 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
     case M_SET_SURFACE_CLIP_V:
         S.clip_y = param & 0xFFFF; S.clip_h = (param >> 16) & 0xFFFF;
         ensure_ready();
-        if (g_ready) backend()->surface(S.color_offset, S.clip_w, S.clip_h, gl_scale());
+        /* Bound at the next draw or clear, not here: see surface_sync. */
+        S.surf_dirty = 1;
         break;
     case M_SET_SURFACE_FORMAT:       S.surf_format = param; break;
     case M_SET_SURFACE_PITCH:        S.surf_pitch = param & 0xFFFF; break;
@@ -5723,7 +7363,7 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
             S.surface_switches++;
         }
         S.color_offset = param;
-        if (g_ready) backend()->surface(param, S.clip_w, S.clip_h, gl_scale());
+        S.surf_dirty = 1;     /* see surface_sync */
         break;
     case M_SET_SURFACE_ZETA_OFFSET:  S.zeta_offset = param; break;
 
@@ -6010,8 +7650,51 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
          * stays the frame for a title that does not.
          */
         S.seen_flip_stall = 1;
+        /* Which surface the window shows for this frame.
+         *
+         * The one the title has set up when it flips is the back buffer it
+         * is ABOUT to draw: JSRF binds the next display buffer, flips, and
+         * only then copies its off-screen frame into it. Showing that buffer
+         * (what the window did while surfaces were bound as their methods
+         * arrived) is two frames behind the game. The buffer the console is
+         * about to scan out is the other one -- same size and format, and
+         * drawn since the last flip. If there is no such buffer (a title
+         * that draws straight into its back buffer), the bound one it is. */
+        { int k, m = -1, best = -1;
+          for (k = 0; k < SURF_CACHE; k++)
+              if (g_surf[k].used && g_surf[k].offset == S.color_offset
+               && g_surf[k].w == S.clip_w && g_surf[k].h == S.clip_h) { m = k; break; }
+          if (m >= 0)
+              for (k = 0; k < SURF_CACHE; k++) {
+                  if (k == m || !g_surf[k].used) continue;
+                  if (g_surf[k].w != g_surf[m].w || g_surf[k].h != g_surf[m].h) continue;
+                  if (g_surf[k].fmt != (S.surf_format & 0xFFFFu)) continue;
+                  if (g_surf[k].last_draw <= g_last_flip_draws) continue;
+                  if (best < 0 || g_surf[k].last_draw > g_surf[best].last_draw) best = k;
+              }
+          g_present_slot = best >= 0 ? best : m;
+          g_last_flip_draws = S.draws; }
         if (S.since_present) { fliplog("flip_stall"); present(1); }
-        else fliplog("stall(nodraw)");
+        else {
+            /* Nothing drawn since the last frame -- a black frame, a fade,
+             * a frame spent loading -- but the title still flipped, and on
+             * the console that flip waits for the display like any other.
+             *
+             * Unpaced, these ran at 500 to 1,500 a second. The DJ K scene
+             * has seven of them in bursts, one each time it loads a line of
+             * speech: its subtitles and animation count frames, its speech
+             * plays in real time, so each burst put the picture up to ten
+             * seconds ahead of the voice -- the subtitles showed the next
+             * line while he was still saying this one, and his mouth moved
+             * to the wrong words. Paced, the two stay together. */
+            static int pace_nodraw = -1;   /* RECOMP_PACE_NODRAW=0: the old way, for A/B */
+            if (pace_nodraw < 0) {
+                const char *v = getenv("RECOMP_PACE_NODRAW");
+                pace_nodraw = v ? atoi(v) : 1;
+            }
+            fliplog("stall(nodraw)");
+            if (pace_nodraw) frame_pace();
+        }
         break;
     default:
         /* RECOMP_GL_UNHANDLED=1: every method this backend ignores, ranked.
@@ -6060,6 +7743,14 @@ static const char *surf_desc(int i)
              i, g_surf[i].offset, g_surf[i].w, g_surf[i].h);
     return buf[i];
 }
+
+/* One number that must keep changing while the game is alive.
+ *
+ * Presents, not draws: a title that has stopped can still be issuing draws
+ * into a buffer nobody shows, and a title that is merely slow still presents.
+ * The freeze watchdog in the kernel bridge reads this and nothing else. */
+unsigned long nv2a_gl_progress(void);
+unsigned long nv2a_gl_progress(void) { return (unsigned long)S.flips; }
 
 void nv2a_gl_report(void)
 {
@@ -6363,4 +8054,24 @@ static const Nv2aBackend *backend(void)
         fprintf(stderr, "  [GL] backend: %s\n", b->name);
     }
     return b;
+}
+
+/* The present count -- the same number RECOMP_GL_DUMP_AFTER counts in -- for
+ * diagnostics outside this file that want to act on one particular frame. */
+uint32_t nv2a_gl_flips(void) { return S.flips; }
+
+/* Test hooks for the game side (recomp_manual.c): capture a burst of frames
+ * (every surface, as RECOMP_GL_DUMP_FB does) starting now, and log every
+ * pass of the next few frames. */
+void nv2a_gl_dump_burst(int shots, int every)
+{
+    g_dump_burst_every = every > 0 ? every : 1;
+    g_dump_burst_left = shots;
+    fprintf(stderr, "  [GL] dump burst: %d shots every %d frames from frame %u\n",
+            shots, g_dump_burst_every, S.frames);
+}
+void nv2a_gl_trace_frames(int n)
+{
+    g_pass_trace_until = S.frames + (uint32_t)n;
+    fprintf(stderr, "  [GL] pass trace for frames %u..%u\n", S.frames, g_pass_trace_until);
 }

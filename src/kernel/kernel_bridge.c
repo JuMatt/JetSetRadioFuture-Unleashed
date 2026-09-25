@@ -38,8 +38,12 @@
  * but only as warnings, and this file is compiled with /W4 /WX-. */
 #include <stdlib.h>
 #include <float.h>
+#include <unistd.h>   /* usleep, for recomp_guest_spin_yield */
+#define SPIN_WITNESS_N 3
+#include <sched.h>    /* sched_yield, likewise */
 void xbox_guest_lock_acquire(void);
 void xbox_guest_lock_release(void);
+static void kernel_freeze_watch(void); /* see the bottom of this file */
 
 #ifndef MAXIMUM_WAIT_OBJECTS
 #define MAXIMUM_WAIT_OBJECTS 64
@@ -645,10 +649,30 @@ static void bridge_NtClose(void)
     /* Close real handles but skip fake/synthetic ones */
     if (raw_handle && raw_handle != 0xDEAD0001u && raw_handle != 0xBEEF0010u) {
         HANDLE h = bridge_take_handle(raw_handle);
-        if (h && h != INVALID_HANDLE_VALUE)
+        if (h && h != INVALID_HANDLE_VALUE) {
+            xbox_dir_context_release(h);
             CloseHandle(h);
+        }
     }
     g_eax = 0; /* STATUS_SUCCESS */
+}
+
+/* RECOMP_CONTIG_LOG=1: every contiguous allocation and free, with the guest
+ * code addresses found on the stack -- which title component owns a block. */
+static void contig_trace(const char *what, uint32_t va, uint32_t size)
+{
+    static int on = -1;
+    char buf[256]; int len = 0, shown = 0, k;
+    if (on < 0) on = getenv("RECOMP_CONTIG_LOG") ? 1 : 0;
+    if (!on) return;
+    len += snprintf(buf + len, sizeof buf - len, "[CONTIGLOG] %s %08X %u |", what, va, size);
+    for (k = -1; k < 24 && shown < 5; k++) {
+        uint32_t w = BRIDGE_MEM32(g_esp + (uint32_t)(k * 4));
+        if (w > 0x11000u && w < 0x1C4000u) {
+            len += snprintf(buf + len, sizeof buf - len, " %08X", w); shown++;
+        }
+    }
+    fprintf(stderr, "%s\n", buf);
 }
 
 /* ── MmAllocateContiguousMemory (ordinal 165) ─────────────
@@ -664,6 +688,7 @@ static void bridge_MmAllocateContiguousMemory(void)
      * hands the hardware. See xbox_ContiguousAlloc. */
     uint32_t xbox_va = xbox_ContiguousAlloc(size, 4096);
 
+    contig_trace("alloc", xbox_va, size);
     if (KERNEL_LOG_ON_HALF()) {
         fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemory: size=%u → Xbox VA 0x%08X\n",
                 size, xbox_va);
@@ -761,6 +786,7 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
 
     if (align < 4096) align = 4096;
     xbox_va = xbox_ContiguousAlloc(size, align);
+    contig_trace("allocEx", xbox_va, size);
 
     if (KERNEL_LOG_ON_HALF()) {
         fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemoryEx: size=%u align=%u → Xbox VA 0x%08X\n",
@@ -777,7 +803,13 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
 static void bridge_MmFreeContiguousMemory(void)
 {
     uint32_t addr = STACK_ARG(0);
-    xbox_HeapFree(addr);
+    contig_trace("free", addr, xbox_ContiguousBlockSize(addr));
+    /* Contiguous blocks go back to the contiguous allocator. This used to call
+     * the general heap's free, which does not know these addresses and
+     * silently kept every one of them: JSRF's D3D frees its textures here on
+     * every stage change, and after the tutorial the window was full. */
+    if (!xbox_ContiguousFree(addr))
+        xbox_HeapFree(addr);
     g_eax = 0;
 }
 
@@ -1437,6 +1469,10 @@ static void bridge_RtlEnterCriticalSection(void)
     g_eax = 0;
 }
 
+/* How often the fair-handoff path actually fires. A fix that is not running
+ * and a fix that does not work look identical from the outside. */
+static unsigned long g_cs_handoffs, g_cs_free_releases;
+
 static void bridge_RtlLeaveCriticalSection(void)
 {
     uint32_t cs_va = STACK_ARG(0);
@@ -1444,6 +1480,48 @@ static void bridge_RtlLeaveCriticalSection(void)
     if (h >= 0 && g_gcs[h].owner == (unsigned long)GetCurrentThreadId())
         g_gcs[h].owner = 0;
     xbox_RtlLeaveCriticalSection(XBOX_TO_NATIVE(cs_va));
+
+    /* Let a waiter actually have it.
+     *
+     * A guest critical section here is a pthread mutex, and a pthread mutex
+     * is not fair: a thread that releases and immediately re-acquires in a
+     * tight loop will win every time, because it never has to be woken. The
+     * title does exactly that -- one thread took and released the same
+     * section 1,452,163 times in a run -- while the thread that wanted it sat
+     * in RtlEnterCriticalSection for FIFTY-SEVEN SECONDS and never got a
+     * turn. On the console this cannot happen: the kernel hands a contended
+     * section to the waiter it woke.
+     *
+     * The consequences were three different-looking bugs. The starved thread
+     * is DirectSound's, so its queue never drains: that is the bugged sound
+     * in every session, the New Game freeze, and -- when the collision lands
+     * during start-up -- the game stuck on the first loading screen about one
+     * launch in three.
+     *
+     * Yielding once, and only when somebody is actually queued for THIS
+     * section, is enough to break the convoy: the spinner goes to the back of
+     * the run queue and the waiter is scheduled. The scan is sixteen slots of
+     * a table that already exists for the lock watchdog; it costs nothing on
+     * the uncontended path, which is nearly all of them. */
+    { int i, waiting = 0;
+      for (i = 0; i < GCS_SLOTS; i++)
+          if (g_gcs_wait[i].tid && g_gcs_wait[i].cs == cs_va) { waiting = 1; break; }
+      /* A yield was not enough: measured over three runs it left one still
+       * stuck for 58 seconds. sched_yield only offers the CPU up -- the
+       * releasing thread stays runnable and on a machine with spare cores it
+       * simply carries on and takes the section back before the woken waiter
+       * has been scheduled at all. Sleeping takes the spinner off the run
+       * queue outright, which is the only thing that guarantees the waiter
+       * gets its turn.
+       *
+       * Twenty microseconds, and only when somebody is queued for this exact
+       * section: on the uncontended path -- almost every release -- nothing
+       * happens at all. When it does fire it is throttling a thread that was
+       * spinning through a million acquisitions a run and starving the audio
+       * thread, so the time is bought back many times over. */
+      if (waiting) { g_cs_handoffs++; usleep(20); }
+      else g_cs_free_releases++; }
+
     g_eax = 0;
 }
 
@@ -2233,6 +2311,14 @@ static int kernel_raise_interrupt_locked(uint32_t vector)
     if (!fn)
         return -1;
 
+    { static uint32_t said[8];
+      if (vector < 8 && said[vector] != routine) {
+          said[vector] = routine;
+          fprintf(stderr, "  [KERNEL] vector %u is serviced by guest 0x%08X\n",
+                  vector, routine);
+          fflush(stderr);
+      } }
+
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = kint;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
@@ -2327,6 +2413,174 @@ static void kernel_vblank_tick(void)
             fprintf(stderr, "  [NV2A] vblank -> ISR %s\n",
                     claimed < 0 ? "not callable" :
                     claimed ? "claimed it" : "declined it");
+        fflush(stderr);
+    }
+}
+
+/* The audio processor's interrupt, delivered.
+ *
+ * Vector 5 on the console. DirectSound connects an ISR to it and does its
+ * voice bookkeeping there -- retiring stopped voices, clearing the per-voice
+ * "stop pending" bit the title's thread then spins on, and advancing the
+ * notifier list that tells the streaming code a buffer was consumed. The
+ * APU emulation sets ISTS and asks for the line (set_irq); nothing delivered
+ * it, because the standalone build has no PCI bus for pci_irq_assert() to
+ * assert on. Delivered from the timer tick like the vblank above, and for the
+ * same reason: this thread has the guest stack and TIB an ISR needs.
+ *
+ * Level-triggered: raised again every tick until the ISR acknowledges by
+ * writing ISTS (write-1-to-clear, handled in the APU's MMIO path). An ISR
+ * that declines is logged the first few times rather than spamming a line a
+ * millisecond, and backed off so a misunderstanding costs 16 calls a second
+ * instead of a thousand. RECOMP_APU_NO_IRQ=1 restores the old behaviour. */
+#define APU_VECTOR 5u
+/* Interrupts raised, and ISRs that claimed one. File scope so the freeze
+ * watchdog can say whether the line was silent or merely ignored. */
+static unsigned g_apu_raised, g_apu_claimed;
+
+static void kernel_apu_tick(void)
+{
+#define raised g_apu_raised
+    extern int mcpx_apu_irq_pending_global(void) __attribute__((weak));
+    static int off = -1;
+    static unsigned declined, backoff;
+    int claimed;
+
+    if (off < 0) off = getenv("RECOMP_APU_NO_IRQ") ? 1 : 0;
+    if (off || !mcpx_apu_irq_pending_global) return;
+    if (backoff) { backoff--; return; }
+    if (!xbox_GetConnectedInterrupt(APU_VECTOR)) return;
+
+    /* RECOMP_APU_FORCE_HZ=<n>: raise the line on a timer, not only when a
+     * voice has something to report.
+     *
+     * An experiment, and the reasoning behind it. DirectSound's Stop() sets
+     * "stop pending" and spins for the flag to clear; the only code that
+     * clears it is reached from this vector's handler; and this vector is
+     * raised only when the voice processor raises a notification -- which
+     * happens when a voice ENDS. So a stop requested on a voice that is still
+     * playing waits for a notification that waits for the stop. A run through
+     * the tutorial shows exactly that shape: eight VOICE_ON, four VOICE_OFF,
+     * ten interrupts, and then a thread spinning forever on the fifth voice.
+     *
+     * On the console the handler also runs on the voice processor's own frame
+     * cadence, which is what drains that queue and refills streaming buffers.
+     * Nothing here provides that cadence. If supplying it ends the spin, the
+     * missing cadence is the bug and this is where the fix belongs. */
+    /* Say what the sound hardware is doing every ten seconds, freeze or no
+     * freeze.
+     *
+     * These numbers only ever appeared inside the freeze report, so a healthy
+     * run -- which is most of them now -- printed nothing about audio at all,
+     * and the one measurement that matters (how often the voice processor
+     * raises a notification) could only be read from a run that had already
+     * gone wrong. One line every ten seconds costs nothing and makes a good
+     * run as informative as a bad one. */
+    { static long long said;
+      long long now2 = (long long)GetTickCount64();
+      extern void mcpx_apu_debug_line(char *, unsigned long) __attribute__((weak));
+      if (mcpx_apu_debug_line && now2 - said >= 10000) {
+          char line[320];
+          said = now2;
+          mcpx_apu_debug_line(line, sizeof line);
+          fprintf(stderr, "  [APU] %s\n", line);
+          fflush(stderr);
+      } }
+
+    { static long hz = -1; static long long next;
+      if (hz < 0) { const char *e = getenv("RECOMP_APU_FORCE_HZ");
+                    hz = e ? atol(e) : 0; }
+      if (hz > 0) {
+          long long now = (long long)GetTickCount64();
+          if (now < next) return;
+          next = now + (1000 / hz > 0 ? 1000 / hz : 1);
+      } else if (!mcpx_apu_irq_pending_global()) return; }
+
+    claimed = kernel_raise_interrupt(APU_VECTOR);
+    raised++;
+    if (claimed > 0) g_apu_claimed++;
+    if (raised <= 3 || (claimed <= 0 && declined < 3)) {
+        if (claimed <= 0) declined++;
+        fprintf(stderr, "  [APU] interrupt #%u -> ISR %s\n", raised,
+                claimed < 0 ? "not callable" :
+                claimed ? "claimed it" : "declined it");
+        fflush(stderr);
+    }
+    if (claimed <= 0) backoff = 16;
+#undef raised
+}
+
+/* What CRI's file device is doing, once a second.
+ *
+ * JSRF streams its music through CRI's cvFs layer: ADXT asks the device to
+ * read N sectors (sub_001403B0), a per-device server (sub_00140C30 ->
+ * sub_00140BA0) issues the actual NtReadFile and runs its completion, and the
+ * ADX decoder converts whatever has arrived. When the music stops, the decode
+ * rate goes to zero and the voice replays whatever is still in its ring --
+ * which sounds like a one-second loop, not like silence, and says nothing
+ * about which of those three stages stopped.
+ *
+ * Everything this needs is in guest memory at fixed addresses, so it can be
+ * read from outside without hooking anything: the device's re-entrancy guard,
+ * and the handle table. A guard stuck at 1 means the server returned without
+ * clearing it and every later call returns immediately; a handle stuck at
+ * state 2 with pending=1 means the read was accepted and never issued; state 2
+ * with pending=0 means it was issued and the completion never ran.
+ *
+ * Layout, from the title's own code:
+ *   handles: 40 of them, 0x00273780 + n * 0x150, live when byte[0] != 0
+ *     +0x01 state (0 idle, 1 done, 2 in flight, 3 error)
+ *     +0x0C sector size   +0x14 total sectors   +0x18 position
+ *     +0x140 byte offset  +0x144 byte length
+ *     +0x148 "issue me"   +0x14C "completion pending"
+ *   guard: 0x002615D8
+ */
+#define CVFS_GUARD   0x002615D8u
+#define CVFS_HANDLE0 0x00273780u
+#define CVFS_STRIDE  0x150u
+#define CVFS_COUNT   40
+static void kernel_cvfs_watch(void)
+{
+    static int on = -1;
+    static long long next;
+    static uint32_t last_pos[CVFS_COUNT];
+    static uint8_t  last_state[CVFS_COUNT];
+    long long now;
+    int n, live = 0;
+
+    if (on < 0) on = getenv("RECOMP_CVFS_WATCH") ? 1 : 0;
+    if (!on) return;
+    now = (long long)GetTickCount64();
+    if (next && now < next) return;
+    next = now + 1000;
+
+    for (n = 0; n < CVFS_COUNT; n++) {
+        uint32_t h = CVFS_HANDLE0 + (uint32_t)n * CVFS_STRIDE;
+        uint8_t used  = (uint8_t)(BRIDGE_MEM32(h) & 0xFF);
+        uint8_t state = (uint8_t)((BRIDGE_MEM32(h) >> 8) & 0xFF);
+        uint32_t pos, total, issue, pending;
+        if (!used) continue;
+        pos     = BRIDGE_MEM32(h + 0x18);
+        total   = BRIDGE_MEM32(h + 0x14);
+        issue   = BRIDGE_MEM32(h + 0x148);
+        pending = BRIDGE_MEM32(h + 0x14C);
+        /* Only when something changed, or something is stuck. */
+        if (state == last_state[n] && pos == last_pos[n] && state != 2)
+            continue;
+        live++;
+        fprintf(stderr, "  [CVFS] h%02d %08X state=%u pos=%u/%u issue=%u "
+                        "pending=%u off=%u len=%u%s\n",
+                n, h, state, pos, total, issue, pending,
+                BRIDGE_MEM32(h + 0x140), BRIDGE_MEM32(h + 0x144),
+                (state == 2 && pos == last_pos[n] && state == last_state[n])
+                    ? "   <-- STUCK" : "");
+        last_state[n] = state;
+        last_pos[n]   = pos;
+    }
+    if (live) {
+        fprintf(stderr, "  [CVFS] server guard @%08X = %u%s\n",
+                CVFS_GUARD, BRIDGE_MEM32(CVFS_GUARD),
+                BRIDGE_MEM32(CVFS_GUARD) ? "   <-- HELD: the server is dead" : "");
         fflush(stderr);
     }
 }
@@ -2635,7 +2889,10 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
                 prev_valid = 1;
             }
         }
+        kernel_freeze_watch(); /* has the picture stopped? */
         kernel_vblank_tick();  /* the GPU's frame clock */
+        kernel_apu_tick();     /* the APU's interrupt line */
+        kernel_cvfs_watch();   /* CRI's streaming file device */
         kernel_drain_dpcs();   /* deferred work, before due timers */
         now = (long long)GetTickCount64();
 
@@ -2840,15 +3097,41 @@ static HANDLE s_handle_table[BRIDGE_HANDLE_MAX];
 
 static uint32_t bridge_handle_token(HANDLE h)
 {
-    int i;
+    int i, used = 0;
     if (!h || h == INVALID_HANDLE_VALUE) return 0;
-    for (i = 1; i < BRIDGE_HANDLE_MAX; i++)
-        if (s_handle_table[i] == h) return BRIDGE_HANDLE_TAG | (uint32_t)i;
-    for (i = 1; i < BRIDGE_HANDLE_MAX; i++)
-        if (s_handle_table[i] == NULL) {
-            s_handle_table[i] = h;
-            return BRIDGE_HANDLE_TAG | (uint32_t)i;
-        }
+
+    /* A fresh slot every time, deliberately.
+     *
+     * This used to scan for an existing slot holding the same HANDLE and hand
+     * back its token. That is a reasonable-looking optimisation and it aliases
+     * unrelated objects, because a host HANDLE is a pointer and pointers get
+     * recycled. The sequence that broke the game: the title opens a thread and
+     * never closes it, so its slot keeps a pointer to a freed object; the host
+     * allocator later reuses that exact address for a FILE; the scan matches
+     * it; and from then on the title's thread token and the new file token are
+     * the same number, pointing at the file.
+     *
+     * Caught in the act -- NtSuspendThread(handle 0x48000004 -> 0xa2417d400)
+     * where 0xa2417d400 is, in the same log, the handle just returned by
+     * opening Z:\Media\Cache\DmCache04.tbl. The suspend fails, the title's
+     * CRT retries it forever, and on the stalled launches the title gives up
+     * and writes JSRF_FATAL.ERR -- a file that appears in failing runs and in
+     * no healthy one.
+     *
+     * With a fresh slot, a token always refers to the object it was made for.
+     * A stale token now points at a freed handle and fails loudly, which is a
+     * bug worth seeing, rather than quietly operating on somebody else's file.
+     * Slots are returned by NtClose, so the table does not grow without bound;
+     * the high-water mark is reported in case a title leaks enough to matter. */
+    for (i = 1; i < BRIDGE_HANDLE_MAX; i++) {
+        if (s_handle_table[i]) { used++; continue; }
+        s_handle_table[i] = h;
+        { static int hw;
+          if (used > hw + 1024) { hw = used;
+              fprintf(stderr, "  [BRIDGE] handle table now holding %d live "
+                              "handles\n", used); fflush(stderr); } }
+        return BRIDGE_HANDLE_TAG | (uint32_t)i;
+    }
     fprintf(stderr, "  [BRIDGE] handle table full\n");
     return 0;
 }
@@ -4075,7 +4358,9 @@ static void bridge_KeSetBasePriorityThread(void)
      * calling thread: it opts out of the guest scheduler lock. */
     if ((tok == 0xFFFFFFFEu) && inc <= -15) {
         extern void xbox_guest_lock_mark_idle(void);
-        xbox_guest_lock_mark_idle();
+        extern int xbox_guest_lock_idle_takes_lock(void);
+        if (!xbox_guest_lock_idle_takes_lock())
+            xbox_guest_lock_mark_idle();
     }
 }
 
@@ -4105,7 +4390,12 @@ static void bridge_MmLockUnlockBufferPages(void)
  */
 static void bridge_MmQueryAllocationSize(void)
 {
-    g_eax = xbox_HeapBlockSize(STACK_ARG(0));
+    /* XPhysicalAlloc/XPhysicalFree ask this about contiguous blocks to keep
+     * D3D's running total (and XPhysicalAlloc zeroes that many bytes), so
+     * the contiguous table answers first. */
+    uint32_t a = STACK_ARG(0);
+    uint32_t n = xbox_ContiguousBlockSize(a);
+    g_eax = n ? n : xbox_HeapBlockSize(a);
 }
 
 /* ── NtCreateMutant (ordinal 192, 3 args) */
@@ -4164,10 +4454,65 @@ static void bridge_NtReleaseMutant(void)
 static void bridge_NtSuspendThread(void)
 {
     uint32_t count_va = STACK_ARG(1);
+    uint32_t handle = STACK_ARG(0);
+    HANDLE h = bridge_resolve_handle(handle);
+    NTSTATUS st = xbox_NtSuspendThread(
+        h, count_va ? (PULONG)XBOX_TO_NATIVE(count_va) : NULL);
 
-    g_eax = (uint32_t)xbox_NtSuspendThread(
-        bridge_resolve_handle(STACK_ARG(0)),
-        count_va ? (PULONG)XBOX_TO_NATIVE(count_va) : NULL);
+    /* Say so when this fails, because the title will not.
+     *
+     * A failing suspend is invisible from the outside and catastrophic in
+     * effect: the caller converts the status to a DOS error and tries again,
+     * forever. In this title that loop reached THIRTY-ONE MILLION calls in a
+     * hundred seconds -- ordinals 231 and 301 alternating, one thread burning
+     * a core while the audio it was supposed to be driving never advanced a
+     * single buffer segment. The counters said the sound hardware was idle;
+     * the reason was here, three layers up.
+     *
+     * Rate-limited to the first few and then once a second: a message per
+     * call would be thirty-one million lines. */
+    if (st < 0) {
+        static long long said; static unsigned n;
+        long long now = (long long)GetTickCount64();
+        if (n < 5 || now - said >= 1000) {
+            said = now; n++;
+            fprintf(stderr, "  [SUSPEND] NtSuspendThread(handle 0x%08X -> %p)"
+                            " failed: 0x%08X  (call %u from guest 0x%08X)\n",
+                    handle, (void *)h, (unsigned)st, n, gcs_caller());
+            fflush(stderr);
+        }
+
+        /* Report success anyway, unless asked not to.
+         *
+         * This is a workaround and worth being honest about. The handle the
+         * title passes here does not resolve to a thread object -- often it
+         * is zero -- so the suspend cannot be performed, and the caller is
+         * the CRT's thread wrapper, which converts the failure with
+         * RtlNtStatusToDosError and tries again. Forever. Measured in one
+         * stuck launch: 26,956,082 calls to this and 26,956,068 to the error
+         * conversion, one thread burning a core, the game never leaving the
+         * first loading screen.
+         *
+         * Failing is therefore strictly worse than lying: on the console this
+         * call succeeds, and the thread the title believes it parked is one
+         * that is already idle or irrelevant. Returning success with a
+         * previous count of zero breaks the livelock and leaves the title's
+         * bookkeeping exactly where the console would have left it.
+         *
+         * What it does NOT do is fix the real defect, which is upstream: that
+         * handle should have been a valid thread. Whoever picks this up should
+         * find who produced it -- most likely a thread creation that never
+         * wrote its handle back -- and then this can go. RECOMP_SUSPEND_STRICT=1
+         * restores the honest failure for that investigation. */
+        { static int strict = -1;
+          if (strict < 0) strict = getenv("RECOMP_SUSPEND_STRICT") ? 1 : 0;
+          if (!strict) {
+              if (count_va) BRIDGE_MEM32(count_va) = 0;
+              g_eax = 0;   /* STATUS_SUCCESS */
+              return;
+          } }
+    }
+    g_eax = (uint32_t)st;
 }
 
 /* ── NtResumeThread (ordinal 224, 2 args) */
@@ -5661,8 +6006,17 @@ static void kernel_watch_arm_once(void)
         g_kernel_watch_va = (uint32_t)strtoul(env, NULL, 0);
 }
 
-/* Current dispatching slot */
-static int g_kernel_dispatch_slot = -1;
+/* Current dispatching slot.
+ *
+ * Per thread. recomp_lookup_kernel() stores the slot and the caller then
+ * calls kernel_thunk_dispatch(), which reads it back; a guest thread that
+ * runs outside the guest lock (an idle-priority one) doing its own lookup in
+ * between made another thread's call run as the wrong ordinal, with the wrong
+ * argument count popped. JSRF showed it as ObfDereferenceObject from XAPI's
+ * SetThreadPriority arriving as NtSuspendThread(NULL), and GetThreadPriority
+ * returning with esp 4 high and esi zeroed -- which took CRI's file handle
+ * out of its register and stopped the music stream. */
+static RECOMP_TLS int g_kernel_dispatch_slot = -1;
 
 /* ── Guest scheduler lock: one guest thread runs at a time ──────────────
  *
@@ -5683,6 +6037,85 @@ static int g_kernel_dispatch_slot = -1;
  * RECOMP_GUEST_LOCK=0 disables it. */
 static CRITICAL_SECTION g_guest_lock;
 static volatile unsigned long g_lock_owner;   /* see xbox_guest_lock_report */
+#ifdef __APPLE__
+#include <pthread.h>
+#include <mach/mach.h>
+#include <dlfcn.h>
+static pthread_t g_lock_owner_pt;
+/* The whole chain, once per stall. Two frames say "in mach_msg2_trap", which
+ * is where half of the system waits; the frames above it say who is waiting
+ * and for what. The holder is suspended only while its frame records are
+ * copied -- no allocation, no locks in that window -- and symbolised after
+ * it runs again. Frame records are [previous fp, return address] on arm64;
+ * system libraries sign the return address, so the top bits are stripped. */
+static volatile long long g_lock_since;   /* defined below; the stall this is */
+static void lock_holder_backtrace(mach_port_t mt)
+{
+    static long long printed_for = -1;
+    arm_thread_state64_t st;
+    mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+    uint64_t fr[32];
+    int n = 0, i;
+    uint64_t hi, lo, fp, prev = 0;
+    if (printed_for == g_lock_since || pthread_equal(g_lock_owner_pt, pthread_self()))
+        return;
+    printed_for = g_lock_since;
+    hi = (uint64_t)(uintptr_t)pthread_get_stackaddr_np(g_lock_owner_pt);
+    lo = hi - (uint64_t)pthread_get_stacksize_np(g_lock_owner_pt);
+    if (thread_suspend(mt) != KERN_SUCCESS)
+        return;
+    if (thread_get_state(mt, ARM_THREAD_STATE64, (thread_state_t)&st, &cnt) == KERN_SUCCESS) {
+        fr[n++] = (uint64_t)arm_thread_state64_get_pc(st);
+        fr[n++] = (uint64_t)arm_thread_state64_get_lr(st);
+        fp = (uint64_t)arm_thread_state64_get_fp(st);
+        while (n < 32 && fp > prev && fp >= lo && fp + 16 <= hi && !(fp & 7)) {
+            uint64_t next = ((const uint64_t *)(uintptr_t)fp)[0];
+            uint64_t ret  = ((const uint64_t *)(uintptr_t)fp)[1] & 0x00007FFFFFFFFFFFull;
+            if (!ret)
+                break;
+            fr[n++] = ret;
+            prev = fp;
+            fp = next;
+        }
+    }
+    thread_resume(mt);
+    fprintf(stderr, "  [LOCK] holder's stack (%d frames):\n", n);
+    for (i = 0; i < n; i++) {
+        Dl_info di;
+        uint64_t a = fr[i] & 0x00007FFFFFFFFFFFull;
+        if (!dladdr((void *)(uintptr_t)a, &di)) di.dli_sname = NULL, di.dli_saddr = NULL, di.dli_fname = NULL;
+        fprintf(stderr, "        #%-2d %#llx %s+0x%llx  (%s)\n", i, (unsigned long long)a,
+                di.dli_sname ? di.dli_sname : "?",
+                (unsigned long long)(a - (uint64_t)(uintptr_t)di.dli_saddr),
+                di.dli_fname ? (strrchr(di.dli_fname, '/') ? strrchr(di.dli_fname, '/') + 1 : di.dli_fname) : "?");
+    }
+}
+/* Where the holder is. A guest thread that holds the lock for seconds is
+ * spinning in guest code with no kernel calls (a loop that makes calls
+ * reaches the yield hook), and the [THREADS] report can only say what it
+ * called last. Its native program counter, read from outside, lands in a
+ * lifted function whose name is the guest address -- the same thing a
+ * `sample` of the process gives, without needing the process kept alive
+ * for someone to run it. */
+static void lock_holder_where(void)
+{
+    mach_port_t mt = pthread_mach_thread_np(g_lock_owner_pt);
+    arm_thread_state64_t st;
+    mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+    Dl_info pi, li;
+    uint64_t pc, lr;
+    if (!mt || thread_get_state(mt, ARM_THREAD_STATE64, (thread_state_t)&st, &cnt) != KERN_SUCCESS)
+        return;
+    pc = (uint64_t)arm_thread_state64_get_pc(st);
+    lr = (uint64_t)arm_thread_state64_get_lr(st);
+    if (!dladdr((void *)pc, &pi)) pi.dli_sname = NULL, pi.dli_saddr = NULL;
+    if (!dladdr((void *)lr, &li)) li.dli_sname = NULL, li.dli_saddr = NULL;
+    fprintf(stderr, "  [LOCK] holder is at %s+0x%llx (pc %#llx), called from %s+0x%llx\n",
+            pi.dli_sname ? pi.dli_sname : "?", pc - (uint64_t)(uintptr_t)pi.dli_saddr, pc,
+            li.dli_sname ? li.dli_sname : "?", lr - (uint64_t)(uintptr_t)li.dli_saddr);
+    lock_holder_backtrace(mt);
+}
+#endif
 /* How many guest threads are queueing for the lock right now. Used by the
  * yield to decide whether standing back is worth anything. */
 static volatile int g_lock_waiters;
@@ -5711,6 +6144,19 @@ static unsigned lock_slot(void)
     return (unsigned)t_lock_slot;
 }
 static int g_guest_lock_enabled = -1;
+/* RECOMP_LOCK_IDLE=1: idle-priority threads take the guest lock like any
+ * other. JSRF needs it: CRI's ADXM idle thread (start 0x0013B2A0, created at
+ * THREAD_PRIORITY_IDLE by ADXM_SetupThrd) does real file and decode work, and
+ * outside the lock it ran concurrently with the threads CRI assumes it cannot
+ * preempt. The one thread the exemption was made for, the `while (!exit)
+ * counter++` spinner at 0x0013B180, now runs natively and marks itself idle
+ * explicitly (recomp_manual.c), so it no longer depends on this. */
+int xbox_guest_lock_idle_takes_lock(void)
+{
+    static int v = -1;
+    if (v < 0) v = getenv("RECOMP_LOCK_IDLE") ? 1 : 0;
+    return v;
+}
 static RECOMP_TLS int t_guest_holds;
 static RECOMP_TLS int t_guest_idle;
 static RECOMP_TLS long long t_guest_since;
@@ -5759,13 +6205,11 @@ void xbox_guest_lock_acquire(void)
      * crash for a possible hang, and which of those is worse is not something
      * to decide without measuring both.
      */
-    { static int lock_idle = -1;
-      if (lock_idle < 0) lock_idle = getenv("RECOMP_LOCK_IDLE") ? 1 : 0;
-      if (!lock_idle
-       && GetThreadPriority(GetCurrentThread()) <= THREAD_PRIORITY_IDLE) {
-          t_guest_idle = 1;
-          return;
-      } }
+    if (!xbox_guest_lock_idle_takes_lock()
+     && GetThreadPriority(GetCurrentThread()) <= THREAD_PRIORITY_IDLE) {
+        t_guest_idle = 1;
+        return;
+    }
     if (t_guest_idle) {
         static int said;
         t_guest_idle = 0;
@@ -5796,6 +6240,9 @@ void xbox_guest_lock_acquire(void)
     t_guest_holds = 1;
     t_guest_since = (long long)GetTickCount64();
     g_lock_owner = GetCurrentThreadId();
+#ifdef __APPLE__
+    g_lock_owner_pt = pthread_self();
+#endif
     g_lock_since = t_guest_since;
 }
 
@@ -5841,10 +6288,14 @@ void xbox_guest_lock_report(void)
     if (now - since < 500) return;
     if (now - said < 1000) return;
     said = now;
-    fprintf(stderr, "  [LOCK] thread %lu has held the guest lock for %lld ms\n",
-            owner, now - since);
+    fprintf(stderr, "  [LOCK] thread %lu has held the guest lock for %lld ms"
+                    " (critical-section handoffs %lu, free releases %lu)\n",
+            owner, now - since, g_cs_handoffs, g_cs_free_releases);
     { extern void xbox_kernel_thread_report(void);
       xbox_kernel_thread_report(); }
+#ifdef __APPLE__
+    if (now - since >= 3000) lock_holder_where();
+#endif
     fflush(stderr);
 }
 
@@ -5881,6 +6332,210 @@ void xbox_guest_lock_release(void)
     g_lock_owner = 0;
     LeaveCriticalSection(&g_guest_lock);
 }
+/* Stand back for a moment inside a guest spin that has no calls in it.
+ *
+ * A lifted loop that only tests memory never reaches the entry hook, so a
+ * guest thread spinning on a flag holds the guest lock for as long as the
+ * spin lasts. That is fine when another guest thread clears the flag, and
+ * fatal when the thing that clears it is an interrupt: the ISR runs on the
+ * kernel timer thread, the timer thread needs the guest lock to run it, and
+ * the lock is held by the very spin the ISR would end. The two wait for each
+ * other and the game stops -- reported as "held the guest lock for 18723 ms"
+ * with the holder inside DirectSound's stop-pending wait.
+ *
+ * Dropping the lock for a moment between polls is all that is needed: the
+ * timer thread takes it, delivers the APU interrupt, DirectSound retires the
+ * voice and clears the bit, and the spin ends on its next look.
+ *
+ * The first few dozen polls yield without sleeping, because the wait this was
+ * written for normally ends within a frame and 100 us a poll would make a
+ * routine stop cost milliseconds. Only a wait that has already gone on starts
+ * sleeping.
+ *
+ * The counter restarts when there has been a gap since the previous poll, so
+ * it measures ONE wait rather than every wait this thread has ever done --
+ * otherwise a healthy run would eventually print the complaint below. It
+ * exists because a spin that yields politely forever is a hang with better
+ * manners, and silence is how the first one hid.
+ *
+ * Both lock helpers no-op when this thread does not hold the lock, so this is
+ * safe to call from anywhere. */
+/* Witnesses: has the code that is SUPPOSED to end this wait run at all?
+ *
+ * "The flag never clears" has two completely different causes and the spin
+ * itself cannot tell them apart: either the clearing code never runs, or it
+ * runs and decides not to clear. One witness counter at the top of each
+ * relevant function separates them in a single run, which is cheaper than
+ * another round of reading disassembly and guessing. Incremented from the
+ * generated bodies; see the headers on those functions. */
+unsigned long g_spin_witness[SPIN_WITNESS_N];
+/* Interrupts delivered from inside a spin rather than on the timer thread. */
+static unsigned long g_spin_isrs;
+static const char *const g_spin_witness_name[SPIN_WITNESS_N] = {
+    "sub_001A2681 (DirectSound voice service, root of the chain)",
+    "sub_001A2E2E (the only code that clears bit 0x8000)",
+    "sub_001A2E2E reached the clear itself",
+};
+
+void recomp_guest_spin_yield(uint32_t site_va, uint32_t obj_va, uint32_t flags)
+{
+    static RECOMP_TLS unsigned long polls;
+    static RECOMP_TLS long long started, last, said;
+    long long now = (long long)GetTickCount64();
+
+    if (!last || now - last > 50) { polls = 0; started = now; said = 0; }
+    last = now;
+
+    xbox_guest_lock_release();
+    if (++polls < 64) sched_yield();
+    else              usleep(100);
+    xbox_guest_lock_acquire();
+
+    /* Take the interrupt HERE, on the thread that is spinning.
+     *
+     * This is the difference between a console and this port, and it is the
+     * whole reason the title deadlocks. DirectSound sets "stop pending", then
+     * spins for it to clear WHILE HOLDING its own critical section, and the
+     * code that clears it needs that same critical section. On the console
+     * that is not a deadlock, because the APU's interrupt preempts the
+     * spinning thread itself -- and an Xbox critical section is recursive per
+     * thread, so the handler's acquire succeeds immediately, retires the
+     * voice, clears the flag, and the spin ends on its next look.
+     *
+     * Here the interrupt was delivered on the kernel timer thread, a
+     * different thread, which blocks on that critical section and never
+     * arrives. Both threads then wait for each other. Delivering it on this
+     * thread restores the console's behaviour exactly: same handler, same
+     * lock, same owner.
+     *
+     * The register set is saved and restored around it because that is also
+     * what the hardware does and what this port otherwise does not: the
+     * lifted registers are ordinary variables, so a handler running "between"
+     * two instructions of the spin would leave ecx pointing somewhere else
+     * and the loop would poll the wrong address forever. ebp is a function
+     * local in generated code and needs no saving; g_seh_ebp does.
+     *
+     * in_isr keeps a handler that spins from re-entering itself. */
+    {
+        extern int mcpx_apu_irq_pending_global(void) __attribute__((weak));
+        extern unsigned char xbox_KeCurrentIrql(void);
+        static RECOMP_TLS int in_isr;
+        static int on = -1, irql_gate = -1, force_polls = -1;
+        if (force_polls < 0) { const char *e = getenv("RECOMP_SPIN_ISR_FORCE");
+                               force_polls = e ? atoi(e) : 0; }
+        if (on < 0) { const char *e = getenv("RECOMP_SPIN_ISR");
+                      on = e ? atoi(e) : 1; }
+        /* Not while the title has masked it -- and DISPATCH_LEVEL does not
+         * mask it.
+         *
+         * This gate was first written as "IRQL < DISPATCH_LEVEL", on the
+         * theory that DirectSound raises IRQL to keep its own interrupt
+         * handler out of its structures. That is wrong twice over, and it
+         * cost a working build.
+         *
+         * Wrong about the hardware: raising to DISPATCH_LEVEL blocks DPCs and
+         * thread preemption, not device interrupts. A device interrupt is
+         * masked only at or above its own IRQL, which is higher than
+         * DISPATCH. So on a console the APU interrupt arrives perfectly well
+         * while a thread sits at DISPATCH_LEVEL -- which is exactly the case
+         * here, because DirectSound's stop-pending spin runs at DISPATCH.
+         * Gating at 2 therefore withheld the one interrupt that ends that
+         * spin, and the deadlock this whole mechanism exists to break came
+         * straight back: "froze pushing new game".
+         *
+         * Wrong about the evidence: the gate was added to stop a crash in a
+         * scene-graph walk, and that crash turned out to be an artefact of a
+         * test environment that was missing RECOMP_ABI_RESTORE. It reproduces
+         * with this delivery disabled entirely, and it predates the delivery
+         * being written. The gate was fixing something that was never broken.
+         *
+         * What remains true is that SOME level must mask it, or a handler
+         * that runs at device IRQL could re-enter itself. Above DISPATCH is
+         * the honest threshold: it masks nothing the console would deliver,
+         * and still holds the interrupt pending -- exactly as the hardware
+         * holds it -- for the one case that matters. */
+        /* The threshold is a setting, and its default is "never mask".
+         *
+         * Guessing it wrong is expensive: at 2 it withheld the interrupt that
+         * ends DirectSound's spin and the freeze came back, and the crash the
+         * gate was added for turned out to be a test-harness artefact. The
+         * build that demonstrably reached the tutorial had no gate at all, so
+         * that is the default, and the threshold is settable rather than
+         * argued about. RECOMP_SPIN_ISR_IRQL=<n>: hold the interrupt when the
+         * title's IRQL is n or above. */
+        if (irql_gate < 0) { const char *e = getenv("RECOMP_SPIN_ISR_IRQL");
+                             irql_gate = e ? atoi(e) : 99; }
+        /* RECOMP_SPIN_ISR_FORCE=<polls>: once a spin has gone on this long,
+         * run the handler whether or not the hardware says an interrupt is
+         * pending.
+         *
+         * Measurement, not a guess: with the mask wide open, ZERO interrupts
+         * were delivered to the spinning thread, because ISTS is zero -- the
+         * voice processor has nothing to report. So the deadlock is not "the
+         * interrupt cannot get through", it is "there is no interrupt". The
+         * handler is nevertheless the only code that can end this wait, and
+         * whether running it unprompted ends the wait decides what the real
+         * bug is: if it does, the APU is failing to raise a notification it
+         * owes; if it does not, the handler needs something else entirely.
+         *
+         * Off unless asked for. Running a driver's interrupt handler when its
+         * device did not ask is not something to do quietly in a shipping
+         * build. */
+        if (force_polls > 0 && polls == (unsigned long)force_polls
+            && !in_isr && xbox_GetConnectedInterrupt(APU_VECTOR)) {
+            uint32_t s_eax = g_eax, s_ecx = g_ecx, s_edx = g_edx;
+            uint32_t s_ebx = g_ebx, s_esi = g_esi, s_edi = g_edi;
+            uint32_t s_esp = g_esp, s_seh = g_seh_ebp;
+            int r;
+            in_isr = 1;
+            r = kernel_raise_interrupt_locked(APU_VECTOR);
+            in_isr = 0;
+            g_eax = s_eax; g_ecx = s_ecx; g_edx = s_edx;
+            g_ebx = s_ebx; g_esi = s_esi; g_edi = s_edi;
+            g_esp = s_esp; g_seh_ebp = s_seh;
+            g_spin_isrs++;
+            fprintf(stderr, "  [SPIN] ran the APU handler unprompted after %lu"
+                            " polls; it returned %d\n", polls, r);
+            fflush(stderr);
+        }
+        if (on && !in_isr && xbox_KeCurrentIrql() < irql_gate
+            && mcpx_apu_irq_pending_global
+            && xbox_GetConnectedInterrupt(APU_VECTOR)
+            && mcpx_apu_irq_pending_global()) {
+            uint32_t s_eax = g_eax, s_ecx = g_ecx, s_edx = g_edx;
+            uint32_t s_ebx = g_ebx, s_esi = g_esi, s_edi = g_edi;
+            uint32_t s_esp = g_esp, s_seh = g_seh_ebp;
+            in_isr = 1;
+            kernel_raise_interrupt_locked(APU_VECTOR);
+            in_isr = 0;
+            g_eax = s_eax; g_ecx = s_ecx; g_edx = s_edx;
+            g_ebx = s_ebx; g_esi = s_esi; g_edi = s_edi;
+            g_esp = s_esp; g_seh_ebp = s_seh;
+            g_spin_isrs++;
+        }
+    }
+
+    if (now - started >= 5000 && now - said >= 5000) {
+        int i;
+        said = now;
+        fprintf(stderr, "  [SPIN] thread %lu has been spinning at 0x%08X for "
+                        "%lld ms (%lu polls), waiting on object 0x%08X whose "
+                        "flags are 0x%04X\n",
+                (unsigned long)GetCurrentThreadId(), site_va,
+                now - started, polls, obj_va, flags & 0xFFFFu);
+        { extern unsigned char xbox_KeCurrentIrql(void);
+          fprintf(stderr, "  [SPIN]   this thread is at IRQL %u; interrupts "
+                  "delivered on it: %lu\n",
+                  (unsigned)xbox_KeCurrentIrql(), g_spin_isrs); }
+        for (i = 0; i < SPIN_WITNESS_N; i++)
+            fprintf(stderr, "  [SPIN]   %-58s %lu time(s)\n",
+                    g_spin_witness_name[i], g_spin_witness[i]);
+        { extern void xbox_kernel_thread_report(void);
+          xbox_kernel_thread_report(); }
+        fflush(stderr);
+    }
+}
+
 /* Called from the function-entry trace hook: hand the CPU over after a
  * slice, the way the console's scheduler would on a timer tick. */
 /*
@@ -6008,7 +6663,7 @@ void xbox_guest_lock_mark_idle(void)
 #define WAITLOG_SLOTS 64
 typedef struct {
     unsigned long long tid;
-    uint32_t ordinal, object, caller;
+    uint32_t ordinal, object, caller, caller2;
     unsigned long long waits, timeouts;
     long long total_ms, max_ms;
     long long last_timeout_ms;   /* the timeout the caller asked for, ms */
@@ -6046,7 +6701,7 @@ static int waitlog_is_wait(ULONG o)
      * and a thread queued behind a lock look identical from outside, and the
      * two are cured by opposite changes. */
     return o == 99 || o == 158 || o == 159 || o == 233 || o == 234 || o == 235
-        || o == 277;
+        || o == 277 || o == 160 || o == 161;
 }
 static int waitlog_is_signal(ULONG o)
 {
@@ -6079,7 +6734,35 @@ static long long waitlog_timeout_ms(ULONG ordinal)
     }
 }
 
+/* One frame further up than `caller`.
+ *
+ * A lock taken fifty thousand times a second is never interesting at the
+ * place that takes it -- that is the C runtime's own two-line helper, and it
+ * is the same address every time. The question is who called the helper, and
+ * the guest stack still holds it: the helper is a leaf, so its own return
+ * address sits directly above the argument the kernel call was given. */
+static uint32_t waitlog_grandparent(ULONG ordinal)
+{
+    /* Scanned, not indexed. A fixed offset assumes the helper's frame is the
+     * shape it looks like in one listing, and the first attempt at this read
+     * back 0x18 and 0x24 -- structure offsets, not code. These are FPO frames
+     * with no ebp chain to walk, so the honest thing is what the crash handler
+     * already does: look up the stack for the first value that lies inside the
+     * title's own code, skipping the call site this bridge was reached from.
+     */
+    uint32_t i;
+    if (ordinal != 277 && ordinal != 294 && ordinal != 160 && ordinal != 161)
+        return 0;
+    for (i = 1; i < 12; i++) {
+        uint32_t v = (uint32_t)BRIDGE_MEM32(g_esp + i * 4);
+        if (v > g_xbox_code_lo && v < g_xbox_code_hi && v != g_xbox_kernel_caller)
+            return v;
+    }
+    return 0;
+}
+
 static void waitlog_record(ULONG ordinal, uint32_t object, uint32_t caller,
+                           uint32_t caller2,
                            long long ms, long long asked_ms, uint32_t status)
 {
     long i, n;
@@ -6089,11 +6772,12 @@ static void waitlog_record(ULONG ordinal, uint32_t object, uint32_t caller,
     n = g_waitlog_n;
     for (i = 0; i < n; i++)
         if (g_waitlog[i].tid == tid && g_waitlog[i].ordinal == (uint32_t)ordinal
-            && g_waitlog[i].object == object) { r = &g_waitlog[i]; break; }
+            && g_waitlog[i].object == object
+            && g_waitlog[i].caller2 == caller2) { r = &g_waitlog[i]; break; }
     if (!r && n < WAITLOG_SLOTS) {
         r = &g_waitlog[n];
         r->tid = tid; r->ordinal = (uint32_t)ordinal; r->object = object;
-        r->caller = caller;
+        r->caller = caller; r->caller2 = caller2;
         g_waitlog_n = n + 1;
     }
     if (r) {
@@ -6174,10 +6858,12 @@ void xbox_waitlog_report(void)
         long long dms = r->total_ms - prev[i].total_ms;
         prev[i] = *r;
         if (!dw) continue;
-        fprintf(stderr, "  [WAITLOG] tid %-6llu ord %-3u obj 0x%08X from 0x%08X:"
+        fprintf(stderr, "  [WAITLOG] tid %-6llu ord %-3u obj 0x%08X from 0x%08X"
+                "%s%08X:"
                 " %.1f waits/s (%llu), %llu timeouts (%.0f%%), %.0f ms/s inside,"
                 " %.1f ms each, asked %s (%lld), max %lld ms\n",
                 r->tid, r->ordinal, r->object, r->caller,
+                r->caller2 ? " via 0x" : "", r->caller2,
                 (double)dw / secs, (unsigned long long)dw,
                 (unsigned long long)dt, dw ? 100.0 * (double)dt / (double)dw : 0.0,
                 (double)dms / secs, (double)dms / (double)dw,
@@ -6255,6 +6941,12 @@ typedef struct {
     volatile long long entered_ms; /* when the call began */
     volatile long long left_ms;    /* when it returned; 0 while inside */
     volatile unsigned long long calls;
+    /* The thread's own mach port, recorded by the thread itself because only
+     * it can ask for it. With this, a watchdog on another thread can read
+     * this one's program counter -- which is the only way to see a thread
+     * that is stuck in guest code and therefore making no kernel calls at
+     * all, the exact case the rest of this table cannot describe. */
+    volatile uint32_t mport;
 } KThreadState;
 static KThreadState g_kthreads[KTHREAD_SLOTS];
 static volatile long g_kthread_n;
@@ -6272,6 +6964,9 @@ static KThreadState *kthread_slot(void)
         if (i < KTHREAD_SLOTS) {
             g_kthread_n = i + 1;
             g_kthreads[i].tid = (unsigned long long)(uintptr_t)GetCurrentThreadId();
+#ifdef __APPLE__
+            g_kthreads[i].mport = (uint32_t)pthread_mach_thread_np(pthread_self());
+#endif
             t_kthread = &g_kthreads[i];
         } else {
             t_kthread = &g_kthreads[KTHREAD_SLOTS - 1];
@@ -6286,6 +6981,88 @@ static KThreadState *kthread_slot(void)
 static void kthread_report(void);
 void xbox_kernel_thread_report(void);
 void xbox_kernel_thread_report(void) { kthread_report(); }
+
+#ifdef __APPLE__
+/* Where one thread is, read from another. Same trick as lock_holder_where,
+ * generalised: the symbol a lifted function was given is its guest address,
+ * so a native program counter names the guest code being executed. */
+static void thread_where(uint32_t mport, unsigned long long tid)
+{
+    arm_thread_state64_t st;
+    mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+    Dl_info pi, li;
+    uint64_t pc, lr;
+    if (!mport) return;
+    if (thread_get_state((mach_port_t)mport, ARM_THREAD_STATE64,
+                         (thread_state_t)&st, &cnt) != KERN_SUCCESS)
+        return;
+    pc = (uint64_t)arm_thread_state64_get_pc(st);
+    lr = (uint64_t)arm_thread_state64_get_lr(st);
+    if (!dladdr((void *)pc, &pi)) { pi.dli_sname = NULL; pi.dli_saddr = NULL; }
+    if (!dladdr((void *)lr, &li)) { li.dli_sname = NULL; li.dli_saddr = NULL; }
+    fprintf(stderr, "  [FROZEN]   tid %-6llu is in %s+0x%llx, called from %s\n",
+            tid,
+            pi.dli_sname ? pi.dli_sname : "?",
+            pc - (uint64_t)(uintptr_t)pi.dli_saddr,
+            li.dli_sname ? li.dli_sname : "?");
+}
+#endif
+
+/* Say so when the picture stops, and say who stopped it.
+ *
+ * Every freeze so far has cost a round trip: the game stops, the log says
+ * nothing in particular, and finding the stuck thread means another build
+ * with another probe in it. The information needed is the same every time --
+ * which threads exist, what each last asked the kernel for, and what guest
+ * code each is executing right now -- so gather it unconditionally the moment
+ * the frame counter stops moving.
+ *
+ * Four seconds, because the title's own loading pauses are shorter than that
+ * and a frozen game is not going to un-freeze at five. Repeats every ten
+ * seconds while it lasts, so a log from a player who walked away is bounded.
+ *
+ * Runs on the kernel timer thread, which takes no guest lock to do any of
+ * this -- deliberately, since the thread being diagnosed is quite likely the
+ * one holding it. */
+static void kernel_freeze_watch(void)
+{
+    extern unsigned long nv2a_gl_progress(void) __attribute__((weak));
+    static unsigned long last_frames;
+    static long long since, said;
+    long long now = (long long)GetTickCount64();
+    unsigned long frames;
+
+    if (!nv2a_gl_progress) return;
+    frames = nv2a_gl_progress();
+    if (!since || frames != last_frames) {
+        last_frames = frames; since = now; said = 0;
+        return;
+    }
+    if (now - since < 4000) return;
+    if (said && now - said < 10000) return;
+    said = now;
+
+    fprintf(stderr, "\n  [FROZEN] nothing has been presented for %lld ms "
+                    "(still at frame %lu). Every guest thread:\n",
+            now - since, frames);
+    {   extern void mcpx_apu_debug_line(char *, unsigned long) __attribute__((weak));
+        char line[256];
+        if (mcpx_apu_debug_line) {
+            mcpx_apu_debug_line(line, sizeof line);
+            fprintf(stderr, "  [FROZEN] APU: %s\n", line);
+        }
+        fprintf(stderr, "  [FROZEN] APU interrupts: %u raised, %u claimed by "
+                        "the title's ISR\n", g_apu_raised, g_apu_claimed);
+    }
+    kthread_report();
+#ifdef __APPLE__
+    {   long i, n = g_kthread_n;
+        for (i = 0; i < n; i++)
+            thread_where(g_kthreads[i].mport, g_kthreads[i].tid);
+    }
+#endif
+    fflush(stderr);
+}
 
 static void kthread_report(void)
 {
@@ -6513,10 +7290,11 @@ static void kernel_thunk_dispatch(void)
         int blocks = kernel_call_blocks(ordinal);
         int wl = waitlog_on();
         long long wl_t0 = 0, wl_asked = -1;
-        uint32_t wl_obj = 0, wl_caller = 0;
+        uint32_t wl_obj = 0, wl_caller = 0, wl_caller2 = 0;
         if (wl && (waitlog_is_wait(ordinal) || waitlog_is_signal(ordinal))) {
             wl_obj = (ordinal == 99) ? 0u : STACK_ARG(0);
             wl_caller = g_xbox_kernel_caller;
+            wl_caller2 = waitlog_grandparent(ordinal);
             if (waitlog_is_wait(ordinal)) {
                 wl_asked = waitlog_timeout_ms(ordinal);
                 wl_t0 = (long long)GetTickCount64();
@@ -6529,7 +7307,7 @@ static void kernel_thunk_dispatch(void)
         if (blocks) xbox_guest_lock_acquire();
         if (wl) {
             if (waitlog_is_wait(ordinal))
-                waitlog_record(ordinal, wl_obj, wl_caller,
+                waitlog_record(ordinal, wl_obj, wl_caller, wl_caller2,
                                (long long)GetTickCount64() - wl_t0,
                                wl_asked, g_eax);
             else
@@ -6815,4 +7593,259 @@ void xbox_kernel_bridge_init(void)
     fprintf(stderr, "  Synthetic VA range: 0x%08X-0x%08X\n",
             KERNEL_VA_BASE, KERNEL_VA_BASE + (resolved - 1) * 4);
 
+}
+
+/* ---- store watch: who writes a given piece of guest memory ------------------
+ *
+ * The other half of RECOMP_WATCH in recomp_types.h. The skeleton that folds
+ * the tutorial's characters in half reaches the GPU as matrices copied out of
+ * guest RAM, and the recompiled function that fills them is the one to read.
+ * Grep cannot find it -- the addresses are computed -- so the store helpers
+ * compare every guest write against a window and call here on a hit.
+ *
+ *   RECOMP_WATCH=0x19C448:0x800    first window, start:length
+ *   RECOMP_WATCH2=0x264000:0x2000  optional second window
+ *
+ * This function is deliberately out of line: its return address then points
+ * into the recompiled function whose store was inlined around the call, and
+ * that address, less the ASLR slide, is what `atos` needs to name it. */
+#include <mach-o/dyld.h>
+#include <time.h>
+#include <execinfo.h>
+
+uint32_t g_recomp_watch_lo, g_recomp_watch_span;
+uint32_t g_recomp_watch2_lo, g_recomp_watch2_span;
+
+static void watch_parse(const char *v, uint32_t *lo, uint32_t *span)
+{
+    char *end = NULL;
+    unsigned long a, n;
+    if (!v || !*v) return;
+    a = strtoul(v, &end, 0);
+    if (!end || *end != ':') return;
+    n = strtoul(end + 1, NULL, 0);
+    *lo = (uint32_t)a; *span = (uint32_t)n;
+    fprintf(stderr, "[WATCH] armed: guest %08lX..%08lX\n", a, a + n);
+}
+
+__attribute__((constructor)) static void watch_init(void)
+{
+    watch_parse(getenv("RECOMP_WATCH"),  &g_recomp_watch_lo,  &g_recomp_watch_span);
+    watch_parse(getenv("RECOMP_WATCH2"), &g_recomp_watch2_lo, &g_recomp_watch2_span);
+}
+
+__attribute__((noinline, used))
+void recomp_watch_hit(uint32_t a, uint32_t n)
+{
+    /* One record per distinct store site, with the call chain that reached
+     * it. The chain matters: if the store is D3D's constant upload, the
+     * interesting function is the game code two frames up that called it. */
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    static struct { uintptr_t ra; uint32_t amin, amax; unsigned long hits;
+                    void *bt[7]; int nbt; } seen[64];
+    static int nseen;
+    static unsigned long total;
+    static struct timespec last;
+    uintptr_t ra = (uintptr_t)__builtin_return_address(0);
+    struct timespec now;
+    int i;
+
+    pthread_mutex_lock(&mu);
+    total++;
+    for (i = 0; i < nseen; i++) if (seen[i].ra == ra) break;
+    if (i == nseen && nseen < 64) {
+        seen[nseen].ra = ra; seen[nseen].amin = a; seen[nseen].amax = a + n;
+        seen[nseen].hits = 0;
+        seen[nseen].nbt = backtrace(seen[nseen].bt, 7);
+        nseen++;
+    }
+    if (i < nseen) {
+        seen[i].hits++;
+        if (a < seen[i].amin) seen[i].amin = a;
+        if (a + n > seen[i].amax) seen[i].amax = a + n;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (now.tv_sec - last.tv_sec >= 4) {
+        uintptr_t slide = (uintptr_t)_dyld_get_image_vmaddr_slide(0);
+        int f;
+        last = now;
+        fprintf(stderr, "[WATCH] %lu stores so far, %d distinct writers:\n",
+                total, nseen);
+        for (i = 0; i < nseen; i++) {
+            fprintf(stderr, "[WATCH]   writer 0x%llx x%lu  guest %08X..%08X  chain",
+                    (unsigned long long)(seen[i].ra - slide), seen[i].hits,
+                    seen[i].amin, seen[i].amax);
+            for (f = 1; f < seen[i].nbt; f++)
+                fprintf(stderr, " 0x%llx",
+                        (unsigned long long)((uintptr_t)seen[i].bt[f] - slide));
+            fprintf(stderr, "\n");
+        }
+        fflush(stderr);
+    }
+    pthread_mutex_unlock(&mu);
+}
+
+/* ---- trig call census ------------------------------------------------------
+ *
+ * The game's asin/acos/atan2 (sub_0014C770 / 7A0 / 7D0) turn a direction into
+ * an integer angle. In a talk scene the speaker turns head and spine towards
+ * whoever they address -- a look-at, built from exactly these calls -- and
+ * title-screen pedestrians never do that. The skeleton that folds in the
+ * tutorial folds above the root, which is what a look-at at a bad target
+ * would do. One record per (function, calling site): how often, the input
+ * range, the angle range, and how many inputs were out of the valid domain. */
+void recomp_trig_log(int kind, float a, float b, int32_t r, uint32_t guest_ret)
+{
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    static struct { int kind; uint32_t site; unsigned long n, bad;
+                    float amin, amax, bmin, bmax; int32_t rmin, rmax; } rec[48];
+    static int nrec;
+    static struct timespec last;
+    static const char *nm[3] = { "asin ", "acos ", "atan2" };
+    struct timespec now;
+    int i;
+    pthread_mutex_lock(&mu);
+    for (i = 0; i < nrec; i++) if (rec[i].kind == kind && rec[i].site == guest_ret) break;
+    if (i == nrec && nrec < 48) {
+        rec[i].kind = kind; rec[i].site = guest_ret; rec[i].n = rec[i].bad = 0;
+        rec[i].amin = rec[i].amax = a; rec[i].bmin = rec[i].bmax = b;
+        rec[i].rmin = rec[i].rmax = r; nrec++;
+    }
+    if (i < nrec) {
+        rec[i].n++;
+        if (a < rec[i].amin) rec[i].amin = a;
+        if (a > rec[i].amax) rec[i].amax = a;
+        if (b < rec[i].bmin) rec[i].bmin = b;
+        if (b > rec[i].bmax) rec[i].bmax = b;
+        if (r < rec[i].rmin) rec[i].rmin = r;
+        if (r > rec[i].rmax) rec[i].rmax = r;
+        if (a != a || b != b || (kind < 2 && (a > 1.0f || a < -1.0f))) rec[i].bad++;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (now.tv_sec - last.tv_sec >= 5) {
+        last = now;
+        fprintf(stderr, "[TRIG] %d call sites:\n", nrec);
+        for (i = 0; i < nrec; i++)
+            fprintf(stderr, "[TRIG]   %s from %08X x%-8lu in [%.4f %.4f]%s"
+                    " -> angle [%d %d]  out-of-domain %lu\n",
+                    nm[rec[i].kind], rec[i].site, rec[i].n, rec[i].amin, rec[i].amax,
+                    rec[i].kind == 2 ? "" : "", rec[i].rmin, rec[i].rmax, rec[i].bad);
+        fflush(stderr);
+    }
+    pthread_mutex_unlock(&mu);
+}
+
+/* ---- rotation census -------------------------------------------------------
+ *
+ * RotateX/Y/Z (sub_001BB2E0 / 330 / 380) are the only way this title turns a
+ * joint, they are lifted correctly, and the sine table they read is intact --
+ * so a spine folded a hundred and thirteen degrees must have been handed that
+ * angle. Log what they are handed, per calling site: the range, and how many
+ * angles are bigger than a quarter turn, which no joint in a talking pose
+ * should need. The call site names the code that computed the angle. */
+void recomp_rot_log(int axis, int32_t angle, uint32_t guest_ret)
+{
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    static struct { int axis; uint32_t site; unsigned long n, big;
+                    int32_t amin, amax; } rec[64];
+    static int nrec;
+    static struct timespec last;
+    struct timespec now;
+    int i;
+    int32_t a16 = (int16_t)(angle & 0xFFFF);   /* as a signed 16-bit BAMS angle */
+    pthread_mutex_lock(&mu);
+    for (i = 0; i < nrec; i++) if (rec[i].axis == axis && rec[i].site == guest_ret) break;
+    if (i == nrec && nrec < 64) {
+        rec[i].axis = axis; rec[i].site = guest_ret; rec[i].n = rec[i].big = 0;
+        rec[i].amin = rec[i].amax = angle; nrec++;
+    }
+    if (i < nrec) {
+        rec[i].n++;
+        if (angle < rec[i].amin) rec[i].amin = angle;
+        if (angle > rec[i].amax) rec[i].amax = angle;
+        if (a16 > 0x4000 || a16 < -0x4000) rec[i].big++;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (now.tv_sec - last.tv_sec >= 5) {
+        last = now;
+        fprintf(stderr, "[ROT] %d call sites:\n", nrec);
+        for (i = 0; i < nrec; i++)
+            fprintf(stderr, "[ROT]   Rotate%c from %08X x%-9lu angle [%d %d]"
+                    " (%.1f..%.1f deg)  over 90deg: %lu\n", "XYZ"[rec[i].axis],
+                    rec[i].site, rec[i].n, rec[i].amin, rec[i].amax,
+                    rec[i].amin * 360.0 / 65536.0, rec[i].amax * 360.0 / 65536.0,
+                    rec[i].big);
+        fflush(stderr);
+    }
+    pthread_mutex_unlock(&mu);
+}
+
+/* ---- who hands RotateZYX a corrupt angle ------------------------------------
+ *
+ * sub_001BAC50 applies RotateZ, RotateY, RotateX from a triple of 32-bit
+ * angles at [ecx]. It is correct; the triple is not -- RotateX was handed
+ * -8,475,112, about 129 full turns, which indexes the sine table with noise.
+ * Record, per calling site, how many triples are out of range, and keep the
+ * address and contents of the first bad one: that address, put under the
+ * store watch, names the code that wrote the garbage. */
+void recomp_zyx_log(uint32_t p, uint32_t guest_ret)
+{
+    /* RECOMP_ZERO_WHEEL=1: an experiment, not a fix. sub_000AD040 applies the
+     * accumulated skate-wheel angle about joints 1, 2, 3... and stores the
+     * result into bone slots, one of which is the slot measured folded by
+     * about 115 degrees -- the value that wheel angle had wrapped to. Zero
+     * the angle for those two calls only; if the characters stand up, this
+     * is the cause. */
+    { static int zw = -1;
+      if (zw < 0) zw = getenv("RECOMP_ZERO_WHEEL") ? 1 : 0;
+      if (zw && (guest_ret == 0x000AD10Bu || guest_ret == 0x000AD159u)) {
+          int32_t *w = (int32_t *)((uint8_t *)xbox_GetMemoryOffset() + p);
+          w[0] = w[1] = w[2] = 0;
+      } }
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    static struct { uint32_t site; unsigned long n, bad; uint32_t bad_p;
+                    int32_t bx, by, bz; } rec[64];
+    static int nrec;
+    static struct timespec last;
+    struct timespec now;
+    const int32_t *a = (const int32_t *)((const uint8_t *)xbox_GetMemoryOffset() + p);
+    int i, bad = 0;
+    for (i = 0; i < 3; i++) if (a[i] > 0x20000 || a[i] < -0x20000) bad = 1;
+    pthread_mutex_lock(&mu);
+    for (i = 0; i < nrec; i++) if (rec[i].site == guest_ret) break;
+    if (i == nrec && nrec < 64) {
+        rec[i].site = guest_ret; rec[i].n = rec[i].bad = 0; rec[i].bad_p = 0; nrec++;
+    }
+    if (i < nrec) {
+        rec[i].n++;
+        if (bad) {
+            if (!rec[i].bad) { rec[i].bad_p = p; rec[i].bx = a[0]; rec[i].by = a[1]; rec[i].bz = a[2]; }
+            rec[i].bad++;
+        }
+    }
+    /* RECOMP_WATCH_LEAN=1: the first time the lean routine (sub_000AD040) is
+     * handed an out-of-range triple, point the second store-watch window at
+     * that triple. Whatever writes it from then on is the runaway. */
+    { static int arm = -1;
+      if (arm < 0) arm = getenv("RECOMP_WATCH_LEAN") ? 1 : 0;
+      if (arm == 1 && bad && (guest_ret == 0x000AD10Bu || guest_ret == 0x000AD159u)) {
+          /* +0x68 is only a per-frame copy of +0x204 (sub_000AD7C0 copies it
+           * across); the value is computed into +0x204, so watch that. */
+          g_recomp_watch2_lo = p - 0x68 + 0x204; g_recomp_watch2_span = 12; arm = 2;
+          fprintf(stderr, "[ZYX] lean triple at %08X = (%d %d %d): store watch armed on"
+                  " its source %08X\n", p, a[0], a[1], a[2], p - 0x68 + 0x204);
+      } }
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (now.tv_sec - last.tv_sec >= 5) {
+        last = now;
+        fprintf(stderr, "[ZYX] %d call sites:\n", nrec);
+        for (i = 0; i < nrec; i++) {
+            if (!rec[i].bad) continue;
+            fprintf(stderr, "[ZYX]   from %08X x%-8lu BAD %lu  first bad triple at %08X ="
+                    " (%d %d %d)\n", rec[i].site, rec[i].n, rec[i].bad, rec[i].bad_p,
+                    rec[i].bx, rec[i].by, rec[i].bz);
+        }
+        fflush(stderr);
+    }
+    pthread_mutex_unlock(&mu);
 }

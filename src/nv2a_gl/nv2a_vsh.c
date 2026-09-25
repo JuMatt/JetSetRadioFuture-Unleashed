@@ -364,6 +364,7 @@ static const char *GLSL_PRELUDE =
 "uniform vec4 vpOff;     // NV097_SET_VIEWPORT_OFFSET\n"
 "uniform vec2 vpSurface; // render target size, for the NDC conversion\n"
 "uniform int  posMode;   // how to read what the program wrote to oPos\n"
+"uniform int  fogEnable; // NV097_SET_FOG_ENABLE\n"
 "out vec4 oD0;\n"
 "out vec4 oD1;\n"
 "out vec4 oT0;\n"
@@ -371,6 +372,25 @@ static const char *GLSL_PRELUDE =
 "out vec4 oT2;\n"
 "out vec4 oT3;\n"
 "out float oFogC;\n"
+"\n"
+"// The fog factor the combiner's FOG register carries in its alpha.\n"
+"//\n"
+"// A vertex program writes a fog COORDINATE here, not a factor: this title\n"
+"// writes eye distance, so the values arriving are in the hundreds and\n"
+"// thousands. Handing that to the combiner as an alpha was catastrophic --\n"
+"// a final combiner that mixes towards the fog colour with a weight of 1282\n"
+"// drives every channel far negative against this title's black fog colour\n"
+"// and clamps to black. That is why the city rendered perfectly and the\n"
+"// people in it came out as silhouettes: the batches that vanished are\n"
+"// exactly the ones whose programs write fog.\n"
+"//\n"
+"// With fog switched off, which is how this title draws the tutorial, the\n"
+"// hardware's factor is 1.0 -- leave the fragment alone. With it on, clamp\n"
+"// the program's own value, which is what the console does for a coordinate\n"
+"// a program supplies itself.\n"
+"float nv_fog(float coord) {\n"
+"    return fogEnable != 0 ? clamp(coord, 0.0, 1.0) : 1.0;\n"
+"}\n"
 "\n"
 "// The NV2A's LIT, which differs from the GL fixed-function one in the\n"
 "// clamping of the specular exponent -- a program that relies on the clamp\n"
@@ -436,7 +456,7 @@ static void emit_viewport_epilogue(SB *sb, int ff)
             "#endif\n"
             "    ndc.w = oPos.w;\n"
             "    gl_Position = vec4(ndc.xyz * ndc.w, ndc.w);\n"
-            "    oFogC = oFog.x;\n"
+            "    oFogC = nv_fog(oFog.x);\n"
             "    gl_PointSize = max(oPts.x, 1.0);\n");
         return;
     }
@@ -510,7 +530,7 @@ static void emit_viewport_epilogue(SB *sb, int ff)
         "    ndc.w = oPos.w;\n"
         "    gl_Position = vec4(ndc.xyz * ndc.w, ndc.w);\n"
         "    }\n"
-        "    oFogC = oFog.x;\n"
+        "    oFogC = nv_fog(oFog.x);\n"
         "    gl_PointSize = max(oPts.x, 1.0);\n");
 }
 
@@ -536,7 +556,22 @@ static void emit_program_body(SB *sb, const Nv2aVshProgram *p)
         sb_add(sb, "    vec4 R%d = vec4(0.0);\n", i);
     sb_add(sb,
         "    vec4 oPos = vec4(0.0, 0.0, 0.0, 1.0);\n"
-        "    vec4 oFog = vec4(0.0);\n"
+        /* Fog defaults to NONE, not to full fog.
+         *
+         * oFogC leaves here as oFog.x and becomes the alpha of the combiner's
+         * FOG register, where 1.0 means "keep the fragment" and 0.0 means
+         * "replace it with the fog colour". Starting oFog at zero therefore
+         * told every program that does not write fog -- which is every
+         * character program in this title -- to paint itself entirely in the
+         * fog colour. The world's programs do write it, so the city came out
+         * correct while the people in it came out as dark silhouettes, which
+         * is exactly the picture: vehicles and trees in full colour, the
+         * skaters nearly black and lost against the scenery.
+         *
+         * The console's default is no fog until a program asks for it, so
+         * that is what this is. A program that writes the register still
+         * overrides it on the very next line. */
+        "    vec4 oFog = vec4(1.0);\n"
         "    vec4 oPts = vec4(1.0);\n"
         "    vec4 oB0 = vec4(0.0);\n"
         "    vec4 oB1 = vec4(0.0);\n"

@@ -97,19 +97,21 @@ static GLuint          g_tex;
         glBindTexture(GL_TEXTURE_2D, g_tex);
         glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
         /* glReadPixels hands back row 0 first and row 0 is the bottom of the
-         * GL image, so the bottom of the quad takes v = 0. */
+         * GL image -- and the renderer draws the picture the GL way up (its
+         * vertex stage sends screen y = 0 to NDC +1), so the bottom of the
+         * quad takes v = 0 and the picture comes out upright.
+         *
+         * This used to be the other way round, which showed any surface the
+         * title drew directly upside down. It looked right only because the
+         * renderer also turned every render-to-texture copy over, and the
+         * surface on screen had always been through exactly one copy. The
+         * boost dash makes two copies; nv2a_gl.c now samples surfaces the
+         * right way up, and this shows the frame the right way up. */
         glBegin(GL_QUADS);
-            /* Upside down, deliberately: the frame arrives from
-             * glReadPixels, and GL numbers a framebuffer's rows from the
-             * bottom while everything that looks at a picture numbers them
-             * from the top. The BMP writer flips for the same reason. This was
-             * wrong from the first version of this file and invisible until
-             * the window started showing one finished frame instead of three
-             * half-finished passes a frame. */
-            glTexCoord2f(0.0f, 1.0f); glVertex2f(-1.0f, -1.0f);
-            glTexCoord2f(1.0f, 1.0f); glVertex2f( 1.0f, -1.0f);
-            glTexCoord2f(1.0f, 0.0f); glVertex2f( 1.0f,  1.0f);
-            glTexCoord2f(0.0f, 0.0f); glVertex2f(-1.0f,  1.0f);
+            glTexCoord2f(0.0f, 0.0f); glVertex2f(-1.0f, -1.0f);
+            glTexCoord2f(1.0f, 0.0f); glVertex2f( 1.0f, -1.0f);
+            glTexCoord2f(1.0f, 1.0f); glVertex2f( 1.0f,  1.0f);
+            glTexCoord2f(0.0f, 1.0f); glVertex2f(-1.0f,  1.0f);
         glEnd();
         glDisable(GL_TEXTURE_2D);
     }
@@ -139,35 +141,68 @@ static NvGLView *g_view;
 /* ---- the keyboard as a gamepad -------------------------------------------
  *
  * A pad is the right way to play this and not everyone has one to hand, so
- * the window doubles as a controller. Both ZQSD and WASD are accepted for the
- * d-pad because the Mac's layout decides which set the same four physical
- * keys produce, and asking someone to switch layouts to play is worse than
- * accepting eight keys.
+ * the window doubles as a controller.
+ *
+ * Keys are matched by POSITION (the hardware key code), not by the letter
+ * the layout prints on them: the four keys under the left hand are W A S D
+ * on a QWERTY Mac and Z Q S D on an AZERTY one, and they are the same four
+ * key codes. The previous version matched letters and drove only the d-pad,
+ * which JSRF's menus read but its skater does not -- movement is the analog
+ * stick -- so on the keyboard you could reach New Game and then not move.
+ * Now those keys push the left stick (and still the d-pad, for menus).
+ *
+ * Layout (AZERTY labels, QWERTY in brackets):
+ *   Z Q S D  [W A S D]   left stick + d-pad      arrows   right stick
+ *   Space  or  J         A  (jump)                K        B
+ *   H                    X                        L        Y
+ *   E                    R trigger (talk, spray)  A  [Q]   L trigger
+ *   R                    Black                    F        White
+ *   Enter                START                    Esc      BACK
+ *   C  /  V              left / right stick click
+ * Keys held with Command go to the menu bar instead (Cmd+Q quits).
  */
 static volatile unsigned short g_kb_buttons;
 static volatile unsigned char  g_kb_analog[8];
 
 enum { KB_UP = 1u<<0, KB_DOWN = 1u<<1, KB_LEFT = 1u<<2, KB_RIGHT = 1u<<3,
-       KB_START = 1u<<4, KB_BACK = 1u<<5 };
+       KB_START = 1u<<4, KB_BACK = 1u<<5,
+       KB_R_UP = 1u<<6, KB_R_DOWN = 1u<<7, KB_R_LEFT = 1u<<8, KB_R_RIGHT = 1u<<9,
+       KB_LTHUMB = 1u<<10, KB_RTHUMB = 1u<<11 };
 
+/* Hardware key codes (HIToolbox kVK_*), named by their US-layout letter. */
+enum { K_A = 0x00, K_S = 0x01, K_D = 0x02, K_F = 0x03, K_H = 0x04,
+       K_C = 0x08, K_V = 0x09, K_Q = 0x0C, K_W = 0x0D, K_E = 0x0E, K_R = 0x0F,
+       K_L = 0x25, K_J = 0x26, K_K = 0x28,
+       K_RETURN = 0x24, K_SPACE = 0x31, K_ESCAPE = 0x35, K_PAD_ENTER = 0x4C,
+       K_LEFT = 0x7B, K_RIGHT = 0x7C, K_DOWN = 0x7D, K_UP = 0x7E };
+
+/* analog[] order, as xinput_device.c reads it: A B X Y Black White LT RT */
 static void kb_apply(NSEvent *e, int down)
 {
-    NSString *chars = [e charactersIgnoringModifiers];
-    unichar c = [chars length] ? [chars characterAtIndex:0] : 0;
     unsigned short bit = 0;
     int analog = -1;
 
-    switch (c) {
-    case 'z': case 'Z': case 'w': case 'W': bit = KB_UP;    break;
-    case 's': case 'S':                     bit = KB_DOWN;  break;
-    case 'q': case 'Q': case 'a': case 'A': bit = KB_LEFT;  break;
-    case 'd': case 'D':                     bit = KB_RIGHT; break;
-    case ' ':                               bit = KB_START; break;
-    case 27:                                bit = KB_BACK;  break;
-    case 'h': case 'H': analog = 2; break;   /* X */
-    case 'j': case 'J': analog = 0; break;   /* A */
-    case 'k': case 'K': analog = 1; break;   /* B */
-    case 'l': case 'L': analog = 3; break;   /* Y */
+    switch ([e keyCode]) {
+    case K_W:      bit = KB_UP;      break;
+    case K_S:      bit = KB_DOWN;    break;
+    case K_A:      bit = KB_LEFT;    break;
+    case K_D:      bit = KB_RIGHT;   break;
+    case K_UP:     bit = KB_R_UP;    break;
+    case K_DOWN:   bit = KB_R_DOWN;  break;
+    case K_LEFT:   bit = KB_R_LEFT;  break;
+    case K_RIGHT:  bit = KB_R_RIGHT; break;
+    case K_RETURN: case K_PAD_ENTER: bit = KB_START; break;
+    case K_ESCAPE: bit = KB_BACK;    break;
+    case K_C:      bit = KB_LTHUMB;  break;
+    case K_V:      bit = KB_RTHUMB;  break;
+    case K_SPACE: case K_J: analog = 0; break;   /* A */
+    case K_K:      analog = 1; break;            /* B */
+    case K_H:      analog = 2; break;            /* X */
+    case K_L:      analog = 3; break;            /* Y */
+    case K_R:      analog = 4; break;            /* Black */
+    case K_F:      analog = 5; break;            /* White */
+    case K_Q:      analog = 6; break;            /* L trigger */
+    case K_E:      analog = 7; break;            /* R trigger */
     default: return;
     }
     if (bit) {
@@ -176,6 +211,14 @@ static void kb_apply(NSEvent *e, int down)
     }
     if (analog >= 0)
         g_kb_analog[analog] = down ? 255 : 0;
+}
+
+/* Losing focus with a key held never delivers its key-up: let go of all. */
+static void kb_release_all(void)
+{
+    int i;
+    g_kb_buttons = 0;
+    for (i = 0; i < 8; i++) g_kb_analog[i] = 0;
 }
 
 int nv_window_keys(unsigned short *buttons, unsigned char *analog)
@@ -229,9 +272,32 @@ int nv_window_pref_scale(void)
 
 @interface NvMenuTarget : NSObject
 - (void)pickScale:(id)sender;
+- (void)showKeys:(id)sender;
 @end
 
 @implementation NvMenuTarget
+- (void)showKeys:(id)sender
+{
+    NSAlert *a = [[NSAlert alloc] init];
+    (void)sender;
+    kb_release_all();
+    a.messageText = @"Keyboard controls";
+    a.informativeText =
+        @"Keys are by position: AZERTY labels first, QWERTY in brackets.\n\n"
+         "Move (left stick)\tZ Q S D  [W A S D]\n"
+         "Camera (right stick)\tarrow keys\n"
+         "A - jump\t\tSpace or J\n"
+         "B\t\t\tK\n"
+         "X\t\t\tH\n"
+         "Y\t\t\tL\n"
+         "R trigger - talk, spray\tE\n"
+         "L trigger\t\tA  [Q]\n"
+         "Black / White\t\tR / F\n"
+         "Start / Back\t\tEnter / Esc\n"
+         "Stick clicks\t\tC / V\n\n"
+         "A game controller works too, at the same time.";
+    [a runModal];
+}
 - (void)pickScale:(id)sender
 {
     NSInteger want = [(NSMenuItem *)sender tag];
@@ -296,6 +362,18 @@ static void build_menu(void)
     [video addItem:resItem];
     [videoItem setSubmenu:video];
     [bar addItem:videoItem];
+
+    {
+        NSMenuItem *ctlItem = [[NSMenuItem alloc] init];
+        NSMenu *ctl = [[NSMenu alloc] initWithTitle:@"Controls"];
+        NSMenuItem *keys = [[NSMenuItem alloc] initWithTitle:@"Keyboard..."
+                                                      action:@selector(showKeys:)
+                                               keyEquivalent:@"k"];
+        [keys setTarget:g_menu_target];
+        [ctl addItem:keys];
+        [ctlItem setSubmenu:ctl];
+        [bar addItem:ctlItem];
+    }
 
     [NSApp setMainMenu:bar];
 }
@@ -387,17 +465,28 @@ void nv_window_pump(void)
                                           inMode:NSDefaultRunLoopMode
                                          dequeue:YES]) != nil) {
             NSEventType t = [e type];
+            int is_key = (t == NSEventTypeKeyDown || t == NSEventTypeKeyUp);
+            /* Command-key combinations belong to the menu bar (Cmd+Q, Cmd+H,
+             * Cmd+1..4): forward them and do not treat them as pad input. */
+            if (is_key && ([e modifierFlags] & NSEventModifierFlagCommand)) {
+                [NSApp sendEvent:e];
+                continue;
+            }
             if (t == NSEventTypeKeyDown)    kb_apply(e, 1);
             else if (t == NSEventTypeKeyUp) kb_apply(e, 0);
-            /* Key events are consumed rather than forwarded: with no menu bar
-             * and no text field, AppKit answers an unhandled key press with a
-             * beep, and holding a direction to walk would beep continuously. */
-            if (t != NSEventTypeKeyDown && t != NSEventTypeKeyUp)
+            /* Other key events are consumed rather than forwarded: with no
+             * text field, AppKit answers an unhandled key press with a beep,
+             * and holding a direction to skate would beep continuously. */
+            if (!is_key)
                 [NSApp sendEvent:e];
         }
 
         pthread_mutex_lock(&g_lock);
         have = g_px_new;
+        if (g_window && ![g_window isKeyWindow] && (g_kb_buttons || g_kb_analog[0] ||
+            g_kb_analog[1] || g_kb_analog[2] || g_kb_analog[3] || g_kb_analog[4] ||
+            g_kb_analog[5] || g_kb_analog[6] || g_kb_analog[7]))
+            kb_release_all();
         pthread_mutex_unlock(&g_lock);
         if (have) [g_view display];
     }

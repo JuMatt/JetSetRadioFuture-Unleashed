@@ -199,6 +199,11 @@ int nv2a_vsh_interp(const Nv2aVshProgram *p, const float v[16][4],
  *
  * Returns how many were recorded, up to a0_max.
  */
+/* Filled by the last nv2a_vsh_interp() call: every output register it wrote,
+ * indexed by Nv2aOutputReg, plus a bitmask of which ones it actually wrote. */
+extern float    g_interp_out[16][4];
+extern uint16_t g_interp_written;
+
 int nv2a_vsh_interp_a0(const Nv2aVshProgram *p, const float v[16][4],
                        const float c[][4], int *a0_out, int a0_max);
 

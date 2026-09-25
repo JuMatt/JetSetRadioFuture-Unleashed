@@ -71,6 +71,11 @@ typedef struct {
      * NV097_SET_SHADER_CLIP_PLANE_MODE), others sampled as 2D here. */
     uint8_t  tex_mode[4];
     uint8_t  clip_cmp[4];        /* four compare bits per stage: 1 = discard when >= 0 */
+    /* BUMPENVMAP (6) / BUMPENVMAP_LUM (7): the earlier stage each one reads
+     * its (du, dv) from, and which channels of each stage's texture the
+     * title marked signed (TEXFILTER bits 28..31: A R G B). */
+    uint8_t  bump_src[4];
+    uint8_t  tex_signed[4];
 
     /* Alpha test, which the NV2A does in fixed function. */
     uint8_t  alpha_test;

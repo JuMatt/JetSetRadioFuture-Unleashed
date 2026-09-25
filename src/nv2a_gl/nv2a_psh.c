@@ -215,7 +215,22 @@ static int psh_emit(const Nv2aPshState *ps, char *buf, int bufsize, int msl)
 
         for (i = 0; i < 4; i++)
             if (ps->tex_bound[i])
-                sb(&s, "uniform sampler2D tex%d;\nuniform vec2 texScale%d;\n", i, i);
+                sb(&s, "uniform sampler2D tex%d;\nuniform vec2 texScale%d;\n"
+                       "uniform vec2 texOff%d;\n", i, i, i);
+        /* BUMPENVMAP stages: the stage's 2x2 matrix and luminance scale and
+         * offset, as uniforms because titles animate them. nv2a_s8 reads a
+         * channel the title marked signed as the two's complement byte it is. */
+        { int any = 0;
+          for (i = 1; i < 4; i++)
+              if (ps->tex_bound[i] && (ps->tex_mode[i] == 6 || ps->tex_mode[i] == 7)) {
+                  sb(&s, "uniform mat2 bumpMat%d;\nuniform float bumpScale%d;\n"
+                         "uniform float bumpOffset%d;\n", i, i, i);
+                  any = 1;
+              }
+          if (any)
+              sb(&s, "float nv2a_s8(float c) { float b = floor(c * 255.0 + 0.5);"
+                     " return (b > 127.5 ? b - 256.0 : b) / 127.0; }\n"
+                     "float nv2a_sb(float c) { return (c * 255.0 - 128.0) / 127.0; }\n"); }
     }
 
     /* Constants are per stage on this hardware; a title that shares them
@@ -278,13 +293,34 @@ static int psh_emit(const Nv2aPshState *ps, char *buf, int bufsize, int msl)
             for (j = 0; j < 4; j++)
                 sb(&s, "    if (oT%d.%c %s 0.0) NV2A_DISCARD;\n", i, "xyzw"[j],
                    (ps->clip_cmp[i] >> j) & 1 ? ">=" : "<");
+        } else if (!msl && i >= 1 && ps->tex_bound[i]
+                   && (ps->tex_mode[i] == 6 || ps->tex_mode[i] == 7)) {
+            /* BUMPENVMAP: (du, dv) from the source stage's blue and green,
+             * through this stage's matrix, offset this stage's coordinates
+             * (xemu psh.c). In the coordinates' own units: texels for a
+             * linear texture, which texScale then normalises. */
+            int j = ps->bump_src[i] < i ? ps->bump_src[i] : 0;
+            /* 0x10: uploaded offset-binary; 0x20: a surface, raw bytes */
+            const char *cv = (ps->tex_signed[j] & 0x20) ? "nv2a_s8" : "nv2a_sb";
+            sb(&s, "    // stage %d: BUMPENVMAP%s from stage %d\n", i,
+               ps->tex_mode[i] == 7 ? "_LUM" : "", j);
+            sb(&s, "    vec2 dsdt%d = vec2(%s(r_t%d.b), %s(r_t%d.g));\n", i,
+               cv, j, cv, j);
+            sb(&s, "    dsdt%d = bumpMat%d * dsdt%d;\n", i, i, i);
+            sb(&s, "    vec4 r_t%d = texture(tex%d, (oT%d.xy + dsdt%d) * texScale%d"
+                   " + texOff%d);\n", i, i, i, i, i, i);
+            if (ps->tex_mode[i] == 7)
+                sb(&s, "    r_t%d *= clamp(bumpScale%d * r_t%d.r + bumpOffset%d, 0.0, 1.0);\n",
+                   i, i, j, i);
+            if (ps->tex_alpha_only[i])
+                sb(&s, "    r_t%d.rgb = vec3(1.0);\n", i);
         } else if (ps->tex_bound[i]) {
             if (msl)
                 sb(&s, "    vec4 r_t%d = tex%d.sample(smp%d, oT%d.xy * texScale%d);\n",
                    i, i, i, i, i);
             else
-                sb(&s, "    vec4 r_t%d = texture(tex%d, oT%d.xy * texScale%d);\n",
-                   i, i, i, i);
+                sb(&s, "    vec4 r_t%d = texture(tex%d, oT%d.xy * texScale%d + texOff%d);\n",
+                   i, i, i, i, i);
             /* An alpha-only texture has no colour of its own; the hardware
              * reads its rgb as one, so a title using it as a mask multiplies
              * by white rather than by black. */
@@ -294,6 +330,14 @@ static int psh_emit(const Nv2aPshState *ps, char *buf, int bufsize, int msl)
             sb(&s, "    vec4 r_t%d = vec4(0.0);\n", i);
         }
     }
+    /* A bump source uploaded offset-binary (0x10) goes back to its own
+     * bytes before the combiners read it: to them it is an ordinary
+     * texture. Only after every bump stage has taken its (du, dv). */
+    if (!msl)
+        for (i = 0; i < 4; i++)
+            if (ps->tex_signed[i] & 0x10)
+                sb(&s, "    r_t%d.gb = mod(floor(r_t%d.gb * 255.0 + 0.5) + 128.0, 256.0) / 255.0;"
+                       "  // undo the upload bias\n", i, i);
     sb(&s,
        "    vec4 r_v0 = oD0;\n"
        "    vec4 r_v1 = oD1;\n"

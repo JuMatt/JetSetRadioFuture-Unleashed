@@ -166,6 +166,20 @@ void nv2a_pb_scan_report(void)
     fflush(stderr);
 }
 
+/*
+ * CALL and RETURN.
+ *
+ * A call word ((w & 3) == 2) runs the commands at its target until a RETURN
+ * (0x00020000), then carries on after the call -- one level deep, as the
+ * NV2A's single subroutine register allows. Xbox D3D uses it for
+ * RunPushBuffer: a recorded command stream replayed by reference. This walk
+ * used to step over the call word, so everything a title drew through a
+ * recorded pushbuffer was never drawn. RECOMP_PB_NOCALL=1: the old behaviour.
+ */
+static uint32_t s_tot_calls, s_tot_returns;
+static int s_in_sub;
+static uint32_t pb_walk_sub(uint32_t target_va);
+
 uint32_t nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
@@ -212,8 +226,29 @@ uint32_t nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
             jump_to = ((w & 3u) == 1u) ? (w & ~3u) : (w & 0x1FFFFFFCu);
             break;
         }
-        if ((w & 3u) == 2u || (w & 0xFFFF0003u) == 0x00020000u)
+        if ((w & 3u) == 2u) {
+            static int nocall = -1;
+            uint32_t tgt = 0x80000000u | ((w & ~3u) & 0x0FFFFFFFu);
+            if (nocall < 0) nocall = getenv("RECOMP_PB_NOCALL") != NULL;
+            s_tot_calls++;
+            if (s_tot_calls <= 12 || (s_tot_calls & (s_tot_calls - 1)) == 0)
+                fprintf(stderr, "[PB] call #%u at %08X -> %08X%s\n", s_tot_calls,
+                        va - 4, tgt, s_in_sub ? " (inside a call: ignored)"
+                                               : nocall ? " (RECOMP_PB_NOCALL: skipped)" : "");
+            if (!s_in_sub && !nocall && s_exec_enabled) {
+                uint32_t n;
+                s_in_sub = 1;
+                n = pb_walk_sub(tgt);
+                s_in_sub = 0;
+                words += n;
+            }
             continue;
+        }
+        if ((w & 0xFFFF0003u) == 0x00020000u) {
+            s_tot_returns++;
+            if (s_in_sub) break;          /* back to the caller */
+            continue;
+        }
         if ((w & 0x00030003u) == 0u) {
             uint32_t count  = (w >> 18) & 0x7FFu;
             uint32_t subch  = (w >> 13) & 7u;
@@ -245,4 +280,19 @@ uint32_t nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
     s_tot_segments++;
     { extern void nv2a_pb_time_end(unsigned methods); nv2a_pb_time_end(words); }
     return jump_to;
+}
+
+/* The body of a call: from its target up to the RETURN, through the same
+ * decoder (nv2a_pb_scan with s_in_sub set stops at the RETURN). A jump inside
+ * a subroutine is followed once, which is how a recorded buffer longer than
+ * one segment continues. Returns the words walked. */
+static uint32_t pb_walk_sub(uint32_t target_va)
+{
+    uint32_t before = s_tot_words, j, hops = 0;
+    j = nv2a_pb_scan(target_va, target_va + 0x400000u);
+    while (j && hops++ < 64) {
+        uint32_t t = 0x80000000u | (j & 0x0FFFFFFFu);
+        j = nv2a_pb_scan(t, t + 0x400000u);
+    }
+    return s_tot_words - before;
 }

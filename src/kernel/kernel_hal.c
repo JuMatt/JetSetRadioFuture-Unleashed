@@ -32,6 +32,18 @@
 
 static XBOX_THREAD_LOCAL KIRQL g_current_irql = PASSIVE_LEVEL;
 
+/* What this thread's IRQL is, for code outside this file.
+ *
+ * It exists because IRQL here is bookkeeping and not enforcement: raising to
+ * DISPATCH_LEVEL records a number and prevents nothing. That is harmless
+ * while nothing delivers interrupts to a guest thread, and not harmless once
+ * something does -- a driver raises IRQL precisely to keep its own interrupt
+ * handler out of a structure it is halfway through rewriting, and delivering
+ * the handler anyway corrupts exactly what the raise was protecting. So
+ * whoever delivers an interrupt has to ask first. */
+KIRQL xbox_KeCurrentIrql(void);
+KIRQL xbox_KeCurrentIrql(void) { return g_current_irql; }
+
 /*
  * KfRaiseIrql - Raises IRQL to the specified level.
  * Returns the previous IRQL. Uses __fastcall (ECX = NewIrql).

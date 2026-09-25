@@ -139,6 +139,72 @@ static HANDLE g_nv2a_ack_thread = NULL;
 static volatile LONG g_nv2a_ack_stop = 0;
 
 /*
+ * Waking the "GPU" when the title kicks it.
+ *
+ * The ack thread below is the GPU: it clears D3D's handshake bits and runs
+ * the pushbuffer. It used to find work by polling every 200 us, and on this
+ * host a 200 us nanosleep is 200-1000 us. D3D's KickOff sets the write-
+ * combine flush bit (0x100410, 0x10000) and spins until it clears, so every
+ * kickoff cost the game thread up to a whole sleep: sampled in the DJ K
+ * scene, the game thread spent 84% of its time in that spin (sub_001912A0)
+ * while the ack thread slept 65% of its time -- two threads waiting on each
+ * other. The scene ran at 42-56 fps instead of 60, and it is timed in
+ * frames, so DJ K's mouth fell behind his voice.
+ *
+ * The title's side, a wrapper on KickOff in the port's manual overrides,
+ * calls xbox_nv2a_hurry(1) on the way in and (0) on the way out: while it is
+ * set the ack thread polls without sleeping, so the flush bit is cleared the
+ * moment it is set. On the way out it calls xbox_nv2a_kick() for the new
+ * DMA_PUT. Otherwise the ack thread waits on a condition variable with the
+ * old period as its timeout, so a kick is served in microseconds and nothing
+ * else changes. RECOMP_NV2A_KICK=0 turns both off (polling only, as before).
+ */
+#if !defined(_WIN32)
+#include <pthread.h>
+#include <sched.h>
+static pthread_mutex_t s_kick_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  s_kick_cv = PTHREAD_COND_INITIALIZER;
+static int s_kick_pending;
+static int s_kick_on = -1;
+static volatile int s_hurry;
+void xbox_nv2a_kick(void)
+{
+    if (s_kick_on < 0) { const char *e = getenv("RECOMP_NV2A_KICK"); s_kick_on = e ? atoi(e) : 1; }
+    if (!s_kick_on) return;
+    pthread_mutex_lock(&s_kick_mu);
+    s_kick_pending = 1;
+    pthread_cond_signal(&s_kick_cv);
+    pthread_mutex_unlock(&s_kick_mu);
+}
+void xbox_nv2a_hurry(int on)
+{
+    if (s_kick_on < 0) { const char *e = getenv("RECOMP_NV2A_KICK"); s_kick_on = e ? atoi(e) : 1; }
+    if (!s_kick_on) return;
+    s_hurry = on;
+    if (on) xbox_nv2a_kick();   /* out of its sleep now, not at the end of it */
+}
+/* Sleep up to us microseconds, or until kicked. Returns 1 if kicked. */
+static int nv2a_ack_wait(long us)
+{
+    struct timespec ts;
+    int kicked;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_nsec += us * 1000L;
+    while (ts.tv_nsec >= 1000000000L) { ts.tv_nsec -= 1000000000L; ts.tv_sec++; }
+    pthread_mutex_lock(&s_kick_mu);
+    if (!s_kick_pending)
+        pthread_cond_timedwait(&s_kick_cv, &s_kick_mu, &ts);
+    kicked = s_kick_pending;
+    s_kick_pending = 0;
+    pthread_mutex_unlock(&s_kick_mu);
+    return kicked;
+}
+#else
+void xbox_nv2a_kick(void) { }
+void xbox_nv2a_hurry(int on) { (void)on; }
+#endif
+
+/*
  * NV2A busy-bit acknowledgement.
  *
  * D3D8 talks to the GPU through set-a-bit / wait-for-hardware-to-clear-it
@@ -744,8 +810,18 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 us = e ? atoi(e) : 200;
 #endif
             }
+#if !defined(_WIN32)
+            if (us > 0) {
+                if (s_kick_on < 0) { const char *e = getenv("RECOMP_NV2A_KICK"); s_kick_on = e ? atoi(e) : 1; }
+                if (s_kick_on && s_hurry) sched_yield();
+                else if (s_kick_on) nv2a_ack_wait(us);
+                else { struct timespec ts = { 0, (long)us * 1000L }; nanosleep(&ts, NULL); }
+            }
+            else Sleep(0);
+#else
             if (us > 0) { struct timespec ts = { 0, (long)us * 1000L }; nanosleep(&ts, NULL); }
             else Sleep(0);
+#endif
         }
     }
     return 0;
@@ -2426,7 +2502,7 @@ void xbox_FreeThreadStack(uint32_t stack_top)
         g_thread_stacks_used--;
 }
 
-/* Bump allocator over the contiguous window mapped at XBOX_CONTIG_BASE.
+/* Allocator over the contiguous window mapped at XBOX_CONTIG_BASE.
  *
  * MmAllocateContiguousMemory hands back physical memory, and on Xbox physical
  * page P is visible at 0x80000000 + P. Drivers rely on that being an exact
@@ -2440,41 +2516,239 @@ void xbox_FreeThreadStack(uint32_t stack_top)
  *
  * Grows up from the base; XBOX_GPU_INSTANCE_DEFAULT is carved off the top by
  * the GPU-instance bridge, so the two do not meet until the window is full.
- * Never freed: contiguous blocks are framebuffers and pushbuffers, which a
- * title allocates once. */
-static uint32_t g_contig_next = XBOX_CONTIG_BASE;
+ *
+ * It used to be a bump pointer that never gave anything back, on the theory
+ * that contiguous blocks are framebuffers and pushbuffers a title allocates
+ * once. JSRF's D3D allocates every texture and vertex buffer here
+ * (XPhysicalAlloc, sub_001A0E3E) and releases them on every stage change
+ * (XPhysicalFree, sub_001A0E8B, nine MmFreeContiguousMemory call sites) --
+ * and MmFreeContiguousMemory went to the general heap's free, which did not
+ * know these addresses and dropped them. After the tutorial the stage reload
+ * found the whole 64 MB spent: 373 allocations refused, every texture and
+ * vertex buffer of the next scene missing, and the DJ K scene drew one quad a
+ * frame on a black screen.
+ *
+ * Same shape as the heap: an address-ordered block table, best fit, and
+ * coalescing on free. Whole pages, because that is what the console hands
+ * out and what MmQueryAllocationSize reports. */
+#define XBOX_CONTIG_MAX_BLOCKS 16384
+static struct { uint32_t addr, size, serial; uint8_t free; }
+    g_contig_blocks[XBOX_CONTIG_MAX_BLOCKS];
+static uint32_t g_contig_serial;   /* numbers each allocation, see BlockSerial */
+static int      g_contig_block_count = 0;
+static uint32_t g_contig_next = XBOX_CONTIG_BASE;   /* bump pointer          */
+static uint32_t g_contig_high = XBOX_CONTIG_BASE;   /* never moves back down */
+static uint32_t g_contig_live = 0;                  /* bytes handed out now  */
+static uint32_t g_contig_nalloc, g_contig_nfree, g_contig_nreuse;
+
+static void contig_insert(int idx, uint32_t addr, uint32_t size, int is_free)
+{
+    if (g_contig_block_count >= XBOX_CONTIG_MAX_BLOCKS) return;
+    memmove(&g_contig_blocks[idx + 1], &g_contig_blocks[idx],
+            (size_t)(g_contig_block_count - idx) * sizeof g_contig_blocks[0]);
+    g_contig_blocks[idx].addr = addr;
+    g_contig_blocks[idx].size = size;
+    g_contig_blocks[idx].free = (uint8_t)is_free;
+    g_contig_blocks[idx].serial = is_free ? 0 : ++g_contig_serial;
+    g_contig_block_count++;
+}
+
+static void contig_remove(int idx)
+{
+    memmove(&g_contig_blocks[idx], &g_contig_blocks[idx + 1],
+            (size_t)(g_contig_block_count - idx - 1) * sizeof g_contig_blocks[0]);
+    g_contig_block_count--;
+}
+
+/* Index of the block containing va, or -1. Blocks are in address order. */
+static int contig_find(uint32_t va)
+{
+    int lo = 0, hi = g_contig_block_count - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        uint32_t a = g_contig_blocks[mid].addr;
+        if (va < a) hi = mid - 1;
+        else if (va >= a + g_contig_blocks[mid].size) lo = mid + 1;
+        else return mid;
+    }
+    return -1;
+}
+
+static void contig_log(const char *what, uint32_t va, uint32_t size)
+{
+    uint32_t n = g_contig_nalloc + g_contig_nfree;
+    if (n <= 24 || (n % 512) == 0) {
+        fprintf(stderr, "  [CONTIG] %s 0x%08X %u bytes -- live %u KB, high-water %u KB,"
+                        " %u allocs (%u reused) %u frees, %d blocks\n",
+                what, va, size, g_contig_live / 1024,
+                (g_contig_high - XBOX_CONTIG_BASE) / 1024,
+                g_contig_nalloc, g_contig_nreuse, g_contig_nfree,
+                g_contig_block_count);
+        fflush(stderr);
+    }
+}
 
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
 {
-    uint32_t result;
+    uint32_t result, limit;
+    int i, best = -1;
+    uint32_t best_waste = 0xFFFFFFFFu;
 
     if (alignment < 4096) alignment = 4096;
-    result = (g_contig_next + alignment - 1) & ~(alignment - 1);
+    if (alignment & (alignment - 1)) alignment = 4096;   /* not a power of two */
+    if (!size) size = 1;
+    if (size > XBOX_CONTIG_SIZE) {
+        fprintf(stderr, "  [CONTIG] refused %u bytes: larger than the window\n", size);
+        return 0;
+    }
+    size = (size + 4095u) & ~4095u;
 
-    /* Leave the top of the window for GPU instance memory. */
-    if ((uint64_t)result + size >
-            (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE
-                - XBOX_GPU_INSTANCE_DEFAULT) {
-        fprintf(stderr, "  [CONTIG] arena exhausted (%u requested, %u of %u used)\n",
+    /* Best fit over the freed blocks first. */
+    for (i = 0; i < g_contig_block_count; i++) {
+        uint32_t a, e, start, waste;
+        if (!g_contig_blocks[i].free) continue;
+        a = g_contig_blocks[i].addr;
+        e = a + g_contig_blocks[i].size;
+        start = (a + alignment - 1) & ~(alignment - 1);
+        if (start < a || start >= e || e - start < size) continue;
+        waste = g_contig_blocks[i].size - size;
+        if (waste < best_waste) { best_waste = waste; best = i; if (!waste) break; }
+    }
+    if (best >= 0 && g_contig_block_count + 2 <= XBOX_CONTIG_MAX_BLOCKS) {
+        uint32_t a = g_contig_blocks[best].addr;
+        uint32_t e = a + g_contig_blocks[best].size;
+        uint32_t start = (a + alignment - 1) & ~(alignment - 1);
+        int idx = best;
+        if (start > a) {                 /* leading slack stays free */
+            g_contig_blocks[best].size = start - a;
+            contig_insert(best + 1, start, e - start, 1);
+            idx = best + 1;
+        }
+        if (e - start > size)            /* trailing remainder stays free */
+            contig_insert(idx + 1, start + size, e - start - size, 1);
+        g_contig_blocks[idx].addr = start;
+        g_contig_blocks[idx].size = size;
+        g_contig_blocks[idx].free = 0;
+        g_contig_blocks[idx].serial = ++g_contig_serial;
+        g_contig_live += size;
+        g_contig_nalloc++; g_contig_nreuse++;
+        memset((void *)((uintptr_t)start + g_memory_offset), 0, size);
+        contig_log("alloc (reused)", start, size);
+        return start;
+    }
+
+    /* Otherwise from the top. */
+    result = (g_contig_next + alignment - 1) & ~(alignment - 1);
+    limit = XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE - XBOX_GPU_INSTANCE_DEFAULT;
+    if (result < g_contig_next || result > limit || limit - result < size
+     || g_contig_block_count + 2 > XBOX_CONTIG_MAX_BLOCKS) {
+        fprintf(stderr, "  [CONTIG] arena exhausted (%u requested, %u of %u used;"
+                        " %u KB live, %u allocs %u frees, %d blocks)\n",
                 size, g_contig_next - XBOX_CONTIG_BASE,
-                (unsigned)XBOX_CONTIG_SIZE);
+                (unsigned)XBOX_CONTIG_SIZE, g_contig_live / 1024,
+                g_contig_nalloc, g_contig_nfree, g_contig_block_count);
         fflush(stderr);
         return 0;
     }
-
+    /* The alignment gap in front of an aligned block becomes a free block of
+     * its own, so a later small allocation can use it. RECOMP_CONTIG_NOGAPS=1
+     * leaves gaps unused, as the old bump allocator did. (For a while this
+     * defaulted to unused, on the suspicion that the audio side wrote past
+     * its blocks into the gaps and silenced the tutorial; the silence came
+     * from a file-size query failing -- see xbox_dir_context_release -- and
+     * happened with the gaps unused too.) */
+    { static int nogap = -1;
+      if (nogap < 0) nogap = getenv("RECOMP_CONTIG_NOGAPS") ? 1 : 0;
+      if (result > g_contig_next)
+          contig_insert(g_contig_block_count, g_contig_next, result - g_contig_next, nogap ? 0 : 1); }
+    contig_insert(g_contig_block_count, result, size, 0);
     g_contig_next = result + size;
+    if (g_contig_next > g_contig_high) g_contig_high = g_contig_next;
+    g_contig_live += size;
+    g_contig_nalloc++;
     memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
+    contig_log("alloc", result, size);
     return result;
 }
 
-/* How much of the window has been handed out.
+/* Give a block back. Returns 1 if va is a block this allocator handed out
+ * (and it is now free), 0 if it is not one of ours -- the caller then knows
+ * to try the general heap. */
+int xbox_ContiguousFree(uint32_t va)
+{
+    int i;
+    uint32_t size;
+
+    if (va < XBOX_CONTIG_BASE || va >= XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
+        return 0;
+    i = contig_find(va);
+    if (i < 0 || g_contig_blocks[i].free || g_contig_blocks[i].addr != va) {
+        static int said;
+        if (said++ < 16)
+            fprintf(stderr, "  [CONTIG] free of 0x%08X: not the start of a live block\n", va);
+        return i >= 0;   /* inside the window: not the heap's either */
+    }
+    size = g_contig_blocks[i].size;
+    /* RECOMP_CONTIG_NOREUSE=1: keep every block, as the bump allocator did.
+     * For telling whether a fault is caused by memory being reused. */
+    { static int noreuse = -1;
+      if (noreuse < 0) noreuse = getenv("RECOMP_CONTIG_NOREUSE") ? 1 : 0;
+      if (noreuse) { g_contig_nfree++; return 1; } }
+    g_contig_blocks[i].free = 1;
+    g_contig_blocks[i].serial = 0;
+    g_contig_live -= size;
+    g_contig_nfree++;
+    if (i + 1 < g_contig_block_count && g_contig_blocks[i + 1].free
+     && g_contig_blocks[i].addr + g_contig_blocks[i].size == g_contig_blocks[i + 1].addr) {
+        g_contig_blocks[i].size += g_contig_blocks[i + 1].size;
+        contig_remove(i + 1);
+    }
+    if (i > 0 && g_contig_blocks[i - 1].free
+     && g_contig_blocks[i - 1].addr + g_contig_blocks[i - 1].size == g_contig_blocks[i].addr) {
+        g_contig_blocks[i - 1].size += g_contig_blocks[i].size;
+        contig_remove(i);
+        i--;
+    }
+    /* A free block at the very top gives its space back to the bump pointer. */
+    if (i == g_contig_block_count - 1
+     && g_contig_blocks[i].addr + g_contig_blocks[i].size == g_contig_next) {
+        g_contig_next = g_contig_blocks[i].addr;
+        contig_remove(i);
+    }
+    contig_log("free", va, size);
+    return 1;
+}
+
+/* Which allocation the address belongs to right now: a number no other
+ * allocation has had, or 0 for memory nobody holds. A GPU backend that
+ * cached something about this memory -- a render target it drew into --
+ * keeps the number, and a different one later means the title freed that
+ * memory and it now holds something else. */
+uint32_t xbox_ContiguousBlockSerial(uint32_t va)
+{
+    int i = contig_find(va);
+    if (i < 0 || g_contig_blocks[i].free) return 0;
+    return g_contig_blocks[i].serial;
+}
+
+/* Bytes from va to the end of its live block (MmQueryAllocationSize), or 0. */
+uint32_t xbox_ContiguousBlockSize(uint32_t va)
+{
+    int i = contig_find(va);
+    if (i < 0 || g_contig_blocks[i].free) return 0;
+    return g_contig_blocks[i].size - (va - g_contig_blocks[i].addr);
+}
+
+/* How far into the window anything has ever been handed out.
  *
  * Lets a caller holding a physical address decide whether it names contiguous
  * memory this runtime allocated. The pushbuffer executor needs exactly that:
- * a surface offset is physical, and only the window makes it addressable. */
+ * a surface offset is physical, and only the window makes it addressable.
+ * A high-water mark rather than the current top, so an address stays
+ * classified the same way after the block around it is freed. */
 uint32_t xbox_ContiguousAllocatedBytes(void)
 {
-    return g_contig_next - XBOX_CONTIG_BASE;
+    return g_contig_high - XBOX_CONTIG_BASE;
 }
 
 
@@ -2569,10 +2843,37 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
     /* Align the next pointer */
     result = (g_heap_next + alignment - 1) & ~(alignment - 1);
 
-    if (result + size > XBOX_HEAP_TOP) {
-        fprintf(stderr, "xbox_HeapAlloc: out of memory (requested %u, used %u/%u)\n",
-                size, g_heap_next - XBOX_HEAP_BASE,
-                (unsigned)(XBOX_HEAP_TOP - XBOX_HEAP_BASE));
+    /* Three ways this request cannot be served, and the middle one used to
+     * crash rather than fail.
+     *
+     * `result + size > XBOX_HEAP_TOP` is the honest bound, but it is computed
+     * in 32-bit unsigned arithmetic and XBOX_HEAP_TOP is the top of the RAM
+     * mirror -- 1856 MB, or 0x74000000. A size near 0xFFFFFFFF makes
+     * result + size WRAP to just below result, the comparison says the block
+     * fits, and the memset below then zeroes four gigabytes from the top of
+     * the heap. It walks off the end of the mapping and faults on the first
+     * unmapped page, which is 0x74000000 exactly -- the crash reported as
+     * "signal 10 (si_code 1: misaligned access), fault addr=0x374000000 in
+     * __bzero", from JSRF's VirtualAlloc wrapper at sub_00145A2F while it
+     * builds the level cache.
+     *
+     * The diagnostic for a corrupt size was already written, a dozen lines
+     * below -- it just sat inside the branch the overflow skipped.
+     *
+     * Failing here is safe: the guest's own wrapper handles a NULL return
+     * (sub_00145A51 sets the error and returns zero), which is what the
+     * console would do with a request this size. The reuse path above already
+     * guards its own arithmetic with `start + size < start`; this is the same
+     * check the bump path was missing. */
+    if (size > XBOX_HEAP_TOP - XBOX_HEAP_BASE ||
+        result + size < result ||
+        result + size > XBOX_HEAP_TOP) {
+        fprintf(stderr, "xbox_HeapAlloc: cannot serve %u bytes (0x%08X) at "
+                "0x%08X align %u -- used %u/%u%s\n",
+                size, size, result, alignment, g_heap_next - XBOX_HEAP_BASE,
+                (unsigned)(XBOX_HEAP_TOP - XBOX_HEAP_BASE),
+                (result + size < result) ? "  [the size overflows the address"
+                                           " space: a corrupt request]" : "");
         /* A request larger than the console ever had is not an exhausted heap,
          * it is a corrupt size -- and then the block histogram below answers a
          * question nobody asked. What is wanted is who asked for it, so scan

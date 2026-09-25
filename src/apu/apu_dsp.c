@@ -183,11 +183,75 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
 
     dsp_ack_frame(d);
 
+    /* Which mixbins is the title actually using?
+     *
+     * RECOMP_APU_BINS=1 reports the per-second peak of every one of the 32
+     * mixbins. The fold-down below takes only bins 0 and 1, which is right
+     * for a title that mixes straight to front-left/front-right and wrong
+     * for one that routes through the DSP: JSRF's title screen lands in 0/1
+     * and plays, and from the first level on it sends everything to the
+     * submix bins dsstdfx would process, which this stub then throws away --
+     * eight voices decoding into a silence the log reports as "encode
+     * processor peak 0". Naming the bins turns "the DSP is stubbed" into a
+     * routing that can be written down. */
+    {
+        static int on = -1;
+        static float peak[NUM_MIXBINS];
+        static int64_t last;
+        int b, i;
+        if (on < 0) on = getenv("RECOMP_APU_BINS") ? 1 : 0;
+        if (on) {
+            int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+            for (b = 0; b < NUM_MIXBINS; b++)
+                for (i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+                    float a = mixbins[b][i] < 0 ? -mixbins[b][i] : mixbins[b][i];
+                    if (a > peak[b]) peak[b] = a;
+                }
+            if (!last) last = now;
+            if (now - last >= 1000) {
+                char line[NUM_MIXBINS * 12 + 64];
+                int n = snprintf(line, sizeof line, "[APU] mixbin peaks:");
+                for (b = 0; b < NUM_MIXBINS; b++)
+                    if (peak[b] > 0.0005f)
+                        n += snprintf(line + n, sizeof line - n, " %d=%.3f", b, peak[b]);
+                fprintf(stderr, "%s\n", line);
+                fflush(stderr);
+                memset(peak, 0, sizeof peak);
+                last = now;
+            }
+        }
+    }
+
+    /* The fold-down to stereo.
+     *
+     * Bins 0/1 alone were enough for the title screen and nothing after it:
+     * from the tutorial on, JSRF plays its sound effects as 3D voices into
+     * the crosstalk bins (6/7 front, 8/9 back), which dsstdfx's crosstalk
+     * effect turns into speaker output on the console, plus the I3DL2 reverb
+     * send (10). With no DSP here they were dropped, and the tutorial's
+     * effects were silent. The crosstalk bins arrive hot -- a busy moment
+     * peaks at full scale in 6/7 while the music sits near 0.25 in 0/1 --
+     * so they come in at xtlk_gain (0.35, RECOMP_APU_XTLK_GAIN), the back
+     * pair and the centre a further -3 dB; the reverb and FX sends are left
+     * out: a dry mix. RECOMP_APU_FOLD=0: bins 0/1 only, as before. */
+    static int fold = -1;
+    if (fold < 0) { const char *v = getenv("RECOMP_APU_FOLD"); fold = v ? atoi(v) : 1; }
+
     if (d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
             /* Clamp to [-1, 1] range */
             float left = mixbins[0][i];
             float right = mixbins[1][i];
+            if (fold) {
+                static float xg = -1.0f;
+                const float k = 0.70710678f;
+                if (xg < 0.0f) { const char *v = getenv("RECOMP_APU_XTLK_GAIN");
+                                 xg = v ? (float)atof(v) : 0.35f; }
+                left  += k * (mixbins[4][i] + mixbins[2][i])
+                       + xg * (mixbins[6][i] + k * mixbins[8][i]);
+                right += k * (mixbins[5][i] + mixbins[2][i])
+                       + xg * (mixbins[7][i] + k * mixbins[9][i]);
+            }
             if (left > 1.0f) left = 1.0f;
             if (left < -1.0f) left = -1.0f;
             if (right > 1.0f) right = 1.0f;
@@ -222,7 +286,15 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
         if (wav) {
             fwrite(&d->monitor.frame_buf[off][0], 2 * sizeof(int16_t),
                    NUM_SAMPLES_PER_FRAME, wav);
-            fflush(wav);
+            /* Buffered, not flushed.
+             *
+             * This runs once per 32-sample encode-processor frame -- about
+             * 1,500 times a second -- and an fflush each time is a write
+             * syscall on the audio thread. With it on, the ADX decode rate
+             * fell from 44,100 samples/s to zero after eighteen seconds and
+             * the music collapsed into a one-second loop: the probe was
+             * causing the fault it was there to measure. The file is closed
+             * at exit, so nothing is lost that matters. */
         }
     }
 
