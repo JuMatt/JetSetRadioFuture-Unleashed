@@ -87,6 +87,22 @@ enum GameFolder {
 
 /// Where an extracted disc is kept, so the same ISO is never unpacked twice.
 enum Library {
+    /// Where the run logs go.
+    ///
+    /// Application Support is the correct place for them and the wrong place
+    /// to have to read them from: it is a protected location, so anyone
+    /// helping to debug this remotely -- which is how most of this port has
+    /// been built -- cannot open it, and every crash report has to be copied
+    /// out by hand. The logs are diagnostic output about the game, not user
+    /// data, so they belong beside the app, in the folder the game already
+    /// lives in. Falls back to Application Support if that folder is not
+    /// writable (a read-only volume, or the app moved somewhere odd).
+    static var logRoot: URL {
+        let beside = Bundle.main.bundleURL.deletingLastPathComponent()
+        if FileManager.default.isWritableFile(atPath: beside.path) { return beside }
+        return root
+    }
+
     static var root: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory,
                                             in: .userDomainMask)[0]
@@ -137,6 +153,22 @@ enum Game {
             "RECOMP_GL_READBACK": "0",
             "RECOMP_FPS": "60",
             "RECOMP_ABI_RESTORE": "1",
+            // CRI's ADX idle thread runs at idle priority and does real file
+            // and decode work; outside the guest lock it raced the threads
+            // CRI assumes it cannot preempt, and the music stream stalled
+            // (and could corrupt CRI's state). Idle threads take the lock.
+            "RECOMP_LOCK_IDLE": "1",
+            // WORKAROUND, not a fix. One full-screen black quad -- four
+            // vertices covering the viewport, no texture, diffuse RGB
+            // zero, alpha around 0.9, alpha-blended -- is drawn over the
+            // finished scene and takes the frame from a mean brightness
+            // of 80 to 5, which is black to the eye. The HUD is drawn
+            // after it and survives, which is exactly what the tutorial
+            // looked like. Skipping it makes the level visible again.
+            // The cost is that genuine fades between scenes now cut
+            // rather than fade. Why the title asks for a near-opaque
+            // curtain on a frame it means you to see is still open.
+            "RECOMP_GL_CURTAIN": "skip",
             "RECOMP_MUTE": "0",
             // Without this the engine renders offscreen and opens nothing.
             // It is how the diagnostic runs work -- they dump frames to disk
@@ -290,8 +322,50 @@ final class Launcher: NSObject, NSApplicationDelegate {
     /// intact. This is the usual shape of a wrapper that has a question to ask
     /// before the real program starts.
     private func start(_ folder: URL) {
-        let log = Library.root.appendingPathComponent("last-run.log")
+        // Write the log where the game lives.
+        //
+        // logRoot prefers the folder beside the .app, which is right in
+        // principle and silently produced nothing in practice -- no log ever
+        // appeared there, so every crash still had to be described from
+        // memory rather than read. The game folder is the one directory this
+        // process is certain it can reach: it was just opened, its contents
+        // were just listed, and the engine is about to chdir into it. Use it
+        // first, keep the other two as fallbacks, and record which one won.
+        let candidates = [folder, Library.logRoot, Library.root]
+        let base = candidates.first {
+            FileManager.default.isWritableFile(atPath: $0.path)
+        } ?? Library.root
+        let log = base.appendingPathComponent("last-run.log")
         logURL = log
+
+        // Keep the previous run's log instead of truncating it.
+        //
+        // The engine's diagnosis of a crash is written here, and the next
+        // launch used to open the same path with "w" -- so the ordinary
+        // reaction to a crash, launching again, destroyed the only record of
+        // it. That happened twice in one afternoon: a crash reported, the app
+        // relaunched, and by the time anyone went looking the backtrace, the
+        // register dump and the guest call chain were gone.
+        //
+        // Each run's log is moved aside under a timestamp before the new one
+        // opens, and the twenty most recent are kept -- a few hundred MB at
+        // worst, against a crash that may take a dozen launches to see again.
+        let fm = FileManager.default
+        let history = base.appendingPathComponent("logs")
+        try? fm.createDirectory(at: history, withIntermediateDirectories: true)
+        if fm.fileExists(atPath: log.path) {
+            let stamp = DateFormatter()
+            stamp.dateFormat = "yyyyMMdd-HHmmss"
+            let name = "run-" + stamp.string(from: Date()) + ".log"
+            try? fm.moveItem(at: log, to: history.appendingPathComponent(name))
+        }
+        if let kept = try? fm.contentsOfDirectory(atPath: history.path)
+                              .filter({ $0.hasPrefix("run-") }).sorted(),
+           kept.count > 20 {
+            for old in kept.prefix(kept.count - 20) {
+                try? fm.removeItem(at: history.appendingPathComponent(old))
+            }
+        }
 
         for (k, v) in Game.environment(gameDir: folder) { setenv(k, v, 1) }
         FileManager.default.changeCurrentDirectoryPath(folder.path)

@@ -24,6 +24,8 @@
 #include <unistd.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <math.h>
+static double jsrf_now(void);   /* defined further down */
 
 /* The Win32 shim's thread id, so traces here and the kernel's [WAITLOG]
  * name the same thread. */
@@ -115,6 +117,98 @@ void recomp_icallv_dump(void)
                 (int)(g_icallv[i].esp1 - g_icallv[i].esp0), g_icallv[i].eax);
     }
 }
+/* ── Functions the recompiler never found ──────────────────────
+ *
+ * recomp/gen/recomp_seeded.c holds 40 functions that live in .text, are
+ * referenced from vtables and state-handler tables in the data sections,
+ * and were not lifted -- 0x0007DBD0 (the title menu's per-frame handler,
+ * whose absence made Start do nothing), 0x00096F80 (hit next, 720 times,
+ * once the menu worked), 0x000BE190 (a deleting destructor), and 37 more
+ * found by the same scan. They are dispatched from here because the
+ * ICALL path asks recomp_lookup_manual() before the generated table.
+ * JSRF_NO_MANUAL_LIFT=1 switches them off for an A/B against the old
+ * behaviour (the calls silently skipped). */
+typedef void (*recomp_seeded_func_t)(void);
+extern const struct { uint32_t va; recomp_seeded_func_t fn; } g_recomp_seeded[];
+extern const unsigned g_recomp_seeded_count;
+
+/* recomp_holes.c: functions reached by direct calls and tail jumps that
+ * the discovery pass missed (each was a no-op stub before). Direct calls
+ * link straight to them; this table is for an indirect call landing on one. */
+typedef void (*recomp_holes_func_t)(void);
+extern const struct { uint32_t va; recomp_holes_func_t fn; } g_recomp_holes[];
+extern const unsigned g_recomp_holes_count;
+
+static recomp_func_t holes_lookup(uint32_t va)
+{
+    unsigned lo = 0, hi = g_recomp_holes_count;
+    while (lo < hi) {
+        unsigned mid = (lo + hi) / 2;
+        if (g_recomp_holes[mid].va == va) return (recomp_func_t)g_recomp_holes[mid].fn;
+        if (g_recomp_holes[mid].va < va) lo = mid + 1; else hi = mid;
+    }
+    return (recomp_func_t)0;
+}
+
+static recomp_func_t seeded_lookup(uint32_t va)
+{
+    unsigned lo = 0, hi = g_recomp_seeded_count;
+    while (lo < hi) {
+        unsigned mid = (lo + hi) / 2;
+        if (g_recomp_seeded[mid].va == va) return (recomp_func_t)g_recomp_seeded[mid].fn;
+        if (g_recomp_seeded[mid].va < va) lo = mid + 1; else hi = mid;
+    }
+    return (recomp_func_t)0;
+}
+
+/* ── A DirectSound spin, made cooperative ──────────────────────
+ *
+ * 0x001A308E, in the XDK's DirectSound library:
+ *
+ *     test byte  [ecx+0x12], 1        ; voice has a stop pending?
+ *     je   done
+ *   w: test word  [ecx+0x12], 0x8000  ; ...wait for the ISR to retire it
+ *     jne  w
+ *   done: ret
+ *
+ * On the console the APU interrupt preempts this loop and clears the bit.
+ * Here the loop holds the guest lock, makes no calls (so the entry-hook
+ * hand-off never fires), and the ISR runs on the timer thread, which needs
+ * that lock: a livelock, seen as "held the guest lock for 143982 ms" with
+ * one thread at 98.8% CPU. Same test, same bit, but the lock is dropped
+ * for a moment between polls so the interrupt can land. The interrupt
+ * itself is delivered by kernel_apu_tick() in the runtime. */
+extern void xbox_guest_lock_acquire(void);
+extern void xbox_guest_lock_release(void);
+int g_manual_trace;
+
+static void manual_sub_001A308E(void)
+{
+    uint32_t obj = g_ecx;
+    if (MEM8(obj + 0x12) & 1) {
+        unsigned polls = 0;
+        while (MEM16(obj + 0x12) & 0x8000) {
+            xbox_guest_lock_release();
+            usleep(100);
+            xbox_guest_lock_acquire();
+            if (++polls == 5000) {           /* half a second: say so, a few times */
+                static int said;
+                if (said++ < 3)
+                    fprintf(stderr, "[MANUAL] sub_001A308E: voice %08X still "
+                            "has its stop pending after 500 ms (flags %04X)\n",
+                            obj, MEM16(obj + 0x12));
+            }
+        }
+        if (g_manual_trace && polls) {
+            static unsigned n;
+            if (n++ < 5)
+                fprintf(stderr, "[MANUAL] sub_001A308E: waited %u polls for "
+                        "voice %08X\n", polls, obj);
+        }
+    }
+    g_esp += 4; return;                      /* ret */
+}
+
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
 {
     /*
@@ -124,6 +218,29 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
      * if (xbox_va == 0x00067890) return stub_00067890;
      * if (xbox_va == 0x000ABCDE) return fixed_sub_000ABCDE;
      */
+
+    {
+        static int manual_on = -1;
+        if (manual_on < 0) {
+            manual_on = (getenv("JSRF_NO_MANUAL_LIFT") == NULL);
+            g_manual_trace = (getenv("JSRF_MANUAL_TRACE") != NULL);
+            fprintf(stderr, "[MANUAL] hand-lifted overrides %s: %u seeded "
+                    "functions + the DirectSound stop-pending wait; %u hole "
+                    "functions (always on)\n",
+                    manual_on ? "ON" : "OFF", g_recomp_seeded_count, g_recomp_holes_count);
+            fflush(stderr);
+        }
+        if (manual_on) {
+            recomp_func_t f;
+            if (xbox_va == 0x001A308Eu) return manual_sub_001A308E;
+            f = seeded_lookup(xbox_va);
+            if (f) return f;
+        }
+        {
+            recomp_func_t f = holes_lookup(xbox_va);
+            if (f) return f;
+        }
+    }
 
     (void)xbox_va;
     return (recomp_func_t)0;
@@ -374,7 +491,8 @@ void sub_00143240(void)
 extern void sub_0006F730_gen(void);
 void sub_0006F730(void)
 {
-    fprintf(stderr, "[ADXTRAP] sub_0006F730: ADXT error code %d (eax=%08X)\n", (int)(int16_t)g_eax, g_eax);
+    fprintf(stderr, "[ADXTRAP] sub_0006F730: ADXT error code %d (eax=%08X), raised from %08X (255AD: save writer, 664C3: sub_000257B0 state, 116EA8: ADX handle status)\n",
+            (int)(int16_t)g_eax, g_eax, MEM32(g_esp));
     fflush(stderr);
     sub_0006F730_gen();
 }
@@ -392,6 +510,55 @@ void sub_001403B0(void)
     sub_001403B0_gen();
     if (h) fprintf(stderr, "[CVFS]   -> %d (state now %u)\n", (int)g_eax, m[h + 1]);
 }
+/* ---- the cvFs read pipeline, for the stalled tutorial music.
+ * sub_001407E0(h): issues ReadFileEx for the pending request (+0x140 offset,
+ * +0x144 bytes) with completion routine sub_001401B0, which clears the
+ * in-flight flag +0x14C; sub_00140BA0(h), the per-handle server, SleepEx(0,
+ * TRUE)s while +0x14C is set, then accounts the bytes and sets state 1. */
+static void cvfs_line(const char *what, uint32_t h, int extra)
+{
+    static int lines;
+    uint8_t *m = (uint8_t *)g_xbox_mem_offset;
+    if (!h || h + 0x150 >= (64u << 20) || lines >= 3000) return;
+    lines++;
+    fprintf(stderr, "[CVFS2] t=%.2f tid %lu %s h=%08X state=%u pend148=%u inflight14c=%u off=%u bytes=%u pos=%u total=%u %d\n",
+            jsrf_now(), (unsigned long)GetCurrentThreadId(), what, h, m[h + 1],
+            *(uint32_t *)(m + h + 0x148), *(uint32_t *)(m + h + 0x14c),
+            *(uint32_t *)(m + h + 0x140), *(uint32_t *)(m + h + 0x144),
+            *(uint32_t *)(m + h + 0x18), *(uint32_t *)(m + h + 0x14), extra);
+}
+extern void sub_001407E0_gen(void);
+void sub_001407E0(void)
+{
+    uint32_t h = GARG(1);
+    cvfs_line("issue>", h, 0);
+    sub_001407E0_gen();
+    cvfs_line("issue<", h, (int)g_eax);
+}
+extern void sub_001401B0_gen(void);
+void sub_001401B0(void)
+{
+    uint8_t *m = (uint8_t *)g_xbox_mem_offset;
+    uint32_t err = GARG(1), bytes = GARG(2), ov = GARG(3);
+    uint32_t h = (ov && ov + 0x14 < (64u << 20)) ? *(uint32_t *)(m + ov + 0x10) : 0;
+    cvfs_line("done>", h, (int)bytes);
+    (void)err;
+    sub_001401B0_gen();
+    cvfs_line("done<", h, (int)err);
+}
+extern void sub_00140BA0_gen(void);
+void sub_00140BA0(void)
+{
+    /* Only the interesting calls: a request pending or in flight. */
+    uint8_t *m = (uint8_t *)g_xbox_mem_offset;
+    uint32_t h = GARG(1);
+    int busy = h && h + 0x150 < (64u << 20) && m[h + 1] == 2;
+    static unsigned quiet;
+    if (busy && (quiet++ % 64) == 0) cvfs_line("serve>", h, (int)quiet);
+    sub_00140BA0_gen();
+    if (busy && m[h + 1] != 2) cvfs_line("serve< completed", h, 0);
+}
+
 /* ---- sub_001402F0: cvFs device Seek(handle, pos) */
 extern void sub_001402F0_gen(void);
 void sub_001402F0(void)
@@ -407,11 +574,43 @@ void sub_0013D300(void)
 {
     uint32_t h = GARG(1);
     uint8_t *m = (uint8_t *)g_xbox_mem_offset;
-    static int n;
-    if (h && *(uint32_t *)(m + h + 0x14) && n++ < 60)
-        fprintf(stderr, "[ADXT] trapchk h=%08X state=%d thresh[0x38]=%d err[0x60]=%d cnt68=%d cnt6a=%d mode6d=%d stm=%08X\n",
-                h, (int8_t)m[h + 1], *(int32_t *)(m + h + 0x38), *(int16_t *)(m + h + 0x60),
-                *(int16_t *)(m + h + 0x68), *(int16_t *)(m + h + 0x6a), m[h + 0x6d], *(uint32_t *)(m + h + 0x14));
+    /* Print a handle's line when any of its fields change (and every 5 s),
+     * for the whole run -- the old first-60 cap spent itself on the title
+     * and said nothing about the tutorial's stream. On a new stream handle,
+     * dump its first words once so the cvFs handle it reads through shows. */
+    {
+        static struct { uint32_t h, sig[6]; double t; uint32_t stm; } seen[8];
+        static int lines;
+        if (h && h + 0x80 < (64u << 20) && lines < 2000) {
+            uint32_t sig[6];
+            int i, slot = -1, changed;
+            double now = jsrf_now();
+            sig[0] = (uint8_t)m[h + 1]; sig[1] = *(uint16_t *)(m + h + 0x60);
+            sig[2] = *(uint16_t *)(m + h + 0x68); sig[3] = *(uint16_t *)(m + h + 0x6a);
+            sig[4] = m[h + 0x6d]; sig[5] = *(uint32_t *)(m + h + 0x14);
+            for (i = 0; i < 8; i++) if (seen[i].h == h) { slot = i; break; }
+            if (slot < 0) for (i = 0; i < 8; i++) if (!seen[i].h) { slot = i; seen[i].h = h; break; }
+            if (slot >= 0) {
+                changed = memcmp(seen[slot].sig, sig, sizeof sig) != 0;
+                if (changed || now - seen[slot].t >= 5.0) {
+                    lines++;
+                    fprintf(stderr, "[ADXT] t=%.1f h=%08X state=%d thresh[0x38]=%d err[0x60]=%d cnt68=%d cnt6a=%d mode6d=%d stm=%08X%s\n",
+                            now, h, (int8_t)m[h + 1], *(int32_t *)(m + h + 0x38), *(int16_t *)(m + h + 0x60),
+                            *(int16_t *)(m + h + 0x68), *(int16_t *)(m + h + 0x6a), m[h + 0x6d], sig[5],
+                            changed ? "  <- changed" : "");
+                    if (sig[5] && sig[5] != seen[slot].stm && sig[5] + 0x40 < (64u << 20)) {
+                        const uint32_t *w = (const uint32_t *)(m + sig[5]);
+                        fprintf(stderr, "[ADXT]   stm %08X: %08X %08X %08X %08X %08X %08X %08X %08X  %08X %08X %08X %08X %08X %08X %08X %08X\n",
+                                sig[5], w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7],
+                                w[8], w[9], w[10], w[11], w[12], w[13], w[14], w[15]);
+                        seen[slot].stm = sig[5];
+                    }
+                    memcpy(seen[slot].sig, sig, sizeof sig);
+                    seen[slot].t = now;
+                }
+            }
+        }
+    }
     /*
      * JSRF_ADX_RATE=1: how often the ADXT server runs, against how often it
      * decides to decode.
@@ -435,6 +634,47 @@ void sub_0013D300(void)
               fprintf(stderr, "[ADXSERV] watchdog ran %d times/s on tid %lu\n",
                       runs, (unsigned long)GetCurrentThreadId());
               fflush(stderr); runs = 0; last_ms = now;
+          }
+      } }
+    /* JSRF_ADX_STALL=1: while an ADXT handle sits in state 1 (preparing)
+     * past a second, dump its stream (+0x14) and the cvFs handle the stream
+     * reads through -- what the stream is waiting for. */
+    { static int on = -1, dumps;
+      if (on < 0) on = getenv("JSRF_ADX_STALL") ? 1 : 0;
+      if (on && h && h + 0x80 < (64u << 20) && dumps < 12) {
+          uint8_t *mm = (uint8_t *)g_xbox_mem_offset;
+          int8_t st = (int8_t)mm[h + 1];
+          int16_t c6a = *(int16_t *)(mm + h + 0x6a);
+          uint32_t stm = *(uint32_t *)(mm + h + 0x14);
+          if (st == 1 && c6a > 0 && (c6a % 90) == 60 && stm && stm + 0x100 < (64u << 20)) {
+              const uint32_t *w = (const uint32_t *)(mm + stm);
+              const uint32_t *hw = (const uint32_t *)(mm + h);
+              int i;
+              dumps++;
+              fprintf(stderr, "[ADXSTALL] t=%.1f h=%08X cnt6a=%d\n[ADXSTALL]  adxt:", jsrf_now(), h, c6a);
+              for (i = 0; i < 32; i++) fprintf(stderr, " %08X", hw[i]);
+              fprintf(stderr, "\n[ADXSTALL]  sj %08X:", stm);
+              for (i = 0; i < 16; i++) fprintf(stderr, " %08X", w[i]);
+              fprintf(stderr, "\n");
+              /* +8 is the ADXSTM (the stream), +4 the decoder, +0xC the
+               * sound output (CRI ADX_TALK layout); dump each object. */
+              { int f; static const int offs[3] = { 8, 4, 0xC };
+                for (f = 0; f < 3; f++) {
+                    uint32_t o = hw[offs[f] / 4];
+                    if (o && o + 0x80 < (64u << 20)) {
+                        const uint32_t *ow = (const uint32_t *)(mm + o);
+                        fprintf(stderr, "[ADXSTALL]  +%02X -> %08X:", offs[f], o);
+                        for (i = 0; i < 32; i++) fprintf(stderr, " %08X", ow[i]);
+                        fprintf(stderr, "\n");
+                    }
+                } }
+              { uint32_t fs = 0x00273780u; const uint8_t *f = mm + fs;
+                fprintf(stderr, "[ADXSTALL]  cvfs %08X: inuse %u state %u off %u bytes %u pend %u inflight %u\n",
+                        fs, f[0], f[1], *(const uint32_t *)(f + 0x140), *(const uint32_t *)(f + 0x144),
+                        *(const uint32_t *)(f + 0x148), *(const uint32_t *)(f + 0x14c)); }
+              /* CRI's Xbox file layer formats its last error here (wxCi*). */
+              fprintf(stderr, "[ADXSTALL]  wxci last error: '%.160s'\n", (const char *)(mm + 0x00273640u));
+              fflush(stderr);
           }
       } }
     sub_0013D300_gen();
@@ -502,12 +742,41 @@ static void jsrf_hook_switch(void)
 {
     extern void recomp_trace_enable_hooks(void);
     if (getenv("JSRF_WATCH_SNDMGR") || getenv("JSRF_DEEP_ESP")
-     || getenv("JSRF_BONE_CHECK"))
+     || getenv("JSRF_BONE_CHECK") || getenv("JSRF_CRI_CALLS"))
         recomp_trace_enable_hooks();
+}
+
+/* JSRF_CRI_CALLS=1 (test only): which functions of the CRI library
+ * (0x138000-0x145000) the game calls, and from where. Every 10 s, the pairs
+ * called since the last report, with counts. */
+static double pad_now(void);
+static void cri_census(uint32_t va)
+{
+    static int on = -1;
+    static struct { uint32_t va, ra; unsigned n, shown; } tab[768];
+    static int ntab; static double next;
+    uint32_t ra; int i;
+    if (on < 0) on = getenv("JSRF_CRI_CALLS") ? 1 : 0;
+    if (!on || va < 0x00138000u || va >= 0x00145000u) return;
+    ra = *(uint32_t *)((uint8_t *)g_xbox_mem_offset + g_esp);
+    if (ra >= 0x00138000u && ra < 0x00145000u) return;
+    for (i = 0; i < ntab; i++) if (tab[i].va == va && tab[i].ra == ra) { tab[i].n++; break; }
+    if (i == ntab && ntab < 768) { tab[i].va = va; tab[i].ra = ra; tab[i].n = 1; tab[i].shown = 0; ntab++; }
+    if (pad_now() >= next) {
+        next = pad_now() + 10.0;
+        fprintf(stderr, "[CRI] t=%.1f calls since the last report:\n", pad_now());
+        for (i = 0; i < ntab; i++)
+            if (tab[i].n != tab[i].shown) {
+                fprintf(stderr, "[CRI]   sub_%08X <- %08X x%u\n", tab[i].va, tab[i].ra, tab[i].n - tab[i].shown);
+                tab[i].shown = tab[i].n;
+            }
+        fflush(stderr);
+    }
 }
 
 void recomp_trace_user_hook(const char *name, uint32_t va)
 {
+    cri_census(va);
     static int init = -1; static uint32_t mgr; static const char *last_name; static uint32_t last_va;
     if (init < 0) { const char *e = getenv("JSRF_WATCH_SNDMGR"); mgr = e ? (uint32_t)strtoul(e, 0, 0) : 0; init = 1; }
     if (mgr) {
@@ -759,11 +1028,18 @@ void sub_00144F60(void)
 }
 
 /* arm the .data write trap when the title music file is opened */
+static double pad_now(void);
+static unsigned s_game_frames;   /* sound-manager updates: one per game frame */
 void xbox_file_open_hook(const char *path)
 {
     extern void jsrf_protect_data_arm(void);
     const char *t = getenv("JSRF_PROTECT_AT");
     if (t && strstr(path, t)) jsrf_protect_data_arm();
+    /* When each ADX stream is opened, on the wall clock and the game's own
+     * frame count: a cutscene timed in frames drifts from its voice track
+     * whenever the game runs below 60 fps, and this is how that shows. */
+    if (strstr(path, "Z_ADX") && strstr(path, ".adx"))
+        fprintf(stderr, "[ADXOPEN] t=%.2f frame %u %s\n", pad_now(), s_game_frames, path);
 }
 
 /* ---- sub_0017CAB0: _chkstk -- report absurd frame sizes */
@@ -806,8 +1082,8 @@ void sub_0017CAB0(void)
 #define XPP_TYPE_GAMEPAD 0x001BC860u
 #define XPP_HANDLE_BASE  0x58580000u
 
-static struct { double t; uint16_t buttons; uint8_t analog[8];
-                char name[16]; int said; } s_pad_script[64];
+static struct { double t, dur; uint16_t buttons; uint8_t analog[8];
+                int16_t axis[4]; int has_axis; char name[16]; int said; } s_pad_script[64];
 static int s_pad_script_n = -1;
 static double pad_now(void)
 {
@@ -829,10 +1105,29 @@ static void pad_script_load(void)
         while (*s == ' ') s++;
         while (*s && *s != ';' && *s != ' ' && k < 15) name[k++] = *s++;
         s_pad_script[s_pad_script_n].t = t;
+        s_pad_script[s_pad_script_n].dur = 0.25;
         s_pad_script[s_pad_script_n].buttons = 0;
         s_pad_script[s_pad_script_n].said = 0;
+        s_pad_script[s_pad_script_n].has_axis = 0;
+        memset(s_pad_script[s_pad_script_n].axis, 0, sizeof s_pad_script[0].axis);
+        /* "NAME@secs" holds for that long instead of a 250 ms tap. */
+        { char *at = strchr(name, '@');
+          if (at) { *at = 0; s_pad_script[s_pad_script_n].dur = atof(at + 1); } }
         memcpy(s_pad_script[s_pad_script_n].name, name, sizeof name);
         memset(s_pad_script[s_pad_script_n].analog, 0, 8);
+        /* Sticks: LX+ LX- LY+ LY- RX+ RX- RY+ RY-, full deflection, or a
+         * percentage after the sign ("LY+60"). Y is up, as on the pad. */
+        if ((name[0] == 'L' || name[0] == 'R') && (name[1] == 'X' || name[1] == 'Y')
+            && (name[2] == '+' || name[2] == '-')) {
+            int ax = (name[0] == 'R' ? 2 : 0) + (name[1] == 'Y' ? 1 : 0);
+            int pct = name[3] ? atoi(name + 3) : 100;
+            long v;
+            if (pct < 0) pct = 0;
+            if (pct > 100) pct = 100;
+            v = (long)pct * 32767 / 100;
+            s_pad_script[s_pad_script_n].axis[ax] = (int16_t)(name[2] == '-' ? -v : v);
+            s_pad_script[s_pad_script_n].has_axis = 1;
+        }
         if (!strcmp(name, "START")) s_pad_script[s_pad_script_n].buttons = XBOX_GAMEPAD_START;
         else if (!strcmp(name, "BACK")) s_pad_script[s_pad_script_n].buttons = XBOX_GAMEPAD_BACK;
         else if (!strcmp(name, "UP")) s_pad_script[s_pad_script_n].buttons = XBOX_GAMEPAD_DPAD_UP;
@@ -849,20 +1144,602 @@ static void pad_script_load(void)
     }
     fprintf(stderr, "[PAD] script: %d scheduled presses\n", s_pad_script_n);
 }
+/* ---- autopilot for headless runs: JSRF_AUTOPILOT="t:x,z;t:x,z;...".
+ * Waypoints are taken in order. Once a waypoint's time t has come (same
+ * clock as JSRF_PAD_SCRIPT), the left stick steers the player toward world
+ * (x, z), relative to where the follow camera looks, until the player is
+ * within 12 units (or 40 s pass). The stick is recomputed every frame from
+ * the camera update (sub_000A5070), so the loop closes through the game's
+ * own camera-relative controls. Off unless the variable is set. */
+static struct { double t, t_on, t_done; float x, z; int state; char btn[8]; } s_auto[16];  /* 0 waiting, 1 active, 2 done */
+static int s_auto_n = -1;
+static int16_t s_auto_lx, s_auto_ly;
+/* JSRF_TALK_AUTO_A=1: while the follow camera is in talk mode (12), tap A
+ * every 2 s to page through the conversation. */
+static int s_talk_auto_a = -1;
+static double s_talk_auto_a_until = 1e30;
+static volatile uint32_t s_cam_mode_now;
+static int s_auto_live;
+static void auto_load(void)
+{
+    const char *s = getenv("JSRF_AUTOPILOT");
+    s_auto_n = 0;
+    if (!s) return;
+    while (*s && s_auto_n < 16) {
+        double t; float x, z; int used = 0;
+        while (*s == ' ' || *s == ';') s++;
+        if (!*s) break;
+        if (sscanf(s, "%lf:%f,%f%n", &t, &x, &z, &used) != 3 || used <= 0) break;
+        s_auto[s_auto_n].t = t; s_auto[s_auto_n].x = x; s_auto[s_auto_n].z = z;
+        s_auto[s_auto_n].state = 0; s_auto[s_auto_n].t_on = 0; s_auto[s_auto_n].t_done = 0;
+        memset(s_auto[s_auto_n].btn, 0, sizeof s_auto[0].btn);
+        s += used;
+        /* "t:x,z:RT" -- on arrival, tap that button three times, 1.5 s apart */
+        if (*s == ':') {
+            int k = 0; s++;
+            while (*s && *s != ';' && *s != ' ' && k < 7) s_auto[s_auto_n].btn[k++] = *s++;
+        }
+        s_auto_n++;
+    }
+    fprintf(stderr, "[AUTO] %d waypoints\n", s_auto_n);
+}
+/* JSRF_TELEPORT="t:x,y,z" -- once, at time t, put the player at (x, y, z).
+ * Test-only shortcut to a spot the autopilot cannot path to. */
+static void teleport_step(float *chw)
+{
+    static int state = -1; static double t; static float x, y, z;
+    if (state < 0) {
+        const char *s = getenv("JSRF_TELEPORT");
+        state = (s && sscanf(s, "%lf:%f,%f,%f", &t, &x, &y, &z) == 4) ? 1 : 0;
+    }
+    if (state != 1 || pad_now() < t) return;
+    state = 2;
+    fprintf(stderr, "[TELEPORT] t=%.1f (%.1f %.1f %.1f) -> (%.1f %.1f %.1f)\n", pad_now(),
+            chw[0xCA4 / 4], chw[0xCA8 / 4], chw[0xCAC / 4], x, y, z);
+    chw[0xCA4 / 4] = x; chw[0xCA8 / 4] = y; chw[0xCAC / 4] = z;
+}
+/* JSRF_CANS="t:n" -- once, at time t, give the player n spray cans
+ * (char +0xFA0; sub_0007FC90 checks it against the boost cost, sub_0007FC60
+ * takes the cost away). Test-only: the boost dash needs ten.
+ * Every frame: log the boost timer (char +0xE60, set from the character's
+ * parameters when B starts a boost, sub_0009C6A5) starting and ending, and
+ * with JSRF_BOOST_DUMP="shots,every,frames" capture a burst of frames and a
+ * per-pass log when the first boost starts. */
+extern void nv2a_gl_dump_burst(int shots, int every);
+extern void nv2a_gl_trace_frames(int n);
+extern uint32_t nv2a_gl_flips(void);
+static void test_hooks_step(uint8_t *ch)
+{
+    static int cans_state = -1; static double cans_t; static int cans_n;
+    static int dump_state = -1; static int d_shots, d_every, d_frames;
+    static uint32_t last_timer; static int boosts;
+    uint32_t *cw = (uint32_t *)ch;
+    uint32_t timer;
+    if (cans_state < 0) {
+        const char *s = getenv("JSRF_CANS");
+        cans_state = (s && sscanf(s, "%lf:%d", &cans_t, &cans_n) == 2) ? 1 : 0;
+        s = getenv("JSRF_BOOST_DUMP");
+        dump_state = (s && sscanf(s, "%d,%d,%d", &d_shots, &d_every, &d_frames) == 3) ? 1 : 0;
+    }
+    if (cans_state == 1 && pad_now() >= cans_t) {
+        cans_state = 2;
+        fprintf(stderr, "[CANS] t=%.1f cans %d -> %d\n", pad_now(), (int)cw[0xFA0 / 4], cans_n);
+        cw[0xFA0 / 4] = (uint32_t)cans_n;
+    }
+    timer = cw[0xE60 / 4];
+    if (timer != last_timer && (timer == 0 || last_timer == 0)) {
+        if (timer) boosts++;
+        fprintf(stderr, "[BOOST] t=%.2f flip %u boost %s: timer %u cans %d\n",
+                pad_now(), nv2a_gl_flips(), timer ? "starts" : "ends", timer,
+                (int)cw[0xFA0 / 4]);
+        if (timer && dump_state == 1) {
+            dump_state = 2;
+            nv2a_gl_dump_burst(d_shots, d_every);
+            nv2a_gl_trace_frames(d_frames);
+        }
+    }
+    last_timer = timer;
+}
+/* ---- missions -------------------------------------------------------------
+ * sub_00030490 / sub_00030690 queue the load of mission file .bin / .dat for
+ * the id in their one argument: high 16 bits and low 16 bits, two decimal
+ * digits each (0x00010001 is mssn0101, the tutorial; 0x00010060 is mssn0196,
+ * what follows it). Every request is logged once per id.
+ * JSRF_MISSION="101:196@20" (test only): from 20 s on, a request for 0101 is
+ * turned into one for 0196 -- straight to the end of the tutorial. */
+static uint32_t s_mission_mgr;   /* the object whose vtable requests missions */
+static void mission_hook(const char *what)
+{
+    static int init; static uint32_t from, to; static double after;
+    static uint32_t said[32]; static int nsaid;
+    uint32_t *arg = (uint32_t *)((uint8_t *)g_xbox_mem_offset + g_esp + 4);
+    uint32_t id = *arg; int i, seen = 0;
+    if (!init) {
+        const char *e = getenv("JSRF_MISSION"); unsigned a, b; double t = 0;
+        init = 1;
+        /* An id is (chapter << 16) | number and the file is named after
+         * the number modulo 100: 0x000100C4 (196) loads mssn0196, the scene
+         * after the tutorial, and 0x00010064 (100) mssn0100, the garage.
+         * "101:196" therefore meant 0x00010060, the right files under the
+         * wrong number, and the game hung on "Now Loading". Values of
+         * 0x10000 and up are taken as ids: JSRF_MISSION="0x10001:0x100C4". */
+        if (e && sscanf(e, "%i:%i@%lf", (int *)&a, (int *)&b, &t) >= 2) {
+            from = a >= 0x10000u ? a : ((a / 100) << 16) | (a % 100);
+            to   = b >= 0x10000u ? b : ((b / 100) << 16) | (b % 100);
+            after = t;
+        }
+    }
+    for (i = 0; i < nsaid; i++) if (said[i] == (id ^ (what[0] << 24))) seen = 1;
+    if (!seen && nsaid < 32) {
+        const uint32_t *sp = (const uint32_t *)((uint8_t *)g_xbox_mem_offset + g_esp);
+        int k, shown = 0;
+        said[nsaid++] = id ^ (what[0] << 24);
+        fprintf(stderr, "[MISSION] t=%.1f %s request mssn%02u%02u (id %08X) mgr %08X from",
+                pad_now(), what, id >> 16, id & 0xFFFF, id, g_ecx);
+        for (k = 0; k < 64 && shown < 8; k++)
+            if (sp[k] > 0x11000u && sp[k] < 0x138000u) { fprintf(stderr, " %08X", sp[k]); shown++; }
+        fprintf(stderr, "\n");
+    }
+    if (what[0] == '.' && what[1] == 'b') s_mission_mgr = g_ecx;
+    if (from && id == from && pad_now() >= after) {
+        fprintf(stderr, "[MISSION] t=%.1f %s: redirecting mssn%02u%02u -> mssn%02u%02u\n",
+                pad_now(), what, from >> 16, from & 0xFFFF, to >> 16, to & 0xFFFF);
+        *arg = to;
+    }
+}
+/* ---- sub_00046FD0: fill in one storage device's record for the save menu
+ * (slot 8 is the hard disk: +0 present, +4 ?, +8 room for a save, +0xC the
+ * existing save's info, 0 = none). [SAVE] says what the menu is told. */
+extern void sub_00046FD0_gen(void);
+void sub_00046FD0(void)
+{
+    uint8_t *m = (uint8_t *)g_xbox_mem_offset;
+    uint32_t slot = *(uint32_t *)(m + g_esp + 4), rec = *(uint32_t *)(m + g_esp + 8);
+    sub_00046FD0_gen();
+    if (slot == 8 && rec) {
+        static int n;
+        if (n++ < 24)
+            fprintf(stderr, "[SAVE] t=%.1f hard disk record %08X: present %u, %u, room %u, save %d, %04X\n",
+                    pad_now(), rec, *(uint32_t *)(m + rec), *(uint32_t *)(m + rec + 4),
+                    *(uint32_t *)(m + rec + 8), (int)*(uint32_t *)(m + rec + 0xC),
+                    *(uint16_t *)(m + rec + 0x10));
+    }
+}
+/* ---- the save menu (test only) ------------------------------------------
+ *
+ * sub_000681C0(mode, records) opens it: mode 0 saves, 1 loads; records is an
+ * optional copy of the nine storage-device records (sub_00047080). The menu
+ * object's state machine is sub_00067E90: +0x98 state, +0xA4 mode, +0xA8 the
+ * active column (0 device, 1 slot, 2 confirm), +0x33C a table whose +8/+0x18/
+ * +0x28 are each column's selection, +0x340 the device items (32 bytes, +8
+ * enabled; item 0 is the hard disk), +0x5CC the hard disk's record, +0x678
+ * the save buffer, +0x6B8 1 for a new save.
+ *
+ * JSRF_OPEN_SAVE=t opens it (save mode) at t seconds, from the camera update,
+ * so a test can reach it without playing to the garage. [SAVEMENU] logs every
+ * change of what the menu is doing. */
+static uint32_t guest_call_cdecl(void (*fn)(void), uint32_t ra, int nargs, const uint32_t *args)
+{
+    uint8_t *m = (uint8_t *)g_xbox_mem_offset;
+    uint32_t sv[8], ret;
+    int top = g_fp_top, i;
+    sv[0] = g_eax; sv[1] = g_ecx; sv[2] = g_edx; sv[3] = g_ebx;
+    sv[4] = g_esp; sv[5] = g_ebp; sv[6] = g_esi; sv[7] = g_edi;
+    for (i = nargs - 1; i >= 0; i--) { g_esp -= 4; *(uint32_t *)(m + g_esp) = args[i]; }
+    g_esp -= 4; *(uint32_t *)(m + g_esp) = ra;
+    fn();
+    ret = g_eax;
+    g_eax = sv[0]; g_ecx = sv[1]; g_edx = sv[2]; g_ebx = sv[3];
+    g_esp = sv[4]; g_ebp = sv[5]; g_esi = sv[6]; g_edi = sv[7];
+    g_fp_top = top;
+    return ret;
+}
+extern void sub_000681C0(void);
+extern void sub_00030490(void);
+static void mission_at_step(void)
+{
+    static int state = -1; static double t; static uint32_t id;
+    if (state < 0) {
+        const char *e = getenv("JSRF_MISSION_AT"); int v = 0;
+        state = (e && sscanf(e, "%lf:%i", &t, &v) == 2) ? 1 : 0; id = (uint32_t)v;
+    }
+    if (state != 1 || pad_now() < t || !s_mission_mgr) return;
+    state = 2;
+    fprintf(stderr, "[MISSION] t=%.1f asking mgr %08X for mission %08X\n", pad_now(), s_mission_mgr, id);
+    { uint32_t sv_ecx = g_ecx; uint32_t a[1]; a[0] = id;
+      g_ecx = s_mission_mgr;
+      { uint32_t r = guest_call_cdecl(sub_00030490, 0x00030490u, 1, a);
+        g_ecx = sv_ecx;
+        fprintf(stderr, "[MISSION] request returned %u\n", r); } }
+}
+static void save_menu_open_step(void)
+{
+    static int state = -1; static double t;
+    if (state < 0) { const char *e = getenv("JSRF_OPEN_SAVE"); state = e ? 1 : 0; t = e ? atof(e) : 0; }
+    if (state != 1 || pad_now() < t) return;
+    state = 2;
+    { uint32_t a[2] = { 0, 0 };
+      fprintf(stderr, "[SAVEMENU] t=%.1f opening the save menu\n", pad_now());
+      guest_call_cdecl(sub_000681C0, 0x0007D25Au, 2, a); }
+}
+extern void sub_00067E90_gen(void);
+void sub_00067E90(void)
+{
+    uint8_t *m = (uint8_t *)g_xbox_mem_offset;
+    uint32_t o = g_ecx;
+    static uint32_t last[16]; static int n;
+    sub_00067E90_gen();
+    if (o >= 0x10000u && o + 0x6C0u < (64u << 20) && n < 400) {
+        uint32_t tab = *(uint32_t *)(m + o + 0x33C), items = *(uint32_t *)(m + o + 0x340);
+        uint32_t v[16] = {0};
+        v[0] = *(uint32_t *)(m + o + 0x98); v[1] = *(uint32_t *)(m + o + 0xA4);
+        v[2] = *(uint32_t *)(m + o + 0xA8);
+        if (tab && tab < (64u << 20)) { v[3] = *(uint32_t *)(m + tab + 8); v[4] = *(uint32_t *)(m + tab + 0x18);
+                                        v[5] = *(uint32_t *)(m + tab + 0x28); }
+        if (items && items < (64u << 20)) v[6] = *(uint32_t *)(m + items + 8);
+        v[7] = *(uint32_t *)(m + o + 0x5D4); v[8] = *(uint32_t *)(m + o + 0x5D8);
+        v[9] = *(uint32_t *)(m + o + 0x678); v[10] = *(uint32_t *)(m + o + 0x6B8);
+        v[11] = *(uint32_t *)(m + 0x251EE8); v[12] = *(uint32_t *)(m + 0x251F20);
+        v[13] = *(uint32_t *)(m + 0x251E1C + (*(uint32_t *)(m + 0x251F20) & 3) * 0x40);
+        v[14] = *(uint32_t *)(m + o + 0x334);
+        if (memcmp(v, last, sizeof v)) {
+            memcpy(last, v, sizeof v); n++;
+            fprintf(stderr, "[SAVEMENU] t=%.1f obj %08X state %u mode %u col %u sel %d/%d/%d hdd-item-on %u "
+                    "room %u save %d buf %08X new %u | pressed %08X port %u portflag %08X ready %u\n",
+                    pad_now(), o, v[0], v[1], v[2], (int)v[3], (int)v[4], (int)v[5], v[6], v[7], (int)v[8],
+                    v[9], v[10], v[11], v[12], v[13], v[14]);
+        }
+    }
+}
+
+/* ---- list menus and the keyboard -----------------------------------------
+ *
+ * The game's list menus move their cursor on either input: a new d-pad
+ * press moves once (and the menu returns for that frame), and on a later
+ * frame a stick that has just crossed its threshold moves once more. On a
+ * pad those are two different hands. On the keyboard W/A/S/D drive the
+ * d-pad and the left stick together -- the skater only reads the stick, the
+ * menus mostly the d-pad -- so every tap moved the cursor twice. In a
+ * two-item YES/NO that is no move at all: the save prompt sat on NO, A went
+ * back a column, and the game could not be saved from the keyboard.
+ *
+ * While a d-pad direction is held, these menus now see the stick centred:
+ * the d-pad has already said where to go. Input structs: 0x251DE0 + 0x40 *
+ * port, and the active port's copy at 0x251EE0; +4 held buttons (d-pad
+ * 0xF000), +0x14/+0x18 stick X/Y. The skater reads angle and magnitude
+ * (+0x34/+0x38), which are left alone. Only the menus that read both inputs
+ * are wrapped; RECOMP_MENU_STICK_BOTH=1 turns it off. */
+static void menu_stick_mute(uint32_t saved[5][2], int *mask)
+{
+    static int off = -1;
+    uint8_t *m = (uint8_t *)g_xbox_mem_offset;
+    int i;
+    *mask = 0;
+    if (off < 0) off = getenv("RECOMP_MENU_STICK_BOTH") ? 1 : 0;
+    if (off) return;
+    for (i = 0; i < 5; i++) {
+        uint32_t b = 0x00251DE0u + 0x40u * (uint32_t)i;
+        if (*(uint32_t *)(m + b + 4) & 0xF000u) {
+            saved[i][0] = *(uint32_t *)(m + b + 0x14); saved[i][1] = *(uint32_t *)(m + b + 0x18);
+            *(uint32_t *)(m + b + 0x14) = 0; *(uint32_t *)(m + b + 0x18) = 0;
+            *mask |= 1 << i;
+        }
+    }
+}
+static void menu_stick_restore(uint32_t saved[5][2], int mask)
+{
+    uint8_t *m = (uint8_t *)g_xbox_mem_offset;
+    int i;
+    for (i = 0; i < 5; i++)
+        if (mask & (1 << i)) {
+            uint32_t b = 0x00251DE0u + 0x40u * (uint32_t)i;
+            *(uint32_t *)(m + b + 0x14) = saved[i][0]; *(uint32_t *)(m + b + 0x18) = saved[i][1];
+        }
+}
+#define MENU_NAV_WRAP(va) \
+    extern void sub_##va##_gen(void); \
+    void sub_##va(void) { uint32_t sv[5][2]; int mk; menu_stick_mute(sv, &mk); \
+                          sub_##va##_gen(); menu_stick_restore(sv, mk); }
+/* One per line as well as inside the macro: the pipeline's manual_scan finds
+ * wrapped functions by these declarations, and emits each body as sub_X_gen
+ * only if it sees one. */
+extern void sub_00069040_gen(void);
+extern void sub_000689A0_gen(void);
+extern void sub_00077000_gen(void);
+extern void sub_00079740_gen(void);
+extern void sub_0007A170_gen(void);
+extern void sub_0011B680_gen(void);
+extern void sub_000F9C40_gen(void);
+extern void sub_000FA070_gen(void);
+extern void sub_00074460_gen(void);
+extern void sub_0007DAE0_gen(void);
+MENU_NAV_WRAP(00069040)   /* save/load menu, active port */
+MENU_NAV_WRAP(000689A0)   /* save/load menu, every port */
+MENU_NAV_WRAP(00077000)
+MENU_NAV_WRAP(00079740)
+MENU_NAV_WRAP(0007A170)
+MENU_NAV_WRAP(0011B680)
+MENU_NAV_WRAP(000F9C40)
+MENU_NAV_WRAP(000FA070)
+MENU_NAV_WRAP(00074460)
+MENU_NAV_WRAP(0007DAE0)
+
+/* ---- sub_00051FC0: the game flow's per-frame step (test only) -------------
+ *
+ * The flow object runs the mission sequence: +0x58 the mission id, +0x5C a
+ * state indexing the step table at 0x1F9888 (0 asks for the mission file,
+ * 1 waits for it, and so on). [FLOW] logs every state change;
+ * JSRF_FLOW_GOTO="t:id" sets the id and state 0 at t seconds -- how a test
+ * gets to a later mission without playing the ones before it. */
+extern void sub_00051FC0_gen(void);
+void sub_00051FC0(void)
+{
+    static int init = -1, log_on; static double t; static uint32_t id, last_state = 0xFFFFFFFFu;
+    uint8_t *m = (uint8_t *)g_xbox_mem_offset;
+    uint32_t flow = g_ecx;
+    if (init < 0) {
+        const char *e = getenv("JSRF_FLOW_GOTO"); int v = 0;
+        init = (e && sscanf(e, "%lf:%i", &t, &v) == 2) ? 1 : 0; id = (uint32_t)v;
+        log_on = (init || getenv("JSRF_FLOW_LOG")) ? 1 : 0;
+    }
+    if (flow >= 0x10000u && flow + 0x1100u < (64u << 20)) {
+        if (init == 1 && pad_now() >= t) {
+            /* The way a mission ends: +0x4C/+0x54 the next chapter and
+             * number, state 93 creates the next flow (task 0xA, 0x4E9B0)
+             * and hands over to it once it has loaded. */
+            init = 2;
+            fprintf(stderr, "[FLOW] t=%.1f flow %08X: state %u mission %08X -> next %u/%u via state 93\n",
+                    pad_now(), flow, *(uint32_t *)(m + flow + 0x5C), *(uint32_t *)(m + flow + 0x58),
+                    id >> 16, id & 0xFFFF);
+            *(uint32_t *)(m + flow + 0x4C) = id >> 16;
+            *(uint32_t *)(m + flow + 0x54) = id & 0xFFFF;
+            *(uint32_t *)(m + flow + 0x5C) = 93;
+        }
+        if (log_on && *(uint32_t *)(m + flow + 0x5C) != last_state) {
+            last_state = *(uint32_t *)(m + flow + 0x5C);
+            fprintf(stderr, "[FLOW] t=%.1f state %u mission %08X\n", pad_now(), last_state,
+                    *(uint32_t *)(m + flow + 0x58));
+        }
+    }
+    sub_00051FC0_gen();
+}
+
+/* ---- sub_00116E30: the sound manager's per-frame update; counts frames.
+ *
+ * JSRF_VOICE_LOG=1 (test only): the speech slots, frame by frame. The
+ * sound manager (task 5) keeps two ADXTs for speech: +0x6C with its state
+ * at +0xC4 and +0x70 with +0xC0 (1 loading, 2 ready or playing, 0 done).
+ * The talk boxes use +0x70 alone (sub_00117140). An event alternates the
+ * two (sub_00117280): it loads the next line paused into one slot while
+ * the other plays, and unpauses it when the playing line ends -- the DJ K
+ * scene's seventeen lines run back to back that way. The ADXT's status is
+ * the byte at +1 (3 playing, 4 decoded, 5 ended), its pause flag +0x72.
+ * [VOICE] lines give the time, the game frame and the present count for
+ * every change, so a line's real start and end can be set against the
+ * frames captured while it plays. */
+extern uint32_t nv2a_gl_flips(void);
+extern void sub_0013A9A0(void);
+static int voice_log_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("JSRF_VOICE_LOG") ? 1 : 0;
+    return on;
+}
+static uint32_t s_sndmgr;   /* the sound manager (task 5), seen by its update */
+extern void sub_00116E30_gen(void);
+void sub_00116E30(void)
+{
+    /* two voice slots: +0x6C with its state at +0xC4, +0x70 with +0xC0 */
+    static const uint32_t hoff[2] = { 0x6C, 0x70 }, soff[2] = { 0xC4, 0xC0 };
+    static uint32_t last[2][4];
+    static double next_level[2];
+    static int init;
+    uint8_t *m = (uint8_t *)g_xbox_mem_offset;
+    uint32_t o = g_ecx;
+    int k;
+    s_game_frames++;
+    sub_00116E30_gen();
+    if (!voice_log_on() || o < 0x10000u || o + 0x200u >= (64u << 20)) return;
+    s_sndmgr = o;
+    if (!init) { init = 1; memset(last, 0xFF, sizeof last); }
+    for (k = 0; k < 2; k++) {
+        uint32_t vs = *(uint32_t *)(m + o + soff[k]);
+        uint32_t h = *(uint32_t *)(m + o + hoff[k]);
+        uint32_t st, pz, f70;
+        if (h < 0x10000u || h + 0x100u >= (64u << 20)) continue;
+        st = (uint32_t)(int32_t)(int8_t)m[h + 1];
+        pz = m[h + 0x72];
+        f70 = m[h + 0x70] | (m[h + 0x6C] << 8);
+        if (vs != last[k][0] || st != last[k][1] || pz != last[k][2] || f70 != last[k][3]) {
+            fprintf(stderr, "[VOICE] t=%.3f frame %u flip %u slot %X: state %u adxt %08X status %d pause %u flags %04X\n",
+                    pad_now(), s_game_frames, nv2a_gl_flips(), hoff[k], vs, h, (int)st, pz, f70);
+            last[k][0] = vs; last[k][1] = st; last[k][2] = pz; last[k][3] = f70;
+        }
+        /* how full the decoded-sample buffer is, twice a second while the
+         * line is live: rising means the output is not taking samples */
+        if ((int)st >= 1 && (int)st <= 4 && pad_now() >= next_level[k]) {
+            uint32_t a[2]; a[0] = h; a[1] = 0;
+            next_level[k] = pad_now() + 0.5;
+            fprintf(stderr, "[VOICE] t=%.3f slot %X obuf %u samples\n", pad_now(), hoff[k],
+                    guest_call_cdecl(sub_0013A9A0, 0x00116C5Cu, 2, a));
+        }
+    }
+}
+
+/* ---- speech: sub_00117140 plays a line for the talk boxes, sub_00117280
+ * one for an event (arg 1 the slot, arg 2 the line), sub_00116810 stops
+ * the voice, sub_0013AA80 is ADXT_Pause. Logged with JSRF_VOICE_LOG=1. */
+extern void sub_00117140_gen(void);
+void sub_00117140(void)
+{
+    if (voice_log_on())
+        fprintf(stderr, "[VOICE] t=%.3f frame %u flip %u play id %u from %08X\n",
+                pad_now(), s_game_frames, nv2a_gl_flips(), GARG(1), GARG(0));
+    sub_00117140_gen();
+}
+extern void sub_00117280_gen(void);
+void sub_00117280(void)
+{
+    if (voice_log_on())
+        fprintf(stderr, "[VOICE] t=%.3f frame %u flip %u event play slot %u line %u from %08X\n",
+                pad_now(), s_game_frames, nv2a_gl_flips(), GARG(1), GARG(2), GARG(0));
+    sub_00117280_gen();
+}
+extern void sub_00116810_gen(void);
+void sub_00116810(void)
+{
+    if (voice_log_on())
+        fprintf(stderr, "[VOICE] t=%.3f frame %u flip %u stop from %08X\n",
+                pad_now(), s_game_frames, nv2a_gl_flips(), GARG(0));
+    sub_00116810_gen();
+}
+extern void sub_0013AA80_gen(void);
+void sub_0013AA80(void)
+{
+    if (voice_log_on() && s_sndmgr) {
+        uint8_t *m = (uint8_t *)g_xbox_mem_offset;
+        uint32_t h = GARG(1);
+        if (h == *(uint32_t *)(m + s_sndmgr + 0x6C) || h == *(uint32_t *)(m + s_sndmgr + 0x70))
+            fprintf(stderr, "[VOICE] t=%.3f frame %u pause %08X %u from %08X\n",
+                    pad_now(), s_game_frames, h, GARG(2), GARG(0));
+    }
+    sub_0013AA80_gen();
+}
+
+/* ---- sub_001912A0: D3D's KickOff -------------------------------------------
+ *
+ * Hands the push buffer to the GPU: sets the write-combine flush bit
+ * (+0x100410, 0x10000), spins until the GPU clears it, then writes the new
+ * DMA_PUT. The GPU here is the ack thread in xbox_memory_layout.c, which
+ * polled every 200 us, so each kickoff waited out a poll: in the DJ K scene
+ * the game thread spent 84% of its time in this spin and the scene ran at
+ * 42-56 fps. While KickOff runs the ack thread now polls without sleeping,
+ * and it is woken once more for the new DMA_PUT. RECOMP_NV2A_KICK=0 = old. */
+extern void xbox_nv2a_kick(void);
+extern void xbox_nv2a_hurry(int on);
+extern void sub_001912A0_gen(void);
+void sub_001912A0(void)
+{
+    xbox_nv2a_hurry(1);
+    sub_001912A0_gen();
+    xbox_nv2a_hurry(0);
+    xbox_nv2a_kick();
+}
+
+/* ---- sub_00013A80: one pass of the game's main loop (test only log) ------
+ * JSRF_FRAME_LOG=1: once a second, how many passes ran, how many of them
+ * presented (+0x74 set = no Present this pass) and how many waited a vblank
+ * (+0x94), and the vblank counter the game keeps at 0x265174. */
+extern void sub_00013A80_gen(void);
+void sub_00013A80(void)
+{
+    static int on = -1; static unsigned n, nopres, waitv; static double next; static uint32_t v0;
+    uint8_t *m = (uint8_t *)g_xbox_mem_offset;
+    uint32_t o = g_ecx;
+    uint32_t w94 = (o > 0x10000u && o < (64u << 20)) ? *(uint32_t *)(m + o + 0x94) : 0;
+    if (on < 0) on = getenv("JSRF_FRAME_LOG") ? 1 : 0;
+    sub_00013A80_gen();
+    if (!on || o < 0x10000u || o >= (64u << 20)) return;
+    n++;
+    if (*(uint32_t *)(m + o + 0x74)) nopres++;
+    if (w94) waitv++;
+    if (pad_now() >= next) {
+        uint32_t v = *(uint32_t *)(m + 0x265174);
+        fprintf(stderr, "[FRAMES] t=%.1f passes %u, no-present %u, vblank-wait %u, vblanks %u, sound updates %u\n",
+                pad_now(), n, nopres, waitv, v - v0, s_game_frames);
+        n = nopres = waitv = 0; v0 = v; next = pad_now() + 1.0;
+    }
+}
+
+extern void sub_00030490_gen(void);
+void sub_00030490(void) { mission_hook(".bin"); sub_00030490_gen(); }
+extern void sub_00030690_gen(void);
+void sub_00030690(void) { mission_hook(".dat"); sub_00030690_gen(); }
+
+/* JSRF_TRACE_AT="t:frames[:shots,every]" (test only): at time t, log every
+ * render pass for that many frames and capture a burst of frames. */
+static void trace_at_step(void)
+{
+    static int state = -1; static double t; static int frames, shots, every;
+    if (state < 0) {
+        const char *e = getenv("JSRF_TRACE_AT");
+        shots = 0; every = 1;
+        state = (e && sscanf(e, "%lf:%d:%d,%d", &t, &frames, &shots, &every) >= 2) ? 1 : 0;
+    }
+    if (state != 1 || pad_now() < t) return;
+    state = 2;
+    fprintf(stderr, "[TRACE] t=%.1f tracing %d frames, %d shots every %d\n", pad_now(), frames, shots, every);
+    nv2a_gl_trace_frames(frames);
+    if (shots > 0) nv2a_gl_dump_burst(shots, every);
+}
+static void auto_step(const float *camf, const float *chf)
+{
+    static double next_say;
+    double now, dx, dz, dist, fx, fz, fl, rx, rz, sx, sy, sl, scale;
+    int i, cur = -1;
+    if (s_auto_n < 0) auto_load();
+    if (s_auto_n <= 0) return;
+    now = pad_now();
+    for (i = 0; i < s_auto_n; i++)
+        if (s_auto[i].state != 2) { if (now >= s_auto[i].t) cur = i; break; }
+    if (cur < 0) { s_auto_live = 0; return; }
+    dx = s_auto[cur].x - chf[0xCA4 / 4];
+    dz = s_auto[cur].z - chf[0xCAC / 4];
+    dist = sqrt(dx * dx + dz * dz);
+    if (s_auto[cur].state == 0) {
+        s_auto[cur].state = 1; s_auto[cur].t_on = now;
+        fprintf(stderr, "[AUTO] t=%.1f waypoint %d: heading for (%.0f, %.0f) from (%.1f, %.1f), %.0f units\n",
+                now, cur, s_auto[cur].x, s_auto[cur].z, chf[0xCA4 / 4], chf[0xCAC / 4], dist);
+    }
+    if (dist < 12.0 || now - s_auto[cur].t_on > 40.0) {
+        s_auto[cur].state = 2; s_auto_live = 0; s_auto[cur].t_done = now;
+        fprintf(stderr, "[AUTO] t=%.1f waypoint %d %s at (%.1f %.1f %.1f)\n", now, cur,
+                dist < 12.0 ? "reached" : "GAVE UP", chf[0xCA4 / 4], chf[0xCA8 / 4], chf[0xCAC / 4]);
+        return;
+    }
+    fx = camf[0x5C / 4] - camf[0x44 / 4];
+    fz = camf[0x64 / 4] - camf[0x4C / 4];
+    fl = sqrt(fx * fx + fz * fz);
+    if (!(fl > 1e-3)) { s_auto_live = 0; return; }
+    fx /= fl; fz /= fl;
+    rx = fz; rz = -fx;                          /* left-handed: right of forward */
+    sx = (dx * rx + dz * rz) / dist;
+    sy = (dx * fx + dz * fz) / dist;
+    sl = sqrt(sx * sx + sy * sy);
+    if (!(sl > 1e-6)) { s_auto_live = 0; return; }
+    scale = 32767.0 / sl;
+    if (dist < 40.0) scale *= (dist < 16.0 ? 0.4 : dist / 40.0);
+    s_auto_lx = (int16_t)(sx * scale);
+    s_auto_ly = (int16_t)(sy * scale);
+    s_auto_live = 1;
+    if (now >= next_say) {
+        next_say = now + 1.0;
+        fprintf(stderr, "[AUTO] t=%.1f at (%.1f %.1f %.1f) -> (%.0f, %.0f) %.0f units, stick (%d, %d)\n",
+                now, chf[0xCA4 / 4], chf[0xCA8 / 4], chf[0xCAC / 4], s_auto[cur].x, s_auto[cur].z,
+                dist, s_auto_lx, s_auto_ly);
+    }
+}
 /* Host pad state for a port: real pad if attached, else the script. */
 static int pad_read(uint32_t port, XBOX_INPUT_STATE *st)
 {
     static int inited; static uint32_t packet;
-    if (!inited) { inited = 1; xbox_InputInit(); pad_script_load(); }
+    if (!inited) { inited = 1; xbox_InputInit(); pad_script_load(); if (s_auto_n < 0) auto_load(); }
     { static int polls; if (++polls == 1 || polls == 600)
         fprintf(stderr, "[PAD] title polled the pad (%d times, t=%.1fs)\n",
                 polls, pad_now()); }
     memset(st, 0, sizeof *st);
-    if (port == 0 && s_pad_script_n > 0) {
+    trace_at_step();
+    if (port == 0 && (s_pad_script_n > 0 || s_auto_n > 0)) {
         double now = pad_now();
         for (int i = 0; i < s_pad_script_n; i++)
-            if (now >= s_pad_script[i].t && now < s_pad_script[i].t + 0.25) {
+            if (now >= s_pad_script[i].t && now < s_pad_script[i].t + s_pad_script[i].dur) {
                 st->Gamepad.wButtons |= s_pad_script[i].buttons;
+                if (s_pad_script[i].has_axis) {
+                    if (s_pad_script[i].axis[0]) st->Gamepad.sThumbLX = s_pad_script[i].axis[0];
+                    if (s_pad_script[i].axis[1]) st->Gamepad.sThumbLY = s_pad_script[i].axis[1];
+                    if (s_pad_script[i].axis[2]) st->Gamepad.sThumbRX = s_pad_script[i].axis[2];
+                    if (s_pad_script[i].axis[3]) st->Gamepad.sThumbRY = s_pad_script[i].axis[3];
+                }
                 for (int k = 0; k < 8; k++) if (s_pad_script[i].analog[k]) st->Gamepad.bAnalogButtons[k] = s_pad_script[i].analog[k];
                 /* A scheduled press that is never polled looks exactly like
                  * a press the title ignored, and the two want completely
@@ -873,6 +1750,33 @@ static int pad_read(uint32_t port, XBOX_INPUT_STATE *st)
                             s_pad_script[i].name, now);
                 }
             }
+        if (s_auto_live) { st->Gamepad.sThumbLX = s_auto_lx; st->Gamepad.sThumbLY = s_auto_ly; }
+        /* JSRF_TALK_AUTO_A=<t> (t > 1): stop at t seconds. The camera mode
+         * it keys on is only updated while the follow camera runs, so after
+         * a cut to an event it can stay 12 and skip the event's lines. */
+        if (s_talk_auto_a < 0) {
+            const char *v = getenv("JSRF_TALK_AUTO_A");
+            s_talk_auto_a = v != NULL;
+            s_talk_auto_a_until = (v && atof(v) > 1.0) ? atof(v) : 1e30;
+        }
+        if (s_talk_auto_a && now < s_talk_auto_a_until && s_cam_mode_now == 12 && fmod(now, 2.0) < 0.2)
+            st->Gamepad.bAnalogButtons[XBOX_BUTTON_A] = 255;
+        for (int i = 0; i < s_auto_n && i < 16; i++) {
+            double dt = now - s_auto[i].t_done;
+            const char *b = s_auto[i].btn;
+            if (s_auto[i].state != 2 || !b[0] || dt < 0) continue;
+            if (!((dt < 0.3) || (dt >= 1.5 && dt < 1.8) || (dt >= 3.0 && dt < 3.3))) continue;
+            if (!strcmp(b, "A")) st->Gamepad.bAnalogButtons[XBOX_BUTTON_A] = 255;
+            else if (!strcmp(b, "B")) st->Gamepad.bAnalogButtons[XBOX_BUTTON_B] = 255;
+            else if (!strcmp(b, "X")) st->Gamepad.bAnalogButtons[XBOX_BUTTON_X] = 255;
+            else if (!strcmp(b, "Y")) st->Gamepad.bAnalogButtons[XBOX_BUTTON_Y] = 255;
+            else if (!strcmp(b, "LT")) st->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] = 255;
+            else if (!strcmp(b, "RT")) st->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] = 255;
+            else if (!strcmp(b, "START")) st->Gamepad.wButtons |= XBOX_GAMEPAD_START;
+            { static int said[16]; int n = dt < 0.3 ? 0 : dt < 1.8 ? 1 : 2;
+              if (!(said[i] & (1 << n))) { said[i] |= 1 << n;
+                fprintf(stderr, "[AUTO] t=%.1f arrival press %s (%d of 3) for waypoint %d\n", now, b, n + 1, i); } }
+        }
         st->dwPacketNumber = ++packet;
         return 1;
     }
@@ -1094,4 +1998,1066 @@ uint32_t recomp_atomic_cas32_unaligned(void *p, uint32_t cmp, uint32_t val)
     if (old == cmp) memcpy(p, &val, 4);
     pthread_mutex_unlock(m);
     return old;
+}
+
+/* ==========================================================================
+ * The skeleton poser, measured and replayed.
+ *
+ * sub_0005F0F0(obj, model, motion, frame[, mode]) poses a character: it
+ * evaluates `motion` at `frame` over the node tree and stores one 4x4 matrix
+ * per bone at obj+0x20 (the count is at obj+0x1c). Every rudie drawn in a
+ * dialogue close-up goes through here -- sub_00048DB0 calls it via
+ * sub_00047970 just before it builds the skinning palette.
+ *
+ * JSRF_POSE_CENSUS=<flip>  For every call during that frame and the next,
+ *     print the arguments and how far each bone's up axis leans from bone
+ *     0's. A spine folded backwards is a large number on a low bone.
+ *
+ * JSRF_SNAP=<flip>[:<k>]   On the k-th call (default 1) during the first frame
+ * JSRF_SNAP_DIR=<dir>      at or after <flip>, write guest RAM and the CPU
+ *     state to <dir>/snap_in.bin as the call begins and <dir>/snap_out.bin as
+ *     it returns. tools/snap_replay.py runs the ORIGINAL x86 from snap_in in
+ *     an emulator and compares with snap_out: any byte the two disagree on is
+ *     something the recompiled code computed that the Xbox would not have.
+ * ========================================================================== */
+#include <math.h>
+#include <string.h>
+extern uint32_t nv2a_gl_flips(void);
+extern size_t g_xbox_total_ram;
+
+static void jsrf_snap_write(const char *dir, const char *name, uint32_t va,
+                            uint32_t phase, uint32_t flip, uint32_t idx)
+{
+    char path[1024];
+    uint8_t hdr[512];
+    uint32_t w[16];
+    size_t ram = g_xbox_total_ram ? g_xbox_total_ram : ((size_t)64 << 20);
+    const RecompXmm *x[8] = { &g_xmm0, &g_xmm1, &g_xmm2, &g_xmm3,
+                              &g_xmm4, &g_xmm5, &g_xmm6, &g_xmm7 };
+    FILE *f;
+    int i;
+    snprintf(path, sizeof path, "%s/%s", dir, name);
+    f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "[SNAP] cannot write %s\n", path); return; }
+    memset(hdr, 0, sizeof hdr);
+    memcpy(hdr, "JSRFSNAP", 8);
+    w[0] = 1; w[1] = va; w[2] = phase; w[3] = (uint32_t)ram;
+    w[4] = g_eax; w[5] = g_ecx; w[6] = g_edx; w[7] = g_ebx;
+    w[8] = g_esp; w[9] = g_ebp; w[10] = g_esi; w[11] = g_edi;
+    w[12] = g_fs_base; w[13] = (uint32_t)g_fp_top; w[14] = flip; w[15] = idx;
+    memcpy(hdr + 8, w, sizeof w);                 /* 8 .. 72   */
+    memcpy(hdr + 72, (const void *)g_fp_stack, 64);  /* 72 .. 136 */
+    for (i = 0; i < 8; i++) memcpy(hdr + 136 + 16 * i, x[i], 16);  /* .. 264 */
+    fwrite(hdr, 1, sizeof hdr, f);
+    fflush(f);
+    /* Page by page with pwrite: a page the runtime has decommitted cannot be
+     * read, and one fwrite of the whole span stops dead at the first such
+     * page (the first rudie snapshot came out 37 MB of 64). Unreadable pages
+     * are written as zeros and flagged in a bitmap after the RAM image, so
+     * the replay can leave them unmapped instead of trusting zeros. */
+    {
+        int fd = fileno(f);
+        static uint8_t zero[4096];
+        static uint8_t bitmap[(256u << 20) / 4096 / 8];
+        size_t npages = ram / 4096, pg, bad = 0;
+        memset(bitmap, 0, sizeof bitmap);
+        for (pg = 0; pg < npages; pg++) {
+            const uint8_t *src = (const uint8_t *)g_xbox_mem_offset + pg * 4096;
+            off_t off = (off_t)sizeof hdr + (off_t)pg * 4096;
+            if (pwrite(fd, src, 4096, off) != 4096) {
+                (void)pwrite(fd, zero, 4096, off);
+                bad++;
+            } else if (pg / 8 < sizeof bitmap) {
+                bitmap[pg / 8] |= (uint8_t)(1u << (pg & 7));
+            }
+        }
+        (void)pwrite(fd, bitmap, npages / 8, (off_t)sizeof hdr + (off_t)ram);
+        if (bad) fprintf(stderr, "[SNAP] %s: %zu unreadable page(s) written as zeros\n", name, bad);
+    }
+    fclose(f);
+}
+
+static void jsrf_pose_census(uint32_t flip, uint32_t idx, uint32_t obj,
+                             uint32_t model, uint32_t motion, uint32_t fbits,
+                             uint32_t from)
+{
+    const uint8_t *m = (const uint8_t *)g_xbox_mem_offset;
+    const uint32_t lim = 64u << 20;
+    uint32_t nb, mats;
+    float fr;
+    char line[2048];
+    int n = 0, i;
+    memcpy(&fr, &fbits, 4);
+    if (obj < 0x10000u || obj >= lim) return;
+    nb = *(const uint32_t *)(m + obj + 0x1c);
+    mats = *(const uint32_t *)(m + obj + 0x20);
+    fprintf(stderr, "[POSE] flip %u #%u obj=%08X model=%08X motion=%08X frame=%.3f"
+            " bones=%u mats=%08X from=%08X", flip, idx, obj, model, motion, fr,
+            nb, mats, from);
+    if (motion >= 0x10000u && motion < lim)
+        fprintf(stderr, " mhdr=%08X %08X %08X", *(const uint32_t *)(m + motion),
+                *(const uint32_t *)(m + motion + 4), *(const uint32_t *)(m + motion + 8));
+    fprintf(stderr, "\n");
+    if (nb == 0 || nb > 128 || mats < 0x10000u || mats + nb * 64u > lim) return;
+    {
+        const float *b0 = (const float *)(m + mats);
+        float ux = b0[4], uy = b0[5], uz = b0[6];
+        float ul = sqrtf(ux * ux + uy * uy + uz * uz);
+        n += snprintf(line + n, sizeof line - n, "[POSE]   lean from bone0 (deg):");
+        for (i = 1; i < (int)nb && n < (int)sizeof line - 16; i++) {
+            const float *b = (const float *)(m + mats + 64u * (uint32_t)i);
+            float vx = b[4], vy = b[5], vz = b[6];
+            float vl = sqrtf(vx * vx + vy * vy + vz * vz);
+            float c = (ul > 0 && vl > 0) ? (ux * vx + uy * vy + uz * vz) / (ul * vl) : 1.0f;
+            if (c > 1) c = 1;
+            if (c < -1) c = -1;
+            n += snprintf(line + n, sizeof line - n, " %d", (int)lrintf(acosf(c) * 57.29578f));
+        }
+        fprintf(stderr, "%s\n", line);
+        fprintf(stderr, "[POSE]   bone0 at (%.2f %.2f %.2f) up (%.3f %.3f %.3f)"
+                " bone1 at (%.2f %.2f %.2f)\n", b0[12], b0[13], b0[14], ux, uy, uz,
+                nb > 1 ? b0[16 + 12] : 0.f, nb > 1 ? b0[16 + 13] : 0.f,
+                nb > 1 ? b0[16 + 14] : 0.f);
+    }
+    fflush(stderr);
+}
+
+static double jsrf_t0;
+__attribute__((constructor)) static void jsrf_t0_init(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    jsrf_t0 = ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+/* ---- the snapshot trigger, for any wrapped function ------------------------
+ *
+ * JSRF_SNAP_VA=<va>        which wrapped function to capture (default the
+ *                          poser, 0x5F0F0)
+ * JSRF_SNAP=<flip>[:<k>]   the k-th matching call at or after that flip, or
+ * JSRF_SNAP=@<sec>[:<k>]   ... at or after that many seconds after launch
+ * JSRF_SNAP_ARG=<n>=<val>  only calls whose n-th stack argument is <val>
+ * JSRF_SNAP_DIR=<dir>      where snap_in.bin / snap_out.bin go            */
+static struct {
+    int init, have_arg, done;
+    uint32_t va, flip, k, argi, argv, seen;
+    double sec;
+    const char *dir;
+} SN;
+
+static double jsrf_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9 - jsrf_t0;
+}
+
+static int jsrf_snap_begin(uint32_t va)
+{
+    uint32_t fl;
+    if (!SN.init) {
+        const char *v = getenv("JSRF_SNAP_VA"), *s = getenv("JSRF_SNAP");
+        const char *a = getenv("JSRF_SNAP_ARG");
+        SN.va = v ? (uint32_t)strtoul(v, 0, 0) : 0x0005F0F0u;
+        SN.sec = -1; SN.k = 1;
+        if (s) {
+            char *e;
+            if (*s == '@') { SN.sec = strtod(s + 1, &e); SN.flip = 0xFFFFFFFFu; }
+            else SN.flip = (uint32_t)strtoul(s, &e, 0);
+            if (*e == ':') SN.k = (uint32_t)strtoul(e + 1, 0, 0);
+        }
+        if (a) {
+            char *e;
+            SN.argi = (uint32_t)strtoul(a, &e, 0);
+            if (*e == '=') { SN.argv = (uint32_t)strtoul(e + 1, 0, 0); SN.have_arg = 1; }
+        }
+        SN.dir = getenv("JSRF_SNAP_DIR");
+        if (!SN.dir) SN.dir = ".";
+        SN.init = 1;
+    }
+    if (SN.done || !SN.flip || va != SN.va) return 0;
+    fl = nv2a_gl_flips();
+    if (SN.sec >= 0) {
+        double now = jsrf_now();
+        if (now < SN.sec) return 0;
+        SN.flip = fl; SN.sec = -1;
+        fprintf(stderr, "[SNAP] armed at flip %u (%.1f s after launch) for sub_%08X call #%u\n",
+                fl, now, va, SN.k);
+    }
+    if (fl < SN.flip) return 0;
+    if (SN.have_arg && GARG(SN.argi) != SN.argv) return 0;
+    if (++SN.seen != SN.k) return 0;
+    fprintf(stderr, "[SNAP] capturing sub_%08X call #%u at flip %u: esp=%08X from=%08X"
+            " args %08X %08X %08X %08X %08X\n", va, SN.seen, fl, g_esp, GARG(0),
+            GARG(1), GARG(2), GARG(3), GARG(4), GARG(5));
+    jsrf_snap_write(SN.dir, "snap_in.bin", va, 0, fl, SN.seen);
+    return 1;
+}
+
+static void jsrf_snap_end(uint32_t va)
+{
+    jsrf_snap_write(SN.dir, "snap_out.bin", va, 1, nv2a_gl_flips(), SN.seen);
+    SN.done = 1;
+    fprintf(stderr, "[SNAP] written: %s/snap_in.bin, snap_out.bin\n", SN.dir);
+    fflush(stderr);
+}
+
+static void jsrf_cam_counts(void);
+/* ---- where the rudies are ---------------------------------------------------
+ *
+ * JSRF_WHERE=<seconds>: every that many seconds, one line per 20-bone skeleton
+ * posed in world space (the pass whose root has an exactly vertical up axis --
+ * the other pass is camera space and tilts with the camera), giving its world
+ * position. Enough to steer a scripted run towards a character. */
+static void jsrf_where(uint32_t fl, uint32_t obj)
+{
+    static double period = -1, next_at;
+    static uint32_t where_flip;
+    const uint8_t *m = (const uint8_t *)g_xbox_mem_offset;
+    uint32_t nb, mats;
+    const float *b0;
+    if (period < 0) {
+        const char *e = getenv("JSRF_WHERE");
+        period = e ? atof(e) : 0;
+        next_at = period;
+    }
+    if (period <= 0) return;
+    if (jsrf_now() >= next_at) { where_flip = fl + 1; next_at = jsrf_now() + period; }
+    if (fl != where_flip) return;
+    if (obj < 0x10000u || obj >= (64u << 20)) return;
+    nb = *(const uint32_t *)(m + obj + 0x1c);
+    mats = *(const uint32_t *)(m + obj + 0x20);
+    if (nb != 20 || mats < 0x10000u || mats + 64u * 20u > (64u << 20)) return;
+    b0 = (const float *)(m + mats);
+    if (fabsf(b0[5] - 1.0f) > 1e-3f || fabsf(b0[6]) > 1e-3f) return;
+    fprintf(stderr, "[WHERE] t=%.1f flip %u obj=%08X at (%.1f %.1f %.1f)\n",
+            jsrf_now(), fl, obj, b0[12], b0[13], b0[14]);
+}
+
+/* ---- the poser: census + snapshot ---------------------------------------- */
+extern void sub_0005F0F0_gen(void);
+void sub_0005F0F0(void)
+{
+    static int init;
+    static uint32_t census_flip, cur_flip = 0xFFFFFFFFu, idx;
+    static double census_sec = -1;
+    uint32_t fl, from, obj, model, motion, fr;
+    int snap;
+    if (!init) {
+        const char *c = getenv("JSRF_POSE_CENSUS");
+        if (c && *c == '@') census_sec = atof(c + 1);
+        else census_flip = c ? (uint32_t)strtoul(c, 0, 0) : 0;
+        init = 1;
+    }
+    snap = jsrf_snap_begin(0x0005F0F0u);
+    if (!census_flip && census_sec < 0) {
+        uint32_t o = GARG(1);
+        sub_0005F0F0_gen();
+        if (snap) jsrf_snap_end(0x0005F0F0u);
+        jsrf_where(nv2a_gl_flips(), o);
+        jsrf_cam_counts();
+        return;
+    }
+    fl = nv2a_gl_flips();
+    if (census_sec >= 0 && jsrf_now() >= census_sec) {
+        census_flip = fl + 1; census_sec = -1;
+        fprintf(stderr, "[POSE] census armed for flip %u\n", census_flip);
+    }
+    if (fl != cur_flip) { cur_flip = fl; idx = 0; }
+    idx++;
+    from = GARG(0); obj = GARG(1); model = GARG(2); motion = GARG(3); fr = GARG(4);
+    sub_0005F0F0_gen();
+    if (snap) jsrf_snap_end(0x0005F0F0u);
+    if (census_flip && (fl == census_flip || fl == census_flip + 1))
+        jsrf_pose_census(fl, idx, obj, model, motion, fr, from);
+    jsrf_where(fl, obj);
+}
+
+/* ---- the pose sampler: sub_0005E7B0 ----------------------------------------
+ *
+ * Samples a source motion at a (fractional) frame into a one-key motion --
+ * the kind every rudie in a dialogue is posed from. JSRF_SAMPLE_LOG=1 prints
+ * each call: the source motion and frame, the floor/ceil the original would
+ * take, and the first joints' angles it produced.                         */
+static void jsrf_motion_brief(const char *tag, uint32_t mo)
+{
+    const uint8_t *m = (const uint8_t *)g_xbox_mem_offset;
+    uint32_t ch, n, i;
+    if (mo < 0x10000u || mo >= (64u << 20)) { fprintf(stderr, " %s=%08X", tag, mo); return; }
+    ch = *(const uint32_t *)(m + mo + 4);
+    n = (*(const uint32_t *)(m + mo) >> 8) & 0xFF;
+    fprintf(stderr, " %s=%08X[type %02X nodes %u frames %d]", tag, mo, m[mo],
+            n, *(const int16_t *)(m + mo + 2));
+    if (ch < 0x10000u || ch >= (64u << 20)) return;
+    for (i = 1; i < n && i < 5; i++) {
+        uint32_t c = ch + 16u * i, fl = *(const uint32_t *)(m + c);
+        uint32_t ap = *(const uint32_t *)(m + c + 8);
+        if ((fl & 0x10) && ap >= 0x10000u && ap < (64u << 20))
+            fprintf(stderr, " n%u(%d %d %d)", i, *(const int16_t *)(m + ap),
+                    *(const int16_t *)(m + ap + 2), *(const int16_t *)(m + ap + 4));
+    }
+}
+
+
+/* ---- where the rudies' folded pose first appears ---------------------------
+ * JSRF_FOLD_TRACE=1: in the sampler and the blender, note a destination pose
+ * whose joint 1 and joint 3 pitch are both strongly negative (the folded
+ * dialogue pose starts n1 x=-6792, n3 x=-10084) where it was not before the
+ * call, and print every input with its own joint angles -- the first such
+ * line names the computation that produced the fold. */
+static int jsrf_node_ang(uint32_t mo, uint32_t node, uint32_t key, int16_t out[3])
+{
+    const uint8_t *m = (const uint8_t *)g_xbox_mem_offset;
+    uint32_t ch, c, fl, ap;
+    if (mo < 0x10000u || mo >= (64u << 20)) return 0;
+    ch = *(const uint32_t *)(m + mo + 4);
+    if (ch < 0x10000u || ch >= (64u << 20)) return 0;
+    c = ch + 16u * node;
+    fl = *(const uint32_t *)(m + c);
+    ap = *(const uint32_t *)(m + c + 8);
+    if (!(fl & 0x10) || ap < 0x10000u || ap >= (64u << 20)) return 0;
+    ap += 6u * key;
+    out[0] = *(const int16_t *)(m + ap); out[1] = *(const int16_t *)(m + ap + 2);
+    out[2] = *(const int16_t *)(m + ap + 4);
+    return 1;
+}
+static int jsrf_is_folded(uint32_t mo)
+{
+    int16_t a1[3], a3[3];
+    if (!jsrf_node_ang(mo, 1, 0, a1) || !jsrf_node_ang(mo, 3, 0, a3)) return 0;
+    return a1[0] < -4000 && a3[0] < -8000;
+}
+static int jsrf_fold_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("JSRF_FOLD_TRACE") ? 1 : 0;
+    return on;
+}
+static void jsrf_fold_report(const char *who, uint32_t dst, const uint32_t *a, int na,
+                             int was)
+{
+    static int shown;
+    int i;
+    if (shown >= 60) return;
+    shown++;
+    fprintf(stderr, "[FOLD] %s made dst %08X folded (was %s) at flip %u t=%.2f from=%08X:",
+            who, dst, was ? "folded" : "normal", nv2a_gl_flips(), jsrf_now(), a[0]);
+    for (i = 1; i < na; i++) fprintf(stderr, " %08X", a[i]);
+    fprintf(stderr, "\n");
+    for (i = 1; i < na; i++) {
+        uint32_t mo = a[i];
+        int16_t q[3];
+        uint32_t n;
+        if (mo < 0x10000u || mo >= (64u << 20)) continue;
+        if ((*(const uint32_t *)((const uint8_t *)g_xbox_mem_offset + mo) & 0xFF) != 0x11
+         && (*(const uint32_t *)((const uint8_t *)g_xbox_mem_offset + mo) & 0xFF) != 0x15) continue;
+        fprintf(stderr, "[FOLD]   arg%d", i);
+        jsrf_motion_brief("", mo);
+        fprintf(stderr, " folded=%d", jsrf_is_folded(mo));
+        for (n = 5; n < 8; n++)
+            if (jsrf_node_ang(mo, n, 0, q)) fprintf(stderr, " n%u(%d %d %d)", n, q[0], q[1], q[2]);
+        fprintf(stderr, "\n");
+    }
+    fflush(stderr);
+}
+extern void sub_0005E7B0_gen(void);
+void sub_0005E7B0(void)
+{
+    /* JSRF_SAMPLE_LOG=1 or =@<sec> (from that many seconds on);
+     * JSRF_SAMPLE_DST=<lo>:<hi> keeps only samples into that address range. */
+    static int on = -1, shown;
+    static double from_sec;
+    static uint32_t dlo, dhi = 0xFFFFFFFFu;
+    uint32_t a[6], i;
+    float fr;
+    int snap = jsrf_snap_begin(0x0005E7B0u);
+    if (on < 0) {
+        const char *e = getenv("JSRF_SAMPLE_LOG"), *d = getenv("JSRF_SAMPLE_DST");
+        on = e ? 1 : 0;
+        from_sec = (e && *e == '@') ? atof(e + 1) : 0;
+        if (d) { char *x; dlo = (uint32_t)strtoul(d, &x, 0); if (*x == ':') dhi = (uint32_t)strtoul(x + 1, 0, 0); }
+    }
+    for (i = 0; i < 6; i++) a[i] = GARG(i);
+    { int was = jsrf_fold_on() ? jsrf_is_folded(a[2]) : 0;
+      sub_0005E7B0_gen();
+      if (jsrf_fold_on() && !was && jsrf_is_folded(a[2]))
+          jsrf_fold_report("sample(sub_0005E7B0)", a[2], a, 6, was); }
+    if (snap) jsrf_snap_end(0x0005E7B0u);
+    if (on && shown < 600 && a[2] >= dlo && a[2] <= dhi
+        && (from_sec <= 0 || jsrf_now() >= from_sec)) {
+        shown++;
+        memcpy(&fr, &a[5], 4);
+        fprintf(stderr, "[SAMPLE] flip %u t=%.1f from=%08X a1=%08X a3=%08X frame=%.4f"
+                " (floor %.0f ceil %.0f)", nv2a_gl_flips(), jsrf_now(), a[0], a[1],
+                a[3], fr, floor(fr), ceil(fr));
+        jsrf_motion_brief("src", a[4]);
+        jsrf_motion_brief("dst", a[2]);
+        fprintf(stderr, "\n");
+        fflush(stderr);
+    }
+}
+
+/* ---- the motion blender: sub_0005EC20(tree, dst, ?, motionA, frameA,
+ * motionB, frameB, weight) -------------------------------------------------
+ * Writes the pose a rudie is actually drawn with (the store watch on Corn's
+ * pose buffer names sub_0005E480, called from here, as its only steady
+ * writer). JSRF_BLEND_LOG=@<sec> with JSRF_SAMPLE_DST=<lo>:<hi> prints each
+ * call into that range: both motions, both frames, the weight, and the
+ * first joints it produced. */
+extern void sub_0005EC20_gen(void);
+void sub_0005EC20(void)
+{
+    static int on = -1, shown;
+    static double from_sec;
+    static uint32_t dlo, dhi = 0xFFFFFFFFu;
+    uint32_t a[9], i;
+    int snap = jsrf_snap_begin(0x0005EC20u);
+    if (on < 0) {
+        const char *e = getenv("JSRF_BLEND_LOG"), *d = getenv("JSRF_SAMPLE_DST");
+        on = e ? 1 : 0;
+        from_sec = (e && *e == '@') ? atof(e + 1) : 0;
+        if (d) { char *x; dlo = (uint32_t)strtoul(d, &x, 0); if (*x == ':') dhi = (uint32_t)strtoul(x + 1, 0, 0); }
+    }
+    for (i = 0; i < 9; i++) a[i] = GARG(i);
+    { int was = jsrf_fold_on() ? jsrf_is_folded(a[2]) : 0;
+      sub_0005EC20_gen();
+      if (jsrf_fold_on() && !was && jsrf_is_folded(a[2]))
+          jsrf_fold_report("blend(sub_0005EC20)", a[2], a, 9, was); }
+    if (snap) jsrf_snap_end(0x0005EC20u);
+    if (on && shown < 400 && a[2] >= dlo && a[2] <= dhi
+        && (from_sec <= 0 || jsrf_now() >= from_sec)) {
+        float fa, fb, w;
+        shown++;
+        memcpy(&fa, &a[5], 4); memcpy(&fb, &a[7], 4); memcpy(&w, &a[8], 4);
+        fprintf(stderr, "[BLEND] flip %u t=%.1f from=%08X tree=%08X a3=%08X frameA=%.4f"
+                " frameB=%.4f w=%.4f", nv2a_gl_flips(), jsrf_now(), a[0], a[1], a[3],
+                fa, fb, w);
+        jsrf_motion_brief("A", a[4]);
+        jsrf_motion_brief("B", a[6]);
+        jsrf_motion_brief("dst", a[2]);
+        fprintf(stderr, "\n");
+        fflush(stderr);
+    }
+}
+
+/* ---- DirectSound: a voice-done notification for a voice nobody owns ---------
+ *
+ * sub_001A200D is the APU interrupt handler's per-voice step: it looks the
+ * hardware voice up in DirectSound's owner table (dsound+0x2C4, 256 entries)
+ * and, if that voice is still on its list, retires it (sub_001A2E2E). It
+ * never checks the table entry for NULL -- on the console a notification
+ * only ever arrives for a voice that is playing, so the entry is always set.
+ *
+ * Here one arrives for hardware voice 0 while no DirectSound voice owns it.
+ * With a NULL entry the handler reads the "voice" at address 0; the
+ * console's page 0 is unmapped and that would fault, ours reads zeros, so
+ * the checks pass and sub_001A2E2E retires a voice at address 0. Its list
+ * link reads as NULL, CONTAINING_RECORD turns that into 0xFFFFFFB4, and the
+ * next load lands at guest 0xFFFFFFBE: "[CRASH] signal 10 ... fault
+ * addr=0x3FFFFFFBE in sub_001A2E2E" -- the black screen on New Game (23 Sep,
+ * Julien's run and 1 of 2 reproductions with his settings).
+ *
+ * There is nothing to retire when nobody owns the voice, so the notification
+ * is dropped. Why the voice processor reports voice 0 at all is an APU
+ * emulation question and is logged so it can be followed up. */
+extern void sub_001A200D_gen(void);
+void sub_001A200D(void)
+{
+    /* Only a NULL entry is caught. Owners live wherever DirectSound put them
+     * -- in practice the contiguous window at 0x80000000 -- so anything that
+     * is not page 0 is left to the original code, exactly as before. (The
+     * first version of this guard also rejected pointers above 64 MB, which
+     * threw away every legitimate notification and stalled the audio thread:
+     * 23 Sep, run g2.) The address is computed exactly as the original does,
+     * so this read is no riskier than the one it guards. */
+    static unsigned drops;
+    const uint8_t *m = (const uint8_t *)g_xbox_mem_offset;
+    uint32_t hw = GARG(1);
+    uint32_t owner = *(const uint32_t *)(m + (uint32_t)(g_ecx + 0x2C4u + hw * 4u));
+    if (owner < 0x10000u) {
+        unsigned n = ++drops;
+        if (n <= 8 || (n & (n - 1)) == 0) {
+            fprintf(stderr, "[DSOUND] voice-done notification for hardware voice %u,"
+                    " which no DirectSound voice owns (entry %08X) -- dropped (%u so far)\n",
+                    hw, owner, n);
+            fflush(stderr);
+        }
+        g_esp += 8;          /* ret 4: return address and the one argument */
+        return;
+    }
+    sub_001A200D_gen();
+}
+
+
+/* ---- talk events: which one starts, when, and from where --------------------
+ *
+ * sub_00038460 is the event manager's "start talk event N" (virtual, slot 8
+ * of the table at 0x1EC068; thiscall, the event number as its one argument;
+ * it records N at +0x1578 and the loader state machine at sub_00038890 then
+ * reads TE<N>.bin). JSRF_TALK_LOG=1 prints every call with its return
+ * address, so the code that decided to start a talk can be found. Added
+ * 23 Sep: Gum's talk (TE002) starts the moment Corn's ends, with Beat still
+ * 570 units away from her. */
+extern void sub_00038460_gen(void);
+void sub_00038460(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("JSRF_TALK_LOG") != NULL;
+    if (on) {
+        const uint8_t *m = (const uint8_t *)g_xbox_mem_offset;
+        uint32_t cur = (g_ecx >= 0x10000u && g_ecx < (64u << 20))
+                     ? *(const uint32_t *)(m + g_ecx + 0x1578u) : 0xFFFFFFFFu;
+        fprintf(stderr, "[TALK] t=%.1f flip %u: start talk event %u (was %u) this=%08X"
+                " from %08X  stack %08X %08X %08X %08X %08X %08X\n",
+                jsrf_now(), nv2a_gl_flips(), GARG(1), cur, g_ecx, GARG(0),
+                GARG(2), GARG(3), GARG(4), GARG(5), GARG(6), GARG(8));
+        fflush(stderr);
+    }
+    sub_00038460_gen();
+}
+
+
+/* ---- the event manager's command and query API ------------------------------
+ *
+ * sub_000256A0(cmd, arg) runs command <cmd> (table 0x1EC068, 33 entries; 8 is
+ * "start talk event <arg>") on the event manager, and sub_000256C0(cmd, arg)
+ * asks it question <cmd> (table 0x1EC178). The tutorial is plain code calling
+ * these -- 52 command and 84 query call sites -- so logging them gives the
+ * tutorial's script as it actually runs. JSRF_TALK_LOG=1 prints each
+ * (call site, cmd, arg, result) the first time and whenever the result
+ * changes: queries are polled every frame. */
+static int ev_log_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("JSRF_TALK_LOG") != NULL;
+    return on;
+}
+static int ev_changed(uint32_t from, uint32_t cmd, uint32_t arg, uint32_t res)
+{
+    static struct { uint32_t from, cmd, arg, res; int used; } t[512];
+    uint32_t h = (from * 2654435761u ^ cmd * 40503u ^ arg * 97u) & 511u;
+    int i;
+    for (i = 0; i < 512; i++) {
+        uint32_t k = (h + (uint32_t)i) & 511u;
+        if (!t[k].used) {
+            t[k].used = 1; t[k].from = from; t[k].cmd = cmd; t[k].arg = arg; t[k].res = res;
+            return 1;
+        }
+        if (t[k].from == from && t[k].cmd == cmd && t[k].arg == arg) {
+            if (t[k].res == res) return 0;
+            t[k].res = res;
+            return 1;
+        }
+    }
+    return 1;
+}
+extern void sub_000256A0_gen(void);
+void sub_000256A0(void)
+{
+    uint32_t from = GARG(0), cmd = GARG(1), arg = GARG(2);
+    sub_000256A0_gen();
+    if (ev_log_on() && ev_changed(from, cmd | 0x80000000u, arg, g_eax)) {
+        fprintf(stderr, "[EVCMD] t=%.2f flip %u cmd %u arg %u (0x%X) -> %u from %08X\n",
+                jsrf_now(), nv2a_gl_flips(), cmd, arg, arg, g_eax, from);
+        fflush(stderr);
+    }
+}
+extern void sub_000256C0_gen(void);
+void sub_000256C0(void)
+{
+    uint32_t from = GARG(0), cmd = GARG(1), arg = GARG(2);
+    sub_000256C0_gen();
+    if (ev_log_on() && ev_changed(from, cmd, arg, g_eax)) {
+        fprintf(stderr, "[EVQRY] t=%.2f flip %u query %u arg %u (0x%X) -> %u from %08X\n",
+                jsrf_now(), nv2a_gl_flips(), cmd, arg, arg, g_eax, from);
+        fflush(stderr);
+    }
+}
+
+
+/* ---- the stage script runner ------------------------------------------------
+ *
+ * sub_0005B3F0 (thiscall) walks the stage's script: header at this+0x1040,
+ * entries at header+0x174 (0x54 bytes each), count at header+0x178, current
+ * index at this+0x2B0. An entry runs only if its flag conditions hold
+ * (entry[0] -> list, entry[1] = count; sub_00039B50 checks one flag), and
+ * entry[4] is its opcode; 0x7E..0xEF are "blocking" and handed back to the
+ * caller, the rest go to sub_000585E0 (which issues event commands).
+ * JSRF_TALK_LOG=1 dumps the whole script once and logs every index change. */
+extern void sub_0005B3F0_gen(void);
+void sub_0005B3F0(void)
+{
+    static uint32_t dumped_hdr;
+    const uint8_t *m = (const uint8_t *)g_xbox_mem_offset;
+    const uint32_t lim = 64u << 20;
+    uint32_t self = g_ecx, hdr = 0, before = 0, after;
+    int on = ev_log_on() && self >= 0x10000u && self < lim;
+    if (on) {
+        hdr = *(const uint32_t *)(m + self + 0x1040u);
+        before = *(const uint32_t *)(m + self + 0x2B0u);
+        if (hdr >= 0x10000u && hdr < lim && hdr != dumped_hdr) {
+            uint32_t ents = *(const uint32_t *)(m + hdr + 0x174u);
+            uint32_t n = *(const uint32_t *)(m + hdr + 0x178u), i, k;
+            dumped_hdr = hdr;
+            fprintf(stderr, "[SCRIPT] t=%.2f runner %08X header %08X: %u entries at %08X\n",
+                    jsrf_now(), self, hdr, n, ents);
+            for (i = 0; i < n && i < 512 && ents >= 0x10000u && ents + (i + 1) * 0x54u < lim; i++) {
+                const uint32_t *e = (const uint32_t *)(m + ents + i * 0x54u);
+                char line[512]; int len = 0;
+                len += snprintf(line + len, sizeof line - len, "[SCRIPT]   #%-3u op %3u (0x%02X)", i, e[4], e[4]);
+                for (k = 0; k < 21; k++)
+                    len += snprintf(line + len, sizeof line - len, " %08X", e[k]);
+                if (e[1] && e[1] < 16 && e[0] >= 0x10000u && e[0] + e[1] * 4u < lim) {
+                    len += snprintf(line + len, sizeof line - len, "  conds:");
+                    for (k = 0; k < e[1]; k++)
+                        len += snprintf(line + len, sizeof line - len, " %08X",
+                                        *(const uint32_t *)(m + e[0] + k * 4u));
+                }
+                fprintf(stderr, "%s\n", line);
+            }
+            fflush(stderr);
+        }
+    }
+    sub_0005B3F0_gen();
+    if (on) {
+        after = *(const uint32_t *)(m + self + 0x2B0u);
+        if (after != before) {
+            fprintf(stderr, "[SCRIPT] t=%.2f flip %u index %u -> %u, returned %d\n",
+                    jsrf_now(), nv2a_gl_flips(), before, after, (int32_t)g_eax);
+            fflush(stderr);
+        }
+    }
+}
+
+
+/* ---- story flags and the triggers that read them ------------------------------
+ *
+ * The flag manager (object at 0x1EFFB0) keeps four banks of 512 bits at
+ * +0x6A14, +0x18, +0x58, +0x98. A condition word is bank | index << 3 |
+ * value << 19; sub_00039B50 tests one, sub_00039BE0 sets one. The event
+ * triggers are entries of 0x54 bytes run every frame by sub_000585E0(list,
+ * index): if all of the entry's conditions hold and the event manager is
+ * idle, its opcode becomes an event command. JSRF_TALK_LOG=1 logs every flag
+ * that changes (with the code that changed it) and every trigger that fires. */
+static uint32_t jsrf_flag_word(uint32_t fm, uint32_t cond, uint32_t *addr, uint32_t *bit)
+{
+    static const uint32_t bank_off[4] = { 0x6A14u, 0x18u, 0x58u, 0x98u };
+    uint32_t bank = cond & 7u, idx = (cond >> 3) & 0xFFFFu;
+    if (bank > 3 || idx >= 0x200u) return 0;
+    *addr = fm + bank_off[bank] + (idx >> 5) * 4u;
+    *bit = idx & 31u;
+    return 1;
+}
+extern void sub_00039BE0_gen(void);
+void sub_00039BE0(void)
+{
+    const uint8_t *m = (const uint8_t *)g_xbox_mem_offset;
+    uint32_t fm = g_ecx, cond = GARG(1), from = GARG(0), a = 0, b = 0, was = 0, now;
+    int ok = ev_log_on() && fm >= 0x10000u && fm < (64u << 20) && jsrf_flag_word(fm, cond, &a, &b);
+    if (ok) was = (*(const uint32_t *)(m + a) >> b) & 1u;
+    sub_00039BE0_gen();
+    if (ok) {
+        now = (*(const uint32_t *)(m + a) >> b) & 1u;
+        if (now != was) {
+            fprintf(stderr, "[FLAG] t=%.2f flip %u bank %u flag %u := %u (cond %08X) from %08X\n",
+                    jsrf_now(), nv2a_gl_flips(), cond & 7u, (cond >> 3) & 0xFFFFu, now, cond, from);
+            fflush(stderr);
+        }
+    }
+}
+extern void sub_000585E0_gen(void);
+void sub_000585E0(void)
+{
+    const uint8_t *m = (const uint8_t *)g_xbox_mem_offset;
+    const uint32_t lim = 64u << 20;
+    uint32_t self = g_ecx, list = GARG(1), idx = GARG(2), busy0 = 0, busy1;
+    int on = ev_log_on() && self >= 0x10000u && self < lim;
+    if (on) busy0 = *(const uint32_t *)(m + self + 0x238u);
+    /* Every entry whose conditions have just become true -- whatever its
+     * opcode, not only the ones that issue an event command. */
+    if (on && list >= 0x10000u && list + (idx + 1) * 0x54u < lim) {
+        static struct { uint32_t list, idx; int held; } seen[1024];
+        const uint32_t *e = (const uint32_t *)(m + list + idx * 0x54u);
+        uint32_t k, a, b, h, ok = 1;
+        for (k = 0; k < e[1] && k < 16; k++) {
+            uint32_t c;
+            if (e[0] < 0x10000u || e[0] + (k + 1) * 4u >= lim) { ok = 0; break; }
+            c = *(const uint32_t *)(m + e[0] + k * 4u);
+            if (!jsrf_flag_word(0x1EFFB0u, c, &a, &b)) { ok = 0; break; }
+            if (((*(const uint32_t *)(m + a) >> b) & 1u) != ((c >> 19) & 1u)) { ok = 0; break; }
+        }
+        h = (list * 2654435761u ^ idx * 97u) & 1023u;
+        for (k = 0; k < 1024; k++) {
+            uint32_t j = (h + k) & 1023u;
+            if (!seen[j].list) { seen[j].list = list; seen[j].idx = idx; seen[j].held = 0; h = j; break; }
+            if (seen[j].list == list && seen[j].idx == idx) { h = j; break; }
+        }
+        if (ok && !seen[h].held) {
+            char line[640]; int len = 0;
+            len += snprintf(line + len, sizeof line - len,
+                            "[ENTRY] t=%.2f flip %u list %08X #%u op %u (0x%X) args %08X %08X %08X %08X %08X %08X; conds",
+                            jsrf_now(), nv2a_gl_flips(), list, idx, e[4], e[4], e[5], e[6], e[7], e[8], e[9], e[10]);
+            for (k = 0; k < e[1] && k < 12; k++) {
+                uint32_t c = *(const uint32_t *)(m + e[0] + k * 4u);
+                len += snprintf(line + len, sizeof line - len, " [b%u f%u =%u]",
+                                c & 7u, (c >> 3) & 0xFFFFu, (c >> 19) & 1u);
+            }
+            len += snprintf(line + len, sizeof line - len, "; sets");
+            for (k = 0; k < e[3] && k < 12 && e[2] >= 0x10000u && e[2] + (k + 1) * 4u < lim; k++) {
+                uint32_t c = *(const uint32_t *)(m + e[2] + k * 4u);
+                len += snprintf(line + len, sizeof line - len, " [b%u f%u =%u]",
+                                c & 7u, (c >> 3) & 0xFFFFu, (c >> 19) & 1u);
+            }
+            fprintf(stderr, "%s\n", line);
+            fflush(stderr);
+        }
+        seen[h].held = (int)ok;
+    }
+    sub_000585E0_gen();
+    if (!on) return;
+    busy1 = *(const uint32_t *)(m + self + 0x238u);
+    if (!busy0 && busy1 && list >= 0x10000u && list + (idx + 1) * 0x54u < lim) {
+        const uint32_t *e = (const uint32_t *)(m + list + idx * 0x54u);
+        char line[640]; int len = 0; uint32_t k;
+        len += snprintf(line + len, sizeof line - len,
+                        "[TRIGGER] t=%.2f flip %u list %08X entry #%u op %u (0x%X) arg %u (0x%X) fired; conds",
+                        jsrf_now(), nv2a_gl_flips(), list, idx, e[4], e[4], e[5], e[5]);
+        for (k = 0; k < e[1] && k < 12 && e[0] >= 0x10000u && e[0] + (k + 1) * 4u < lim; k++) {
+            uint32_t c = *(const uint32_t *)(m + e[0] + k * 4u);
+            len += snprintf(line + len, sizeof line - len, " [b%u f%u =%u]",
+                            c & 7u, (c >> 3) & 0xFFFFu, (c >> 19) & 1u);
+        }
+        len += snprintf(line + len, sizeof line - len, "; sets");
+        for (k = 0; k < e[3] && k < 12 && e[2] >= 0x10000u && e[2] + (k + 1) * 4u < lim; k++) {
+            uint32_t c = *(const uint32_t *)(m + e[2] + k * 4u);
+            len += snprintf(line + len, sizeof line - len, " [b%u f%u =%u]",
+                            c & 7u, (c >> 3) & 0xFFFFu, (c >> 19) & 1u);
+        }
+        fprintf(stderr, "%s\n", line);
+        fflush(stderr);
+    }
+}
+
+
+/* ---- the player's talk trigger ----------------------------------------------
+ *
+ * sub_00080BD0 is a character's per-frame update (this = the character; its
+ * position is the vec3 at +0xCA4). When +0x308 is set it looks up the talk
+ * point +0x2F8 in the event-scene registry (0x20C750) and opens the talk --
+ * the "get close to her and pull the Right Trigger" path. JSRF_TALK_LOG=1
+ * logs every change of those fields, per character, with the position. */
+extern void sub_00080BD0_gen(void);
+void sub_00080BD0(void)
+{
+    static struct { uint32_t obj, f308, f2f8, f2dc, f2e0; } seen[16];
+    const uint8_t *m = (const uint8_t *)g_xbox_mem_offset;
+    uint32_t self = g_ecx;
+    sub_00080BD0_gen();
+    if (ev_log_on() && self >= 0x10000u && self < (64u << 20)) {
+        uint32_t f308 = *(const uint32_t *)(m + self + 0x308u);
+        uint32_t f2f8 = *(const uint32_t *)(m + self + 0x2F8u);
+        uint32_t f2dc = *(const uint32_t *)(m + self + 0x2DCu);
+        uint32_t f2e0 = *(const uint32_t *)(m + self + 0x2E0u);
+        const float *pos = (const float *)(m + self + 0xCA4u);
+        int i, slot = -1;
+        for (i = 0; i < 16; i++) {
+            if (seen[i].obj == self) { slot = i; break; }
+            if (!seen[i].obj) { seen[i].obj = self; seen[i].f308 = ~f308; slot = i; break; }
+        }
+        if (slot >= 0 && (seen[slot].f308 != f308 || seen[slot].f2f8 != f2f8
+                          || seen[slot].f2dc != f2dc || seen[slot].f2e0 != f2e0)) {
+            fprintf(stderr, "[TALKPT] t=%.2f flip %u char %08X at (%.1f %.1f %.1f): +308=%08X +2F8=%08X +2DC=%08X +2E0=%08X\n",
+                    jsrf_now(), nv2a_gl_flips(), self, pos[0], pos[1], pos[2], f308, f2f8, f2dc, f2e0);
+            fflush(stderr);
+            seen[slot].f308 = f308; seen[slot].f2f8 = f2f8;
+            seen[slot].f2dc = f2dc; seen[slot].f2e0 = f2e0;
+        }
+    }
+}
+
+
+/* ---- who opens a talk ------------------------------------------------------
+ * sub_0006D9A0 constructs the talk display (class 0x1CC5D0; args: owner,
+ * 0x1DDE, 0x10, talk id, camera shot, scene position, ...). sub_00052780 is
+ * the stage script's talk op, which also moves the player to the scene. */
+extern void sub_0006D9A0_gen(void);
+void sub_0006D9A0(void)
+{
+    if (ev_log_on()) {
+        fprintf(stderr, "[TALKOPEN] t=%.2f flip %u display %08X from %08X args %08X %08X %08X talk=%d shot=%d %08X %08X\n",
+                jsrf_now(), nv2a_gl_flips(), g_ecx, GARG(0), GARG(1), GARG(2), GARG(3),
+                (int32_t)GARG(4), (int32_t)GARG(5), GARG(6), GARG(7));
+        fflush(stderr);
+    }
+    sub_0006D9A0_gen();
+}
+extern void sub_00052780_gen(void);
+void sub_00052780(void)
+{
+    if (ev_log_on()) {
+        fprintf(stderr, "[TALKOP] t=%.2f flip %u script talk op, this=%08X from %08X\n",
+                jsrf_now(), nv2a_gl_flips(), g_ecx, GARG(0));
+        fflush(stderr);
+    }
+    sub_00052780_gen();
+}
+
+
+/* ---- the stage's blocking-entry list ------------------------------------------
+ * sub_00057DE0 (thiscall, the event object) scans header+0x18C (count at
+ * +0x190, 0x54-byte entries): the first entry whose flag conditions hold and
+ * whose op is 0xE2..0xF9 is returned and becomes a mode (0xE7 = open a talk).
+ * Only op 0xF6 also asks the player (message 0x1AF). JSRF_TALK_LOG=1 dumps
+ * the list and the trigger list (header+0x17C / +0x180) once, and logs every
+ * entry this returns. */
+static void jsrf_dump_entries(const char *what, uint32_t ents, uint32_t n)
+{
+    const uint8_t *m = (const uint8_t *)g_xbox_mem_offset;
+    const uint32_t lim = 64u << 20;
+    uint32_t i, k;
+    fprintf(stderr, "[LIST] %s: %u entries at %08X\n", what, n, ents);
+    for (i = 0; i < n && i < 256 && ents >= 0x10000u && ents + (i + 1) * 0x54u < lim; i++) {
+        const uint32_t *e = (const uint32_t *)(m + ents + i * 0x54u);
+        char line[768]; int len = 0;
+        len += snprintf(line + len, sizeof line - len, "[LIST]   %s #%-3u op 0x%02X args %08X %08X %08X %08X %08X %08X; conds",
+                        what, i, e[4], e[5], e[6], e[7], e[8], e[9], e[10]);
+        for (k = 0; k < e[1] && k < 12 && e[0] >= 0x10000u && e[0] + (k + 1) * 4u < lim; k++) {
+            uint32_t c = *(const uint32_t *)(m + e[0] + k * 4u);
+            len += snprintf(line + len, sizeof line - len, " [b%u f%u =%u]", c & 7u, (c >> 3) & 0xFFFFu, (c >> 19) & 1u);
+        }
+        len += snprintf(line + len, sizeof line - len, "; sets");
+        for (k = 0; k < e[3] && k < 12 && e[2] >= 0x10000u && e[2] + (k + 1) * 4u < lim; k++) {
+            uint32_t c = *(const uint32_t *)(m + e[2] + k * 4u);
+            len += snprintf(line + len, sizeof line - len, " [b%u f%u =%u]", c & 7u, (c >> 3) & 0xFFFFu, (c >> 19) & 1u);
+        }
+        fprintf(stderr, "%s\n", line);
+    }
+    fflush(stderr);
+}
+extern void sub_00057DE0_gen(void);
+void sub_00057DE0(void)
+{
+    static uint32_t dumped;
+    const uint8_t *m = (const uint8_t *)g_xbox_mem_offset;
+    const uint32_t lim = 64u << 20;
+    uint32_t self = g_ecx, hdr = 0;
+    int on = ev_log_on() && self >= 0x10000u && self < lim;
+    if (on) {
+        hdr = *(const uint32_t *)(m + self + 0x1040u);
+        if (hdr >= 0x10000u && hdr < lim && hdr != dumped) {
+            dumped = hdr;
+            jsrf_dump_entries("blocking", *(const uint32_t *)(m + hdr + 0x18Cu), *(const uint32_t *)(m + hdr + 0x190u));
+            jsrf_dump_entries("trigger", *(const uint32_t *)(m + hdr + 0x17Cu), *(const uint32_t *)(m + hdr + 0x180u));
+        }
+    }
+    sub_00057DE0_gen();
+    if (on && (int32_t)g_eax >= 0) {
+        uint32_t ents = *(const uint32_t *)(m + hdr + 0x18Cu);
+        uint32_t cur = *(const uint32_t *)(m + self + 0xFB8u);
+        fprintf(stderr, "[BLOCK] t=%.2f flip %u returned op 0x%02X, entry #%d\n",
+                jsrf_now(), nv2a_gl_flips(), g_eax,
+                (cur >= ents && ents) ? (int)((cur - ents) / 0x54u) : -1);
+        fflush(stderr);
+    }
+}
+
+
+/* ---- the zone test ----------------------------------------------------------
+ * sub_0004A6F0(point, zone) -> 1 if the point is on the inner side of all six
+ * planes of the zone (6 plane points at zone+0x00, 6 normals at zone+0x48):
+ * dot(plane_point - point, normal) must not be below 0 (a NaN counts as
+ * inside, on the console too). The event-scene registry uses it to decide
+ * that a character has walked into a talk zone. JSRF_TALK_LOG=1 logs the
+ * first 24 "inside" answers and a few "outside" ones, with the numbers. */
+extern void sub_0004A6F0_gen(void);
+void sub_0004A6F0(void)
+{
+    static unsigned n_in, n_out;
+    const uint8_t *m = (const uint8_t *)g_xbox_mem_offset;
+    const uint32_t lim = 64u << 20;
+    uint32_t pt = GARG(1), zone = GARG(2), from = GARG(0);
+    sub_0004A6F0_gen();
+    /* Only the event-scene registry's calls (sub_0006C6E0), and only once the
+     * stage is running: the title's own zone checks would use up the budget. */
+    if (ev_log_on() && from >= 0x0006C6E0u && from < 0x0006C840u && jsrf_now() > 60.0
+        && pt >= 0x10000u && pt < lim && zone >= 0x10000u && zone + 0x90u < lim
+        && ((g_eax && n_in < 24) || (!g_eax && n_out < 12))) {
+        const float *p = (const float *)(m + pt), *z = (const float *)(m + zone);
+        char line[640]; int len = 0, i;
+        if (g_eax) n_in++; else n_out++;
+        len += snprintf(line + len, sizeof line - len,
+                        "[ZONE] t=%.2f %s from %08X point %08X (%.1f %.1f %.1f) zone %08X dots",
+                        jsrf_now(), g_eax ? "INSIDE" : "outside", from, pt, p[0], p[1], p[2], zone);
+        for (i = 0; i < 6; i++) {
+            const float *q = z + 3 * i, *nv = z + 18 + 3 * i;
+            float d = (q[0] - p[0]) * nv[0] + (q[1] - p[1]) * nv[1] + (q[2] - p[2]) * nv[2];
+            len += snprintf(line + len, sizeof line - len, " %.1f", d);
+        }
+        len += snprintf(line + len, sizeof line - len, "  p0 (%.1f %.1f %.1f) n0 (%.2f %.2f %.2f)",
+                        z[0], z[1], z[2], z[18], z[19], z[20]);
+        {   /* which registration, which probe */
+            uint32_t reg = (from == 0x0006C769u || from == 0x0006C7E2u) ? zone - 0xE0u : zone - 0x50u;
+            const uint32_t *r = (const uint32_t *)(m + reg);
+            const uint32_t *pr = (const uint32_t *)(m + pt);
+            len += snprintf(line + len, sizeof line - len,
+                            "  reg %08X id=%u task=%u param=%u type=%u shot=%d | probe idx=%d +24=%u +28=%u +2C=%u +30=%u",
+                            reg, r[0x178 / 4], r[0x17C / 4], r[0x184 / 4], r[8 / 4], (int32_t)r[0xC / 4],
+                            (int32_t)pr[0xC / 4], pr[0x24 / 4], pr[0x28 / 4], pr[0x2C / 4], pr[0x30 / 4]);
+        }
+        fprintf(stderr, "%s\n", line);
+        fflush(stderr);
+    }
+}
+
+
+/* ---- "has character <a> walked into the zone of scene <b>?" --------------------
+ * sub_0006C680(a, b), thiscall on the event-scene registry (0x20C750): true
+ * if a registration with +0x17C == b has +0x180 == a + 1 (the registry's
+ * per-frame update, sub_0006C6E0, sets +0x180 to the index + 1 of a probe it
+ * finds inside the scene's zone). Trigger op 0x04 uses it: Gum's lesson
+ * waits on (0, 1) -- the player inside scene 1's zone. JSRF_TALK_LOG=1 logs
+ * every true answer and the first false ones, with every registration. */
+extern void sub_0006C680_gen(void);
+void sub_0006C680(void)
+{
+    static unsigned n_false;
+    const uint8_t *m = (const uint8_t *)g_xbox_mem_offset;
+    const uint32_t lim = 64u << 20;
+    uint32_t self = g_ecx, a = GARG(1), b = GARG(2), from = GARG(0);
+    sub_0006C680_gen();
+    if (ev_log_on() && self >= 0x10000u && self < lim && (g_eax || n_false < 4)) {
+        uint32_t reg = *(const uint32_t *)(m + self + 4u);
+        int k = 0;
+        if (!g_eax) n_false++;
+        fprintf(stderr, "[INZONE] t=%.2f flip %u (%u, %u) -> %u from %08X; regs:", jsrf_now(),
+                nv2a_gl_flips(), a, b, g_eax, from);
+        while (reg >= 0x10000u && reg + 0x190u < lim && k++ < 16) {
+            const uint32_t *r = (const uint32_t *)(m + reg);
+            fprintf(stderr, " [%08X id=%u task=%u in=%u]", reg, r[0x178 / 4], r[0x17C / 4], r[0x180 / 4]);
+            reg = r[0x18C / 4];
+        }
+        fprintf(stderr, "\n");
+        fflush(stderr);
+    }
+}
+
+
+/* ---- the camera -------------------------------------------------------------
+ * Object 0x4C (class 0x1CD518) is the camera; sub_000A5070 its per-frame
+ * update. It picks a mode from its target character's state (+0xE58, with
+ * overrides from +0xF18, +0xEC8, +0xE38/+0xE3C), switches mode through the
+ * table at 0x215534 when that changes (+0x208 holds the current one), runs
+ * the mode's update from 0x215570, and returns early while +0x1E0 is set.
+ * Eye at +0x44, target at +0x5C. JSRF_CAM_LOG=1 prints every change of the
+ * mode inputs and the eye position once a second. */
+extern void sub_000A5070_gen(void);
+void sub_000A5070(void)
+{
+    static int on = -1;
+    static uint32_t last[10];
+    static double next;
+    const uint8_t *m = (const uint8_t *)g_xbox_mem_offset;
+    const uint32_t lim = 64u << 20;
+    uint32_t cam = g_ecx;
+    if (on < 0) on = getenv("JSRF_CAM_LOG") != NULL;
+    sub_000A5070_gen();
+    if (cam >= 0x10000u && cam + 0x240u < lim)
+        s_cam_mode_now = ((const uint32_t *)(m + cam))[0x208 / 4];
+    { static int hooks = -1;
+      if (hooks < 0) hooks = (getenv("JSRF_CANS") || getenv("JSRF_BOOST_DUMP")) ? 1 : 0;
+      if (hooks && cam >= 0x10000u && cam + 0x240u < lim) {
+          uint32_t who = ((const uint32_t *)(m + cam))[0x24 / 4];
+          if (who >= 0x10000u && who + 0x1000u < lim)
+              test_hooks_step((uint8_t *)(uintptr_t)(m + who));
+      } }
+    save_menu_open_step();
+    mission_at_step();
+    if (s_auto_n != 0 && cam >= 0x10000u && cam + 0x240u < lim) {
+        uint32_t who = ((const uint32_t *)(m + cam))[0x24 / 4];
+        if (who >= 0x10000u && who + 0x1000u < lim) {
+            teleport_step((float *)(uintptr_t)(m + who));
+            auto_step((const float *)(m + cam), (const float *)(m + who));
+        }
+    }
+    if (!on || cam < 0x10000u || cam + 0x240u >= lim) return;
+    {
+        const uint32_t *c = (const uint32_t *)(m + cam);
+        const float *cf = (const float *)(m + cam);
+        uint32_t tgt = c[0x24 / 4];          /* sub_00011BD0: the character it follows */
+        uint32_t now[10];
+        int i, changed = 0;
+        now[0] = c[0x208 / 4]; now[1] = c[0x1E0 / 4]; now[2] = c[0x40 / 4];
+        now[3] = c[0x98 / 4];  now[4] = c[0x1DC / 4];
+        now[5] = now[6] = now[7] = now[8] = now[9] = 0;
+        if (tgt >= 0x10000u && tgt + 0x1000u < lim) {
+            const uint32_t *t = (const uint32_t *)(m + tgt);
+            now[5] = t[0xE58 / 4]; now[6] = t[0xF18 / 4]; now[7] = t[0xEC8 / 4];
+            now[8] = t[0xE38 / 4]; now[9] = t[0xE3C / 4];
+        }
+        for (i = 0; i < 10; i++) if (now[i] != last[i]) changed = 1;
+        if (changed || jsrf_now() >= next) {
+            next = jsrf_now() + 1.0;
+            fprintf(stderr, "[CAM] t=%.2f flip %u cam %08X mode=%u +1E0=%u +40=%08X +98=%u +1DC=%u | char %08X E58=%u F18=%u EC8=%u E38=%u E3C=%u | eye (%.1f %.1f %.1f) tgt (%.1f %.1f %.1f)%s\n",
+                    jsrf_now(), nv2a_gl_flips(), cam, now[0], now[1], now[2], now[3], now[4],
+                    tgt, now[5], now[6], now[7], now[8], now[9],
+                    cf[0x44 / 4], cf[0x48 / 4], cf[0x4C / 4], cf[0x5C / 4], cf[0x60 / 4], cf[0x64 / 4],
+                    changed ? "  <- changed" : "");
+            fflush(stderr);
+            memcpy(last, now, sizeof last);
+        }
+    }
+}
+
+/* ---- camera call counters (JSRF_CAM_LOG=1): which camera methods and mode
+ * handlers actually run, printed every two seconds from the poser. */
+static unsigned long jsrf_camcnt[18];
+static const uint32_t jsrf_camva[18] = { 0x000A28B0u, 0x000A2960u, 0x000A3A70u, 0x000A3BD0u, 0x000A3D10u, 0x000A59B0u, 0x000A58B0u, 0x000A58C0u, 0x000A58E0u, 0x000A3E50u, 0x000A4100u, 0x000A5A00u, 0x000A5A70u, 0x000A5AC0u, 0x000A5AF0u, 0x000A4890u, 0x000A4D80u, 0x000A4C30u };
+extern void sub_000A28B0_gen(void);
+void sub_000A28B0(void) { jsrf_camcnt[0]++; sub_000A28B0_gen(); }
+extern void sub_000A2960_gen(void);
+void sub_000A2960(void) { jsrf_camcnt[1]++; sub_000A2960_gen(); }
+extern void sub_000A3A70_gen(void);
+void sub_000A3A70(void) { jsrf_camcnt[2]++; sub_000A3A70_gen(); }
+extern void sub_000A3BD0_gen(void);
+void sub_000A3BD0(void) { jsrf_camcnt[3]++; sub_000A3BD0_gen(); }
+extern void sub_000A3D10_gen(void);
+void sub_000A3D10(void) { jsrf_camcnt[4]++; sub_000A3D10_gen(); }
+extern void sub_000A59B0_gen(void);
+void sub_000A59B0(void) { jsrf_camcnt[5]++; sub_000A59B0_gen(); }
+extern void sub_000A58B0_gen(void);
+void sub_000A58B0(void) { jsrf_camcnt[6]++; sub_000A58B0_gen(); }
+extern void sub_000A58C0_gen(void);
+void sub_000A58C0(void) { jsrf_camcnt[7]++; sub_000A58C0_gen(); }
+extern void sub_000A58E0_gen(void);
+void sub_000A58E0(void) { jsrf_camcnt[8]++; sub_000A58E0_gen(); }
+extern void sub_000A3E50_gen(void);
+void sub_000A3E50(void) { jsrf_camcnt[9]++; sub_000A3E50_gen(); }
+extern void sub_000A4100_gen(void);
+void sub_000A4100(void) { jsrf_camcnt[10]++; sub_000A4100_gen(); }
+extern void sub_000A5A00_gen(void);
+void sub_000A5A00(void) { jsrf_camcnt[11]++; sub_000A5A00_gen(); }
+extern void sub_000A5A70_gen(void);
+void sub_000A5A70(void) { jsrf_camcnt[12]++; sub_000A5A70_gen(); }
+extern void sub_000A5AC0_gen(void);
+void sub_000A5AC0(void) { jsrf_camcnt[13]++; sub_000A5AC0_gen(); }
+extern void sub_000A5AF0_gen(void);
+void sub_000A5AF0(void) { jsrf_camcnt[14]++; sub_000A5AF0_gen(); }
+extern void sub_000A4890_gen(void);
+void sub_000A4890(void) { jsrf_camcnt[15]++; sub_000A4890_gen(); }
+extern void sub_000A4D80_gen(void);
+void sub_000A4D80(void) { jsrf_camcnt[16]++; sub_000A4D80_gen(); }
+extern void sub_000A4C30_gen(void);
+void sub_000A4C30(void) { jsrf_camcnt[17]++; sub_000A4C30_gen(); }
+static void jsrf_cam_counts(void)
+{
+    static int on = -1; static double next;
+    int i; char line[1024]; int len = 0;
+    if (on < 0) on = getenv("JSRF_CAM_LOG") != NULL;
+    if (!on || jsrf_now() < next) return;
+    next = jsrf_now() + 2.0;
+    len += snprintf(line + len, sizeof line - len, "[CAMCNT] t=%.1f", jsrf_now());
+    for (i = 0; i < (int)(sizeof jsrf_camcnt / sizeof jsrf_camcnt[0]); i++)
+        if (jsrf_camcnt[i])
+            len += snprintf(line + len, sizeof line - len, " %05X:%lu", jsrf_camva[i], jsrf_camcnt[i]);
+    fprintf(stderr, "%s\n", line); fflush(stderr);
 }
