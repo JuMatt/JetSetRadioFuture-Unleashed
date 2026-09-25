@@ -377,21 +377,29 @@ def _make_condition(jcc, flag_setter, flag_ops):
     # ── FPU compare-to-EFLAGS and sahf: no standard operands ──
     if flag_setter in ("fcompi", "fcomip", "fucomi", "fucompi",
                         "fucomip", "fcomi", "sahf"):
+        # g_fp_cmp is -1 less, 0 equal, 1 greater, 2 unordered. Unordered
+        # sets ZF, PF and CF together (fcomi directly, sahf via C3/C2/C0), so
+        # it has to count as below, below-or-equal and equal -- and as
+        # neither above nor above-or-equal. Comparing the code against 0
+        # (the old form) made 2 read as "greater".
         fpu_cmp_map = {
-            "ja": ">", "jnbe": ">",
-            "jae": ">=", "jnb": ">=", "jnc": ">=",
-            "jb": "<", "jnae": "<", "jc": "<",
-            "jbe": "<=", "jna": "<=",
-            "je": "==", "jz": "==",
-            "jne": "!=", "jnz": "!=",
+            "ja": "(g_fp_cmp == 1)", "jnbe": "(g_fp_cmp == 1)",
+            "jae": "(g_fp_cmp == 0 || g_fp_cmp == 1)",
+            "jnb": "(g_fp_cmp == 0 || g_fp_cmp == 1)",
+            "jnc": "(g_fp_cmp == 0 || g_fp_cmp == 1)",
+            "jb": "(g_fp_cmp == -1 || g_fp_cmp == 2)",
+            "jnae": "(g_fp_cmp == -1 || g_fp_cmp == 2)",
+            "jc": "(g_fp_cmp == -1 || g_fp_cmp == 2)",
+            "jbe": "(g_fp_cmp != 1)", "jna": "(g_fp_cmp != 1)",
+            "je": "(g_fp_cmp == 0 || g_fp_cmp == 2)",
+            "jz": "(g_fp_cmp == 0 || g_fp_cmp == 2)",
+            "jne": "(g_fp_cmp == -1 || g_fp_cmp == 1)",
+            "jnz": "(g_fp_cmp == -1 || g_fp_cmp == 1)",
+            "jp": "(g_fp_cmp == 2)", "jnp": "(g_fp_cmp != 2)",
         }
-        op = fpu_cmp_map.get(jcc)
-        if op:
-            return f"(g_fp_cmp {op} 0) /* {flag_setter} */", desc
-        if jcc == "jp":
-            return "0 /* fpu: unordered/NaN */", desc
-        if jcc == "jnp":
-            return "1 /* fpu: ordered */", desc
+        cond = fpu_cmp_map.get(jcc)
+        if cond:
+            return f"{cond} /* {flag_setter} */", desc
         return None
 
     # If no operands available for other flag-setters, can't generate condition
@@ -419,23 +427,31 @@ def _make_condition(jcc, flag_setter, flag_ops):
         )
         desc = f"{desc} ({void_a} vs {void_b})" if desc else desc
         a, b = "_fca", "_fcb"
-        # comiss uses unsigned condition codes (CF, ZF)
+        # comiss uses unsigned condition codes (CF, ZF) -- and an UNORDERED
+        # compare (either operand NaN) sets ZF, PF and CF all at once. So
+        # every condition that is true on CF or ZF is also true on NaN, which
+        # C's relational operators are not: `a < b` is false when a is NaN,
+        # but jb after comiss is taken. JSRF normalises a zero-length motion
+        # segment into a NaN direction (0 * rsqrtss(0) = 0 * inf), and its
+        # edge tests then read "no hit" on the Xbox through jb; lifted as
+        # `a < b` they fell through to "hit", and every rudie standing still
+        # in the Garage was knocked flat every frame.
         if jcc in ("ja", "jnbe"):
-            return f"({a} > {b})", desc
+            return f"({a} > {b})", desc                      # CF=0 and ZF=0
         if jcc in ("jae", "jnb", "jnc"):
-            return f"({a} >= {b})", desc
+            return f"({a} >= {b})", desc                     # CF=0
         if jcc in ("jb", "jnae", "jc"):
-            return f"({a} < {b})", desc
+            return f"(!({a} >= {b}))", desc                  # CF=1: less or unordered
         if jcc in ("jbe", "jna"):
-            return f"({a} <= {b})", desc
+            return f"(!({a} > {b}))", desc                   # CF=1 or ZF=1
         if jcc in ("je", "jz"):
-            return f"({a} == {b})", desc
+            return f"(!({a} < {b}) && !({a} > {b}))", desc   # ZF=1: equal or unordered
         if jcc in ("jne", "jnz"):
-            return f"({a} != {b})", desc
+            return f"(({a} < {b}) || ({a} > {b}))", desc     # ZF=0: ordered, not equal
         if jcc == "jp":
-            return f"0 /* {jcc}: unordered/NaN */", desc
+            return f"(({a} != {a}) || ({b} != {b})) /* {jcc}: unordered */", desc
         if jcc == "jnp":
-            return f"1 /* {jcc}: ordered */", desc
+            return f"(({a} == {a}) && ({b} == {b})) /* {jcc}: ordered */", desc
         return None
 
     # SF is the sign bit of the result at the OPERAND's width, not at 32 bits.
@@ -1496,7 +1512,11 @@ class Lifter:
             r = ops[1].reg
             if r in ("al", "bl", "cl", "dl", "ah", "bh", "ch", "dh"):
                 src = f"SX8({src})"
-            elif r in ("ax", "bx", "cx", "dx", "si", "di"):
+            # bp and sp belong here too. They were missing, so `movsx ecx, bp`
+            # fell through as a plain 16-bit read -- a zero extension -- and
+            # JSRF's keyframe angle interpolator (sub_0005D3B0) handed every
+            # negative X angle back 65536 too large.
+            elif r in ("ax", "bx", "cx", "dx", "si", "di", "bp", "sp"):
                 src = f"SX16({src})"
         return [_fmt_operand_write(ops[0], src)]
 
@@ -2644,16 +2664,19 @@ class Lifter:
             if nops >= 2:
                 src = _fmt_operand_read(ops[1])
                 return [_sse_write(ops[0], f"(float)(int32_t){src}") + " /* cvtsi2ss */"]
-        if m in ("cvtss2si", "cvttss2si"):
+        if m in ("cvtss2si", "cvttss2si", "cvtsd2si", "cvttsd2si"):
+            # cvtss2si/cvtsd2si ROUND (MXCSR: round-to-nearest-even); only the
+            # cvtt- forms truncate. Both used to be a plain (int32_t) cast,
+            # which truncates -- so every rounding conversion truncated
+            # (JSRF's FloatToInt at 0x14C690, 134 call sites) -- and is
+            # undefined for NaN/out-of-range, where x86 gives 0x80000000.
             if nops >= 2:
-                return [_fmt_operand_write(ops[0], f"(int32_t){_sse_read(ops[1])}") + f" /* {m} */"]
+                helper = "recomp_cvtt2si" if m.startswith("cvtt") else "recomp_cvt2si"
+                return [_fmt_operand_write(ops[0], f"{helper}({_sse_read(ops[1])})") + f" /* {m} */"]
         if m == "cvtsi2sd":
             if nops >= 2:
                 src = _fmt_operand_read(ops[1])
                 return [_sse_write(ops[0], f"(double)(int32_t){src}") + " /* cvtsi2sd */"]
-        if m in ("cvtsd2si", "cvttsd2si"):
-            if nops >= 2:
-                return [_fmt_operand_write(ops[0], f"(int32_t){_sse_read(ops[1])}") + f" /* {m} */"]
         if m == "cvtss2sd":
             if nops >= 2:
                 return [_sse_write(ops[0], f"(double){_sse_read(ops[1])}") + " /* cvtss2sd */"]
@@ -3015,7 +3038,12 @@ class Lifter:
         if m in ("fnclex", "fclex"):
             return ["/* fnclex: clear x87 exception flags (nothing tracked) */"]
         if m == "frndint":
-            return [f"fp_top() = rint(fp_top()); /* frndint */"]
+            # Round the way the x87 control word says, not the way the host
+            # happens to be set. The CRT's floor() and ceil() are fldcw to
+            # round-down/round-up followed by frndint; with rint() both came
+            # back rounded to nearest, so floor(110.2) was right and
+            # ceil(110.2) was 110.
+            return [f"fp_top() = recomp_fp_round_cw(fp_top()); /* frndint: rounds as the control word says */"]
         if m == "fldpi":
             return [f"fp_push(3.14159265358979323846); /* fldpi */"]
         if m == "fldl2e":

@@ -314,6 +314,29 @@ static inline int16_t recomp_fist16(double v) {
     return (int16_t)r;
 }
 
+/* cvtss2si / cvtsd2si ROUND, using MXCSR's mode -- round-to-nearest-even,
+ * which the title never changes. Only the cvtt- forms truncate. A C cast
+ * truncates, so lifting both as (int32_t) made every rounding conversion a
+ * truncating one (JSRF's FloatToInt helper at 0x14C690, 134 call sites:
+ * 2.7 -> 2 instead of 3, -0.6 -> 0 instead of -1). NaN and out-of-range
+ * inputs give the "integer indefinite" 0x80000000 on x86; a C cast of those
+ * is undefined and ARM64 returns 0 or saturates. Float inputs widen to
+ * double exactly, so one pair serves the ss and sd forms. */
+static inline int32_t recomp_cvt2si(double v) {
+    double r;
+    if (v != v) return (int32_t)0x80000000u;
+    r = nearbyint(v);
+    if (r >= 2147483648.0 || r < -2147483648.0) return (int32_t)0x80000000u;
+    return (int32_t)r;
+}
+static inline int32_t recomp_cvtt2si(double v) {
+    double r;
+    if (v != v) return (int32_t)0x80000000u;
+    r = trunc(v);
+    if (r >= 2147483648.0 || r < -2147483648.0) return (int32_t)0x80000000u;
+    return (int32_t)r;
+}
+
 /* ================================================================
  * ICALL trace ring buffer (for debugging indirect calls)
  * ================================================================ */
@@ -497,20 +520,69 @@ static inline volatile uint64_t *recomp_p64(uint32_t a) {
     }
     return (volatile uint64_t *)XBOX_PTR(a);
 }
+/* ---- store watch -----------------------------------------------------
+ *
+ * Which recompiled function writes a given piece of guest memory.
+ *
+ * Grep cannot answer that for anything reached through a computed address,
+ * and a skeleton's matrices always are -- base plus sixty-four times the bone.
+ * So every guest store below passes through one unsigned compare against a
+ * window that is empty unless RECOMP_WATCH names one. A store that lands in
+ * it calls an out-of-line hook, whose return address points into the very
+ * recompiled function that did the storing; the hook records it and `atos`
+ * turns it into a name offline.
+ *
+ * Off, it costs a load, a subtract and a branch that is never taken. */
+/* Compiled in only when asked for (-DRECOMP_STORE_WATCH): even off it is a
+ * compare and a branch on every guest store, and a shipped build has no
+ * use for it. */
+#ifdef RECOMP_STORE_WATCH
+extern uint32_t g_recomp_watch_lo, g_recomp_watch_span;
+extern uint32_t g_recomp_watch2_lo, g_recomp_watch2_span;
+void recomp_watch_hit(uint32_t a, uint32_t n);
+#define RECOMP_WATCH(a, n) do { \
+    if (RECOMP_MMIO_UNLIKELY((uint32_t)(a) - g_recomp_watch_lo < g_recomp_watch_span) \
+     || RECOMP_MMIO_UNLIKELY((uint32_t)(a) - g_recomp_watch2_lo < g_recomp_watch2_span)) \
+        recomp_watch_hit((uint32_t)(a), (n)); } while (0)
+
+/* Block copies. `rep movsd` lifts to memcpy on host pointers, which never
+ * touches the store helpers above -- and a matrix upload is exactly a block
+ * copy. Route the generated code's memcpy through the same window. */
+static inline void *recomp_memcpy_watched(void *d, const void *s, size_t n) {
+    if (RECOMP_MMIO_UNLIKELY(g_recomp_watch_span | g_recomp_watch2_span)) {
+        uint32_t ga = (uint32_t)((const uint8_t *)d - (const uint8_t *)XBOX_PTR(0));
+        uint32_t k;
+        for (k = 0; k < (uint32_t)n; k += 4)
+            if ((uint32_t)(ga + k) - g_recomp_watch_lo < g_recomp_watch_span
+             || (uint32_t)(ga + k) - g_recomp_watch2_lo < g_recomp_watch2_span) {
+                recomp_watch_hit(ga + k, (uint32_t)n); break;
+            }
+    }
+    return memcpy(d, s, n);
+}
+#else
+#define RECOMP_WATCH(a, n) ((void)0)
+#endif
+
 static inline void recomp_w8(uint32_t a, uint8_t v) {
+    RECOMP_WATCH(a, 1);
     if (RECOMP_IS_MMIO(a)) recomp_mmio_write(a, v, 1); else *(volatile uint8_t *)XBOX_PTR(a) = v;
 }
 static inline void recomp_w16(uint32_t a, uint16_t v) {
+    RECOMP_WATCH(a, 2);
     if (RECOMP_IS_MMIO(a)) recomp_mmio_write(a, v, 2); else *(volatile uint16_t *)XBOX_PTR(a) = v;
 }
 static inline void recomp_w32(uint32_t a, uint32_t v) {
+    RECOMP_WATCH(a, 4);
     if (RECOMP_IS_MMIO(a)) recomp_mmio_write(a, v, 4); else *(volatile uint32_t *)XBOX_PTR(a) = v;
 }
 static inline void recomp_wf(uint32_t a, float v) {
+    RECOMP_WATCH(a, 4);
     if (RECOMP_IS_MMIO(a)) { uint32_t b; memcpy(&b, &v, 4); recomp_mmio_write(a, b, 4); }
     else *(volatile float *)XBOX_PTR(a) = v;
 }
 static inline void recomp_wd(uint32_t a, double v) {
+    RECOMP_WATCH(a, 8);
     if (RECOMP_IS_MMIO(a)) { uint64_t b; memcpy(&b, &v, 8); recomp_mmio_write(a, (uint32_t)b, 4); recomp_mmio_write(a + 4, (uint32_t)(b >> 32), 4); }
     else *(volatile double *)XBOX_PTR(a) = v;
 }
@@ -603,6 +675,7 @@ static inline RecompXmm XMM_MEM(uint32_t addr) {
 }
 
 static inline void XMM_STORE(uint32_t addr, RecompXmm v) {
+    RECOMP_WATCH(addr, 16);
     MEM32(addr)      = v.u[0]; MEM32(addr + 4)  = v.u[1];
     MEM32(addr + 8)  = v.u[2]; MEM32(addr + 12) = v.u[3];
 }
@@ -622,6 +695,7 @@ static inline void recomp_xmm_load_half(RecompXmm *dst, uint32_t addr,
 
 static inline void recomp_xmm_store_half(uint32_t addr, RecompXmm src,
                                          int high) {
+    RECOMP_WATCH(addr, 8);
     MEM32(addr)     = src.u[high * 2];
     MEM32(addr + 4) = src.u[high * 2 + 1];
 }
@@ -961,8 +1035,46 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
 extern int g_recomp_abi_check;
 extern int g_recomp_abi_restore;
 extern uint64_t g_recomp_abi_repairs;
+
+/* Calls whose whole job is to move the frame, and which must never be
+ * "repaired".
+ *
+ * RECOMP_ABI_RESTORE puts ebx/esi/edi back when a callee returns having
+ * changed them, on the assumption that a changed callee-saved register means
+ * the lifter dropped a push/pop pair. For __SEH_epilog that assumption is
+ * exactly backwards: its entire purpose is to POP edi, esi and ebx off the
+ * frame its matching __SEH_prolog pushed them onto, restoring the values its
+ * CALLER's caller is entitled to see. The lifted code does this correctly.
+ * The repair then overwrote all three with the values the function body was
+ * using a moment earlier -- 44,987 times in one 60-second run of JSRF -- and
+ * those leaked out through the next indirect call (RECOMP_ICALL does no ABI
+ * check, so nothing upstream repaired them a second time). That is the
+ * intermittent crash: a memset reached with edi = 0xFFFFFFFF, faulting on a
+ * guest address of 0x74000000 in __bzero.
+ *
+ * It survived the obvious test because __SEH_epilog also returns with esp far
+ * ABOVE where it started -- it unwinds a whole frame -- and a big positive
+ * esp delta looks nothing like the longjmp the existing guard was written to
+ * exclude.
+ *
+ * These are addresses in one title's copy of the MSVC CRT, so they are named
+ * here rather than derived: the lifter finds the same two by pattern (see
+ * tools.recomp --seh-prolog/--seh-epilog) and a mismatch between the two is
+ * worth noticing loudly rather than silently agreeing.
+ *
+ *   0x0017D1F8  __SEH_prolog    pushes ebx/esi/edi FOR the caller, allocates
+ *                               locals; returns with esp below entry, so the
+ *                               existing esp guard already excluded it.
+ *   0x0017D231  __SEH_epilog    pops them back; the bug above.
+ *   0x0017CAB0  _alloca/chkstk  xchg esp, eax -- moves the stack by design.
+ *
+ * The test is on a compile-time constant at every generated call site, so it
+ * folds away entirely; nothing is added to the hot path.
+ */
+#define RECOMP_ABI_FRAME_HELPER(va) \
+    ((va) == 0x0017D1F8u || (va) == 0x0017D231u || (va) == 0x0017CAB0u)
 #define RECOMP_ABI_CALL(va, fn) do { \
-    if (RECOMP_UNLIKELY(g_recomp_abi_check != 0)) { \
+    if (RECOMP_UNLIKELY(g_recomp_abi_check != 0) && !RECOMP_ABI_FRAME_HELPER(va)) { \
         uint32_t _ab = g_ebx, _as = g_esi, _ad = g_edi, _ap = g_esp; \
         (fn)(); \
         if (g_ebx != _ab || g_esi != _as || g_edi != _ad || g_esp < _ap + 4) { \
@@ -1163,6 +1275,7 @@ static inline RecompMmx MMX_MEM(uint32_t addr) {
 }
 
 static inline void MMX_STORE(uint32_t addr, RecompMmx v) {
+    RECOMP_WATCH(addr, 8);
     memcpy((void *)XBOX_PTR(addr), &v, 8);
 }
 
@@ -1365,3 +1478,8 @@ static inline RecompMmx MMX_PSADBW(RecompMmx a, RecompMmx b) {
  * ================================================================ */
 
 #endif /* RECOMP_TYPES_H */
+
+/* Generated code only: see recomp_memcpy_watched. */
+#if defined(RECOMP_STORE_WATCH) && !defined(RECOMP_NO_MEMCPY_WATCH)
+#define memcpy(d, s, n) recomp_memcpy_watched((d), (s), (n))
+#endif

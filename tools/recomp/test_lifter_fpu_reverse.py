@@ -67,7 +67,7 @@ class FpuReverseFormTest(unittest.TestCase):
             ("fpatan", "atan2(fp_st1(), fp_top())"),
             ("fsin", "sin(fp_top())"),
             ("fcos", "cos(fp_top())"),
-            ("frndint", "rint(fp_top())"),
+            ("frndint", "recomp_fp_round_cw(fp_top())"),  # honours the control word
             ("fyl2x", "log2(fp_top())"),
         ):
             with self.subTest(mnemonic=mnemonic):
@@ -82,3 +82,48 @@ class FpuReverseFormTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NanCompareTest(unittest.TestCase):
+    """An unordered comiss sets ZF, PF and CF together, so every branch that
+    is taken on CF or ZF is taken on NaN too -- which C's relational operators
+    are not. JSRF's collision edge tests run on a NaN direction whenever a
+    character stands still, and depend on exactly this."""
+
+    def test_comiss_conditions_follow_x86_on_nan(self):
+        import math
+        nan = float("nan")
+        # (condition text the lifter emits, x86 truth table on (a, b))
+        cases = {
+            "jb":  lambda a, b: not (a >= b),
+            "jbe": lambda a, b: not (a > b),
+            "je":  lambda a, b: (not (a < b)) and (not (a > b)),
+            "jne": lambda a, b: (a < b) or (a > b),
+            "ja":  lambda a, b: a > b,
+            "jae": lambda a, b: a >= b,
+        }
+        x86 = {  # CF, ZF after comiss: unordered 1,1; less 1,0; equal 0,1; greater 0,0
+            "jb":  lambda cf, zf: cf == 1,
+            "jbe": lambda cf, zf: cf == 1 or zf == 1,
+            "je":  lambda cf, zf: zf == 1,
+            "jne": lambda cf, zf: zf == 0,
+            "ja":  lambda cf, zf: cf == 0 and zf == 0,
+            "jae": lambda cf, zf: cf == 0,
+        }
+        def flags(a, b):
+            if math.isnan(a) or math.isnan(b): return 1, 1
+            if a < b: return 1, 0
+            if a == b: return 0, 1
+            return 0, 0
+        for jcc, c in cases.items():
+            for a, b in ((nan, 1.0), (1.0, nan), (nan, nan), (0.0, 1.0), (1.0, 1.0), (2.0, 1.0)):
+                with self.subTest(jcc=jcc, a=a, b=b):
+                    self.assertEqual(c(a, b), x86[jcc](*flags(a, b)))
+
+    def test_lifter_emits_the_nan_safe_forms(self):
+        import inspect
+        from tools.recomp import lifter as L
+        src = inspect.getsource(L)
+        self.assertIn('return f"(!({a} >= {b}))", desc', src)
+        self.assertIn('return f"(!({a} > {b}))", desc', src)
+        self.assertIn('return f"(!({a} < {b}) && !({a} > {b}))", desc', src)

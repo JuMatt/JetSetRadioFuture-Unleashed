@@ -1001,6 +1001,61 @@ class FunctionTranslator:
             if not leaves and i + 1 < len(blocks):
                 preds[blocks[i + 1].start].add(bb.start)
 
+        def _incoming_state(bb, states):
+            """The flag state every predecessor of bb agrees on, or None."""
+            sources = preds[bb.start]
+            if bb.start == start or not sources:
+                return None
+            if not all(p in states for p in sources):
+                return None
+            got = [states[p] for p in sources]
+            incoming = got[0]
+            for other in got[1:]:
+                if other == incoming:
+                    continue
+                if self._flag_states_compatible(incoming, other):
+                    continue
+                merged = self._flag_states_result_merge(incoming, other)
+                if merged is not None:
+                    incoming = merged
+                    continue
+                return None
+            return incoming
+
+        # Flag state at every block entry, iterated to a fixed point BEFORE
+        # emitting anything.
+        #
+        # The emission loop walks blocks in address order. A predecessor that
+        # sits further down the function -- a jump back up into the block --
+        # has no state yet when its target is lifted, and "unknown" meant the
+        # unassigned _flags fallback: a condition that is always false. JSRF's
+        # trigger ops 0x04 and 0x05 share one `je`; op 0x05's arm reaches it by
+        # jumping back up from 0x57186, so the je could never fire, "has the
+        # player walked into Gum's zone?" always answered yes, and her lesson
+        # opened the moment Corn stopped talking -- with the camera left on her
+        # for the whole tutorial. 119 jcc sites in the title came out this way.
+        # Lifting a block is cheap and deterministic, so the fixed point costs
+        # a few extra passes; the lifter's own bookkeeping is put back after.
+        import copy as _copy
+        _saved = {k: _copy.deepcopy(getattr(self.lifter, k))
+                  for k in ("_fp_top", "unimplemented", "referenced_calls",
+                            "jump_table_targets") if hasattr(self.lifter, k)}
+        entry_state = {}
+        block_out = {}
+        for _round in range(8):
+            changed = False
+            for bb in blocks:
+                inc = _incoming_state(bb, block_out)
+                _, st = lift_basic_block(self.lifter, bb, flag_state=inc)
+                if bb.start not in block_out or block_out[bb.start] != st:
+                    block_out[bb.start] = st
+                    changed = True
+                entry_state[bb.start] = inc
+            if not changed:
+                break
+        for k, v in _saved.items():
+            setattr(self.lifter, k, v)
+
         out_state = {}
         for bb in blocks:
             # Emit label if this block is a branch target
@@ -1012,29 +1067,10 @@ class FunctionTranslator:
                 # compile. The null statement costs nothing and is always valid.
                 lines.append(f"loc_{bb.start:08X}: ;")
 
-            # Inherit the flag state only when every predecessor agrees on it.
-            # Blocks are walked in address order, so a back edge's predecessor
-            # may not be computed yet -- treat that as unknown rather than
-            # guessing, which costs a fallback condition and never a wrong one.
-            sources = preds[bb.start]
-            if bb.start == start or not sources:
-                incoming = None
-            elif all(p in out_state for p in sources):
-                states = [out_state[p] for p in sources]
-                incoming = states[0]
-                for other in states[1:]:
-                    if other == incoming:
-                        continue
-                    if self._flag_states_compatible(incoming, other):
-                        continue
-                    merged = self._flag_states_result_merge(incoming, other)
-                    if merged is not None:
-                        incoming = merged
-                        continue
-                    incoming = None
-                    break
-            else:
-                incoming = None
+            # Inherit the flag state every predecessor agrees on -- all of
+            # them, including the ones further down (see the fixed point
+            # above).
+            incoming = entry_state.get(bb.start)
 
             stmts, out_state[bb.start] = lift_basic_block(
                 self.lifter, bb, flag_state=incoming)

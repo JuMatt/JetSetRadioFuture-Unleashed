@@ -171,5 +171,35 @@ class SsePackedLifterTest(unittest.TestCase):
                 statement.lstrip().startswith("/*"), (mnemonic, statement))
 
 
+class SseFloatToIntConversionTest(unittest.TestCase):
+    """cvtss2si rounds by MXCSR (round-to-nearest-even); only cvttss2si
+    truncates. Both used to lift to a plain (int32_t) cast, which truncates
+    and is undefined for NaN -- JSRF's FloatToInt helper (0x14C690, 134 call
+    sites) returned 2 for 2.7."""
+
+    def _lift(self, mnemonic, op_str, operands):
+        return Lifter().lift_instruction(_insn(mnemonic, op_str, operands))
+
+    def test_cvtss2si_rounds_through_the_helper(self):
+        self.assertEqual(
+            self._lift("cvtss2si", "eax, dword ptr [esp + 4]",
+                       [Operand(type="reg", reg="eax"), _mem("esp", 4, size=4)]),
+            ["eax = recomp_cvt2si(MEMF(esp + 4)); /* cvtss2si */"],
+        )
+
+    def test_cvttss2si_truncates_through_the_helper(self):
+        self.assertEqual(
+            self._lift("cvttss2si", "eax, xmm7",
+                       [Operand(type="reg", reg="eax"), _xmm("xmm7")]),
+            ["eax = recomp_cvtt2si(xmm7.f[0]); /* cvttss2si */"],
+        )
+
+    def test_no_conversion_is_a_bare_cast(self):
+        for m in ("cvtss2si", "cvttss2si", "cvtsd2si", "cvttsd2si"):
+            out = self._lift(m, "edx, xmm0",
+                             [Operand(type="reg", reg="edx"), _xmm("xmm0")])
+            self.assertNotIn("(int32_t)", out[0], m)
+
+
 if __name__ == "__main__":
     unittest.main()
