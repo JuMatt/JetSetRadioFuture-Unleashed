@@ -124,12 +124,21 @@ static const char *g_game_dir_arg;
  * choice and comes back through here rather than tearing the renderer down
  * underneath a frame in flight. */
 static char **g_argv;
+/* Set when RECOMP_GL_SCALE is this process's own doing (the Video menu's
+ * stored choice, copied into the environment for the renderer) rather than
+ * the user's. */
+static int g_scale_env_ours;
 
 void recomp_restart_self(void);
 void recomp_restart_self(void)
 {
     if (!g_argv || !g_argv[0]) return;
     fflush(stdout); fflush(stderr);
+    /* The relaunched process inherits this environment, and an explicit
+     * RECOMP_GL_SCALE wins over the stored choice -- so the copy made at
+     * startup came back as "explicit" and every restart returned at the old
+     * resolution: picking a new one from the menu never took. */
+    if (g_scale_env_ours) unsetenv("RECOMP_GL_SCALE");
     execv(g_argv[0], g_argv);          /* only returns on failure */
     fprintf(stderr, "  [WIN] could not relaunch: %s\n", strerror(errno));
 }
@@ -717,17 +726,27 @@ static int host_main(void)
          * the window to stay at the console's. */
         int win_w, win_h;
         {
-            /* The window follows the internal resolution, so the finished
-             * frame is presented one-to-one instead of being stretched. A
-             * 640x480 frame blown up into a 1280x960 window is every pixel
-             * doubled, and it looks exactly like that. */
+            /* The Video menu's stored choice sets the internal resolution
+             * (the renderer reads RECOMP_GL_SCALE). The window used to
+             * follow it as well, so a frame would be presented one-to-one --
+             * see below for why it no longer does. */
             extern int nv_window_pref_scale(void) __attribute__((weak));
             int scale = nv_window_pref_scale ? nv_window_pref_scale() : 2;
             char buf[8];
+            const char *pre = getenv("RECOMP_GL_SCALE");
+            if (!pre || !*pre) g_scale_env_ours = 1;
             snprintf(buf, sizeof buf, "%d", scale);
             setenv("RECOMP_GL_SCALE", buf, 1);   /* before the renderer starts */
-            win_w = 640 * scale;
-            win_h = 480 * scale;
+            /* ...but not in size any more. The window opened at 640x480
+             * times the scale in POINTS, which on a Retina screen is twice
+             * that in pixels: 1x gave a postage stamp and 4x a 2560x1920
+             * window, twice the height of a MacBook's screen. The scale now
+             * only sets how sharp the picture is; the window opens at
+             * 1280x960 (fitted to the screen if that does not fit, see
+             * nv_window_prepare) and can be resized or made full screen. */
+            (void)scale;
+            win_w = 1280;
+            win_h = 960;
         }
         { const char *w = getenv("RECOMP_WINDOW_W");
           const char *h = getenv("RECOMP_WINDOW_H");
