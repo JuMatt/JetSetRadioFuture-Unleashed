@@ -51,13 +51,24 @@ static void sb(SB *s, const char *fmt, ...)
 #define IN_ALPHA(x) (((x) >> 4) & 1)
 #define IN_MAP(x)   (((x) >> 5) & 7)
 
+/* NV097_SET_COMBINER_CONTROL bits 12 and 16: whether each stage has its own
+ * C0 / C1 or every stage reads stage 0's (xemu: PS_COMBINERCOUNT_UNIQUE_C0/
+ * _C1). The final combiner -- stage 8 here -- has a pair of its own,
+ * NV097_SET_SPECULAR_FOG_FACTOR. Set by psh_emit for the shader being built. */
+static int s_c0_each = 1, s_c1_each = 1;
+#define PSH_FINAL_STAGE 8
+
 static const char *reg_name(unsigned reg, int stage)
 {
     static char buf[32];
     switch (reg) {
     case NV2A_PSH_REG_ZERO:     return "vec4(0.0)";
-    case NV2A_PSH_REG_C0:       snprintf(buf, sizeof buf, "c0_%d", stage); return buf;
-    case NV2A_PSH_REG_C1:       snprintf(buf, sizeof buf, "c1_%d", stage); return buf;
+    case NV2A_PSH_REG_C0:
+        if (stage >= PSH_FINAL_STAGE) return "c0_f";
+        snprintf(buf, sizeof buf, "c0_%d", s_c0_each ? stage : 0); return buf;
+    case NV2A_PSH_REG_C1:
+        if (stage >= PSH_FINAL_STAGE) return "c1_f";
+        snprintf(buf, sizeof buf, "c1_%d", s_c1_each ? stage : 0); return buf;
     case NV2A_PSH_REG_FOG:      return "r_fog";
     case NV2A_PSH_REG_V0:       return "r_v0";
     case NV2A_PSH_REG_V1:       return "r_v1";
@@ -106,15 +117,55 @@ static void emit_input(SB *s, uint8_t in, int stage, int alpha_path)
     }
 }
 
-/* ---- output decoding ---------------------------------------------------- */
+/* ---- output decoding ----------------------------------------------------
+ *
+ * The output word is what the XDK's PS_COMBINEROUTPUTS builds,
+ *
+ *     (flags << 12) | (mux_sum << 8) | (ab << 4) | cd
+ *
+ * with the flags
+ *
+ *     0x01  CD is a dot product         0x02  AB is a dot product
+ *     0x04  the third output is a mux on R0's alpha, not the sum
+ *     0x08..0x38  the output mapping: 0x08 bias, 0x10 x2, 0x18 x2 with
+ *           bias, 0x20 x4, 0x30 x0.5
+ *     0x40  CD blue to alpha            0x80  AB blue to alpha  (colour only)
+ *
+ * which is how xemu's parse_combiner_output reads it too. This used to take
+ * the mapping from bits 12-14 and the dot and mux flags from 15-17, three
+ * bits off: a x2 stage came out as a dot product at x1, a dot product came
+ * out doubled, a mux came out x4, and blue-to-alpha did not exist. Any
+ * combiner that is not a plain multiply-add was being computed as something
+ * else -- the graffiti's, which builds per-part weights with dot products
+ * and blue-to-alpha, summed to an alpha of zero and drew nothing at all. */
 
-#define OUT_CD(x)     ((x) & 0x0F)
-#define OUT_AB(x)     (((x) >> 4) & 0x0F)
-#define OUT_SUM(x)    (((x) >> 8) & 0x0F)
-#define OUT_MAP(x)    (((x) >> 12) & 0x07)
-#define OUT_AB_DOT(x) (((x) >> 15) & 1)
-#define OUT_CD_DOT(x) (((x) >> 16) & 1)
-#define OUT_MUX(x)    (((x) >> 17) & 1)
+#define OUT_CD(x)       ((x) & 0x0F)
+#define OUT_AB(x)       (((x) >> 4) & 0x0F)
+#define OUT_SUM(x)      (((x) >> 8) & 0x0F)
+#define OUT_CD_DOT(x)   (((x) >> 12) & 1)
+#define OUT_AB_DOT(x)   (((x) >> 13) & 1)
+#define OUT_MUX(x)      (((x) >> 14) & 1)
+#define OUT_MAP(x)      (((x) >> 15) & 0x07)
+#define OUT_CD_BLUE(x)  (((x) >> 18) & 1)
+#define OUT_AB_BLUE(x)  (((x) >> 19) & 1)
+
+/* RECOMP_GL_OLD_OCW=1: the old reading of the output word, for A/B. */
+static int old_ocw(void)
+{
+    static int v = -1;
+    if (v < 0) v = getenv("RECOMP_GL_OLD_OCW") ? 1 : 0;
+    return v;
+}
+#define OLD_OUT_MAP(x)    (((x) >> 12) & 0x07)
+#define OLD_OUT_AB_DOT(x) (((x) >> 15) & 1)
+#define OLD_OUT_CD_DOT(x) (((x) >> 16) & 1)
+#define OLD_OUT_MUX(x)    (((x) >> 17) & 1)
+#define O_MAP(x)    (old_ocw() ? OLD_OUT_MAP(x) : OUT_MAP(x))
+#define O_AB_DOT(x) (old_ocw() ? OLD_OUT_AB_DOT(x) : OUT_AB_DOT(x))
+#define O_CD_DOT(x) (old_ocw() ? OLD_OUT_CD_DOT(x) : OUT_CD_DOT(x))
+#define O_MUX(x)    (old_ocw() ? OLD_OUT_MUX(x) : OUT_MUX(x))
+#define O_AB_BLUE(x) (old_ocw() ? 0 : OUT_AB_BLUE(x))
+#define O_CD_BLUE(x) (old_ocw() ? 0 : OUT_CD_BLUE(x))
 
 /* The output mapping is a scale and bias applied to everything the stage
  * produces. shl1/shl2 are how a title gets more than unit range out of a
@@ -172,6 +223,8 @@ static int psh_emit(const Nv2aPshState *ps, char *buf, int bufsize, int msl)
 
     if (stages < 1) stages = 1;
     if (stages > NV2A_PSH_STAGES) stages = NV2A_PSH_STAGES;
+    s_c0_each = old_ocw() ? 1 : (int)((ps->control >> 12) & 1);
+    s_c1_each = old_ocw() ? 1 : (int)((ps->control >> 16) & 1);
 
     if (msl) {
         sb(&s,
@@ -247,8 +300,19 @@ static int psh_emit(const Nv2aPshState *ps, char *buf, int bufsize, int msl)
            ((ps->c1[i] >> 16) & 0xFF) / 255.0, ((ps->c1[i] >> 8) & 0xFF) / 255.0,
            (ps->c1[i] & 0xFF) / 255.0, ((ps->c1[i] >> 24) & 0xFF) / 255.0);
     }
-    /* The final combiner reads C0/C1 too; it uses the last stage's pair. */
-    sb(&s, "#define c0_f c0_%d\n#define c1_f c1_%d\n", stages - 1, stages - 1);
+    /* The final combiner reads C0/C1 too: its own pair, from
+     * NV097_SET_SPECULAR_FOG_FACTOR (xemu's c0_8 / c1_8). It used to borrow
+     * the last stage's. */
+    if (old_ocw())
+        sb(&s, "#define c0_f c0_%d\n#define c1_f c1_%d\n", stages - 1, stages - 1);
+    else {
+        sb(&s, "%s vec4 c0_f = vec4(%.6f, %.6f, %.6f, %.6f);\n", cq,
+           ((ps->final_c0 >> 16) & 0xFF) / 255.0, ((ps->final_c0 >> 8) & 0xFF) / 255.0,
+           (ps->final_c0 & 0xFF) / 255.0, ((ps->final_c0 >> 24) & 0xFF) / 255.0);
+        sb(&s, "%s vec4 c1_f = vec4(%.6f, %.6f, %.6f, %.6f);\n", cq,
+           ((ps->final_c1 >> 16) & 0xFF) / 255.0, ((ps->final_c1 >> 8) & 0xFF) / 255.0,
+           (ps->final_c1 & 0xFF) / 255.0, ((ps->final_c1 >> 24) & 0xFF) / 255.0);
+    }
     }
 
     if (msl) {
@@ -355,17 +419,29 @@ static int psh_emit(const Nv2aPshState *ps, char *buf, int bufsize, int msl)
        "    vec3 ab, cd, sum, ab_raw, cd_raw;\n"
        "    float ab_a, cd_a, sum_a, ab_a_raw, cd_a_raw;\n\n");
 
+    /* Each stage reads its inputs, computes all six results (AB, CD and the
+     * sum or mux, for colour and for alpha), and only then writes them: a
+     * stage that reads a register it also writes sees the value from before
+     * the stage, in both halves. Results are clamped to the registers'
+     * [-1, 1], as xemu does. The mux picks on R0's alpha: its top bit, or
+     * with NV097_SET_COMBINER_CONTROL bit 8 clear, its bottom bit. */
+    {
+    const char *mux_sel = (old_ocw() || ((ps->control >> 8) & 1))
+                        ? "(r_r0.a >= 0.5)"
+                        : "((uint(r_r0.a * 255.0) & 1u) == 1u)";
+    const char *lo = old_ocw() ? "" : "clamp(";
+    const char *hi3 = old_ocw() ? "" : ", -1.0, 1.0)";
     for (i = 0; i < stages; i++) {
         uint32_t ric = ps->rgb_icw[i], aic = ps->alpha_icw[i];
         uint32_t roc = ps->rgb_ocw[i], aoc = ps->alpha_ocw[i];
-        char expr[512];
+        char expr[512], mux[640];
         SB e;
 
         sb(&s, "    // stage %d\n", i);
 
         /* --- colour --- */
         e.buf = expr; e.cap = sizeof expr; e.pos = 0; e.overflow = 0;
-        if (OUT_AB_DOT(roc)) {
+        if (O_AB_DOT(roc)) {
             sb(&e, "vec3(dot(");
             emit_input(&e, (uint8_t)(ric >> 24), i, 0);
             sb(&e, ", ");
@@ -381,7 +457,7 @@ static int psh_emit(const Nv2aPshState *ps, char *buf, int bufsize, int msl)
         sb(&s, "    ab_raw = %s;\n", expr);
 
         e.pos = 0; e.overflow = 0;
-        if (OUT_CD_DOT(roc)) {
+        if (O_CD_DOT(roc)) {
             sb(&e, "vec3(dot(");
             emit_input(&e, (uint8_t)(ric >> 8), i, 0);
             sb(&e, ", ");
@@ -395,21 +471,14 @@ static int psh_emit(const Nv2aPshState *ps, char *buf, int bufsize, int msl)
             sb(&e, ")");
         }
         sb(&s, "    cd_raw = %s;\n", expr);
-        sb(&s, "    ab = "); emit_out_map(&s, OUT_MAP(roc), "ab_raw"); sb(&s, ";\n");
-        sb(&s, "    cd = "); emit_out_map(&s, OUT_MAP(roc), "cd_raw"); sb(&s, ";\n");
-
-        e.pos = 0; e.overflow = 0;
+        sb(&s, "    ab = %s", lo); emit_out_map(&s, O_MAP(roc), "ab_raw"); sb(&s, "%s;\n", hi3);
+        sb(&s, "    cd = %s", lo); emit_out_map(&s, O_MAP(roc), "cd_raw"); sb(&s, "%s;\n", hi3);
         /* The sum is of the *unmapped* products; the mapping is applied once
          * to each of the three results, not twice to the sum. */
-        sb(&s, "    sum = ");
-        emit_out_map(&s, OUT_MAP(roc),
-                     OUT_MUX(roc) ? "(r_r0.a >= 0.5) ? cd_raw : ab_raw"
-                                  : "ab_raw + cd_raw");
-        sb(&s, ";\n");
-
-        emit_store(&s, OUT_AB(roc), i, "ab", 0);
-        emit_store(&s, OUT_CD(roc), i, "cd", 0);
-        emit_store(&s, OUT_SUM(roc), i, "sum", 0);
+        snprintf(mux, sizeof mux, "%s ? cd_raw : ab_raw", mux_sel);
+        sb(&s, "    sum = %s", lo);
+        emit_out_map(&s, O_MAP(roc), O_MUX(roc) ? mux : "ab_raw + cd_raw");
+        sb(&s, "%s;\n", hi3);
 
         /* --- alpha --- */
         e.pos = 0; e.overflow = 0;
@@ -427,43 +496,64 @@ static int psh_emit(const Nv2aPshState *ps, char *buf, int bufsize, int msl)
         emit_input(&e, (uint8_t)aic, i, 1);
         sb(&e, ")");
         sb(&s, "    cd_a_raw = %s;\n", expr);
-        sb(&s, "    ab_a = "); emit_out_map(&s, OUT_MAP(aoc), "ab_a_raw"); sb(&s, ";\n");
-        sb(&s, "    cd_a = "); emit_out_map(&s, OUT_MAP(aoc), "cd_a_raw"); sb(&s, ";\n");
+        sb(&s, "    ab_a = %s", lo); emit_out_map(&s, O_MAP(aoc), "ab_a_raw"); sb(&s, "%s;\n", hi3);
+        sb(&s, "    cd_a = %s", lo); emit_out_map(&s, O_MAP(aoc), "cd_a_raw"); sb(&s, "%s;\n", hi3);
+        snprintf(mux, sizeof mux, "%s ? cd_a_raw : ab_a_raw", mux_sel);
+        sb(&s, "    sum_a = %s", lo);
+        emit_out_map(&s, O_MAP(aoc), O_MUX(aoc) ? mux : "ab_a_raw + cd_a_raw");
+        sb(&s, "%s;\n", hi3);
 
-        e.pos = 0; e.overflow = 0;
-        sb(&s, "    sum_a = ");
-        emit_out_map(&s, OUT_MAP(aoc),
-                     OUT_MUX(aoc) ? "(r_r0.a >= 0.5) ? cd_a_raw : ab_a_raw"
-                                  : "ab_a_raw + cd_a_raw");
-        sb(&s, ";\n");
-
+        /* --- the writes: colour, its blue-to-alpha, then alpha --- */
+        emit_store(&s, OUT_AB(roc), i, "ab", 0);
+        if (O_AB_BLUE(roc) && OUT_AB(roc) != NV2A_PSH_REG_ZERO)
+            emit_store(&s, OUT_AB(roc), i, "ab.b", 1);
+        emit_store(&s, OUT_CD(roc), i, "cd", 0);
+        if (O_CD_BLUE(roc) && OUT_CD(roc) != NV2A_PSH_REG_ZERO)
+            emit_store(&s, OUT_CD(roc), i, "cd.b", 1);
+        emit_store(&s, OUT_SUM(roc), i, "sum", 0);
         emit_store(&s, OUT_AB(aoc), i, "ab_a", 1);
         emit_store(&s, OUT_CD(aoc), i, "cd_a", 1);
         emit_store(&s, OUT_SUM(aoc), i, "sum_a", 1);
         sb(&s, "\n");
     }
+    }
 
     /* --- final combiner --- */
     sb(&s, "    // final combiner\n");
-    sb(&s, "    r_sum = clamp(r_v1 + r_r0, 0.0, 1.0);\n");
+    { int fst = old_ocw() ? stages - 1 : PSH_FINAL_STAGE;
+    /* V1R0_SUM: specular plus R0, each optionally complemented, clamped only
+     * when the title asks (SPECULAR_FOG_CW1 bits 5, 6, 7 -- xemu's inv_r0,
+     * inv_v1, clamp_sum). It used to be clamped always and never inverted. */
+    if (old_ocw())
+        sb(&s, "    r_sum = clamp(r_v1 + r_r0, 0.0, 1.0);\n");
+    else {
+        uint32_t fl = ps->final_efg & 0xFF;
+        sb(&s, "    r_sum.rgb = %s%s + %s%s%s;\n",
+           (fl & 0x80) ? "clamp(" : "",
+           (fl & 0x40) ? "(1.0 - r_v1.rgb)" : "r_v1.rgb",
+           (fl & 0x20) ? "(1.0 - r_r0.rgb)" : "r_r0.rgb",
+           (fl & 0x80) ? ", 0.0, 1.0)" : "", "");
+        sb(&s, "    r_sum.a = clamp(r_v1.a + r_r0.a, 0.0, 1.0);\n");
+    }
     {
         char expr[512];
         SB e; e.buf = expr; e.cap = sizeof expr; e.pos = 0; e.overflow = 0;
         sb(&e, "vec3(");
-        emit_input(&e, (uint8_t)(ps->final_efg >> 24), stages - 1, 0);
+        emit_input(&e, (uint8_t)(ps->final_efg >> 24), fst, 0);
         sb(&e, " * ");
-        emit_input(&e, (uint8_t)(ps->final_efg >> 16), stages - 1, 0);
+        emit_input(&e, (uint8_t)(ps->final_efg >> 16), fst, 0);
         sb(&e, ")");
         sb(&s, "    r_ef.rgb = %s;\n", expr);
     }
     sb(&s, "    vec3 fa, fb, fc, fd;\n");
-    sb(&s, "    fa = "); emit_input(&s, (uint8_t)(ps->final_abcd >> 24), stages - 1, 0); sb(&s, ";\n");
-    sb(&s, "    fb = "); emit_input(&s, (uint8_t)(ps->final_abcd >> 16), stages - 1, 0); sb(&s, ";\n");
-    sb(&s, "    fc = "); emit_input(&s, (uint8_t)(ps->final_abcd >> 8), stages - 1, 0); sb(&s, ";\n");
-    sb(&s, "    fd = "); emit_input(&s, (uint8_t)ps->final_abcd, stages - 1, 0); sb(&s, ";\n");
+    sb(&s, "    fa = "); emit_input(&s, (uint8_t)(ps->final_abcd >> 24), fst, 0); sb(&s, ";\n");
+    sb(&s, "    fb = "); emit_input(&s, (uint8_t)(ps->final_abcd >> 16), fst, 0); sb(&s, ";\n");
+    sb(&s, "    fc = "); emit_input(&s, (uint8_t)(ps->final_abcd >> 8), fst, 0); sb(&s, ";\n");
+    sb(&s, "    fd = "); emit_input(&s, (uint8_t)ps->final_abcd, fst, 0); sb(&s, ";\n");
     sb(&s, "    float fg = ");
-    emit_input(&s, (uint8_t)(ps->final_efg >> 8), stages - 1, 1);
+    emit_input(&s, (uint8_t)(ps->final_efg >> 8), fst, 1);
     sb(&s, ";\n");
+    }
     sb(&s,
        "    vec4 result;\n"
        "    result.rgb = clamp(fd + fa * fb + (1.0 - fa) * fc, 0.0, 1.0);\n"

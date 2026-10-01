@@ -194,6 +194,9 @@ uint32_t xbox_ContiguousBlockSerial(uint32_t xbox_va);
 /* Wake the NV2A acknowledgement thread now (D3D KickOff). */
 void xbox_nv2a_kick(void);
 void xbox_nv2a_hurry(int on);
+/* Completes a pending vblank acknowledgement now; for the renderer's frame
+ * pacing, which sleeps on the thread that normally does it. */
+void xbox_nv2a_vblank_service(void);
 
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
                          uint32_t put_off, uint32_t get_ptr_off);

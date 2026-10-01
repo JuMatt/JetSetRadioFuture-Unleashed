@@ -21,4 +21,11 @@ int xa2_submit_samples(const int16_t *samples, int num_samples);
 /* Get the preferred buffer size in samples. */
 int xa2_get_buffer_size(void);
 
+/* Frames waiting in the output ring, or -1 if this backend has no ring the
+ * APU can pace itself on. */
+int xa2_ring_level(void);
+
+/* Milliseconds since the device last pulled from the ring, or -1. */
+int xa2_ms_since_pull(void);
+
 #endif /* APU_XAUDIO2_H */

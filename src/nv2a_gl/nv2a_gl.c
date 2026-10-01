@@ -73,6 +73,8 @@
 
 #include "d3d8_swizzle.h"          /* swizzle + DXT helpers, header-only */
 
+static double mono_now(void);
+
 /* The guest-thread lock, if this is linked into the runtime.
  *
  * Weak, because the GL backend also builds standalone for its own capture
@@ -80,6 +82,7 @@
 extern int  xbox_guest_lock_drop(void)   __attribute__((weak));
 extern unsigned long g_vblank_count      __attribute__((weak));
 extern void xbox_guest_lock_retake(int)  __attribute__((weak));
+extern void xbox_nv2a_vblank_service(void) __attribute__((weak));
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern uint32_t  xbox_ContiguousAllocatedBytes(void);
@@ -301,6 +304,9 @@ static struct {
      * black, because the diffuse colour a program passes through is exactly
      * the attribute a batch is most likely to omit. */
     float    const_attr[NUM_ATTRS][4];
+    /* What the title last set explicitly (SET_VERTEX_DATA*), for
+     * RECOMP_GL_STICKYLOG to compare the inherited values against. */
+    float    const_set[NUM_ATTRS][4];
     int      const_attr_init;
     uint32_t prim;
     uint32_t idx[MAX_INDICES];
@@ -322,6 +328,9 @@ static struct {
     TexStage tex[NUM_STAGES];
     int      depth_test, depth_mask, depth_func;
     uint32_t color_mask;         /* NV097_SET_COLOR_MASK, 0x01010101 = all */
+    /* Stencil (0x032C, 0x0360..0x0378). Recorded; see stencil_apply. */
+    uint32_t stencil_en, stencil_wmask, stencil_func, stencil_ref,
+             stencil_fmask, stencil_op[3];
     int      blend_enable, blend_src, blend_dst;
     int      cull_enable, cull_face, front_face;
     int      alpha_test, alpha_func;
@@ -349,6 +358,8 @@ static struct {
     float    light_spot_falloff[8][3], light_spot_dir[8][4];
     float    light_pos[8][3], light_att[8][3];
     float    eye_position[4];        /* NV097_SET_EYE_POSITION */
+    float    specular_params[6];     /* NV097_SET_SPECULAR_PARAMS */
+    float    ff_mv[4][4], ff_imv[4][4]; /* model-view matrix 0 and its inverse, as sent */
     int      seen_flip_stall;
     /*
      * The fixed-function matrices, kept apart from the constant file.
@@ -645,6 +656,10 @@ static struct {
     GLint    u_ffMat, u_ffTexMat;   /* fixed-function transform, see S.ff_* */
     GLint    u_ffVpOff;
     GLint    u_litAmbient, u_zClip;
+    /* fixed-function lighting, see nv2a_vsh_emit_ff_glsl */
+    GLint    u_ffMV, u_ffIMV, u_ltSceneAmb, u_ltMatEm, u_ltMatAlpha;
+    GLint    u_ltAmb, u_ltDif, u_ltSpc, u_ltDir, u_ltHalf, u_ltPos, u_ltAtt;
+    GLint    u_ltRange, u_ltSpotDir, u_ltEye, u_ltSpecPow;
     GLint    u_tex[4], u_texScale[4], u_fogColor, u_alphaFunc, u_alphaRef;
     GLint    u_bumpMat[4], u_bumpScale[4], u_bumpOff[4], u_texOff[4];
     uint16_t inputs;
@@ -738,6 +753,7 @@ static struct {
     int      valid;
 } g_last;
 static int g_last_cm_reset;   /* a clear forced the colour mask on */
+static int g_last_stencil_reset;   /* a clear changed the stencil write mask */
 static uint32_t g_frame_chars;       /* big skinned batches this frame */
 static uint32_t g_frame_chars_prev;  /* ... and in the frame just finished */
 
@@ -1107,13 +1123,14 @@ static void surface_bind(uint32_t offset, uint32_t w, uint32_t h)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         glBindRenderbuffer(GL_RENDERBUFFER, g_surf[slot].depth);
-        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24,
+        /* With a stencil: the title keeps its shadow counts there. */
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8,
                               (GLsizei)(w * gl_scale()),
                               (GLsizei)(h * gl_scale()));
         glBindFramebuffer(GL_FRAMEBUFFER, g_surf[slot].fbo);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                                GL_TEXTURE_2D, g_surf[slot].tex, 0);
-        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT,
                                   GL_RENDERBUFFER, g_surf[slot].depth);
         if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
             fprintf(stderr, "  [GL] framebuffer incomplete at %ux%u\n", w, h);
@@ -1368,6 +1385,22 @@ static void pcache_locate_uniforms(int slot)
     g_pcache[slot].u_ffVpOff    = glGetUniformLocation(prog, "ffVpOff");
     g_pcache[slot].u_litAmbient = glGetUniformLocation(prog, "litAmbient");
     g_pcache[slot].u_zClip      = glGetUniformLocation(prog, "zClip");
+    g_pcache[slot].u_ffMV       = glGetUniformLocation(prog, "ffMV");
+    g_pcache[slot].u_ffIMV      = glGetUniformLocation(prog, "ffIMV");
+    g_pcache[slot].u_ltSceneAmb = glGetUniformLocation(prog, "ltSceneAmb");
+    g_pcache[slot].u_ltMatEm    = glGetUniformLocation(prog, "ltMatEm");
+    g_pcache[slot].u_ltMatAlpha = glGetUniformLocation(prog, "ltMatAlpha");
+    g_pcache[slot].u_ltAmb      = glGetUniformLocation(prog, "ltAmb");
+    g_pcache[slot].u_ltDif      = glGetUniformLocation(prog, "ltDif");
+    g_pcache[slot].u_ltSpc      = glGetUniformLocation(prog, "ltSpc");
+    g_pcache[slot].u_ltDir      = glGetUniformLocation(prog, "ltDir");
+    g_pcache[slot].u_ltHalf     = glGetUniformLocation(prog, "ltHalf");
+    g_pcache[slot].u_ltPos      = glGetUniformLocation(prog, "ltPos");
+    g_pcache[slot].u_ltAtt      = glGetUniformLocation(prog, "ltAtt");
+    g_pcache[slot].u_ltRange    = glGetUniformLocation(prog, "ltRange");
+    g_pcache[slot].u_ltSpotDir  = glGetUniformLocation(prog, "ltSpotDir");
+    g_pcache[slot].u_ltEye      = glGetUniformLocation(prog, "ltEye");
+    g_pcache[slot].u_ltSpecPow  = glGetUniformLocation(prog, "ltSpecPow");
     for (i = 0; i < 4; i++) {
         char nm[16];
         snprintf(nm, sizeof nm, "tex%d", i);
@@ -1388,6 +1421,32 @@ static void pcache_locate_uniforms(int slot)
     g_pcache[slot].u_alphaRef   = glGetUniformLocation(prog, "alphaRef");
 }
 
+/*
+ * Sticky vertex attributes (RECOMP_GL_STICKY_ATTRS=0 turns this off).
+ *
+ * The hardware keeps one current value per vertex attribute, and fetching a
+ * vertex from an array writes into it: after a draw, every attribute that
+ * came from an array is left holding the last vertex's value, and the next
+ * draw that leaves that attribute's array disabled reads it. xemu models it
+ * the same way (pgraph_gl_bind_vertex_attributes: the "provoking" element of
+ * every enabled array is copied into the attribute's inline value).
+ *
+ * This used to keep only what the title set explicitly with the
+ * SET_VERTEX_DATA methods, which this title never does for the normal -- and
+ * the pause map's counter box is five lit draws with no normal array of their
+ * own. On the console they are lit with the normal the map's own geometry
+ * left behind, one that faces the viewer, and come out in the colours the
+ * title gives the light for each of them; here they got a normal of nothing
+ * and came out black.
+ */
+static int sticky_attrs(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *v = getenv("RECOMP_GL_STICKY_ATTRS");
+                  on = (v && v[0] == '0') ? 0 : 1; }
+    return on;
+}
+
 /* Which inputs a fixed-function batch actually has.
  *
  * The emitted shader declares only the arrays the batch supplies; an
@@ -1406,6 +1465,24 @@ static void ff_describe(Nv2aVshFixed *f)
         if (S.attr[9 + i].size) f->inputs_read |= 1u << (9 + i);
     f->tex_matrix = (uint8_t)(S.ff_texmat_enable & 0xF);
     f->lit = (uint8_t)(S.ff_lighting ? 1 : 0);
+    /* RECOMP_GL_FF_NOLIGHT=1: the old way -- the stream colour through, or
+     * white -- for A/B. */
+    { static int off = -1;
+      if (off < 0) off = getenv("RECOMP_GL_FF_NOLIGHT") ? 1 : 0;
+      if (off) f->lit = 0; }
+    if (f->lit) {
+        /* Lit, the normal is always read: from its array when the batch has
+         * one, otherwise the attribute's current value (see sticky_attrs). */
+        if (S.attr[2].size || sticky_attrs()) {
+            f->inputs_read |= 1u << 2; f->has_normal = 1;
+        }
+        f->colmat = (uint8_t)(S.color_material & 0xFF);
+        f->lflags = (uint8_t)(((S.light_control & 1u) ? 1 : 0)
+                            | ((S.light_control & (1u << 16)) ? 2 : 0)
+                            | (S.specular_enable ? 4 : 0)
+                            | (S.normalization ? 8 : 0));
+        f->light_mask = (uint16_t)(S.light_enable_mask & 0xFFFFu);
+    }
 }
 
 
@@ -1602,7 +1679,7 @@ static int program_for_current(void)
         g_pcache[slot].dis = nv2a_vsh_disasm(&vp, dis, sizeof dis)
                            ? strdup(dis) : NULL;
     }
-    if (getenv("RECOMP_GL_DUMP_VSH")) {
+    if (getenv("RECOMP_GL_DUMP_VSH") || (dump_slot() >= 0 && slot == dump_slot())) {
         char dis[16384];
         if (nv2a_vsh_disasm(&vp, dis, sizeof dis))
             fprintf(stderr, "----- NV2A program (%d slots, hash %08X) -----\n%s",
@@ -1640,13 +1717,14 @@ static int program_for_current(void)
       if (at3d == -2) { const char *v = getenv("RECOMP_GL_DUMP_PSH_3D");
                         at3d = v ? atol(v) : -1; }
       if (getenv("RECOMP_GL_DUMP_PSH")
+       || (dump_slot() >= 0 && slot == dump_slot())
        || (at3d >= 0 && (long)S.draws_3d >= at3d && psh_shots < 4)) {
         int k;
         psh_shots++;
         fprintf(stderr, "----- combiners: %u stage(s), control %08X, "
-                        "final %08X/%08X -----\n",
+                        "final %08X/%08X c0 %08X c1 %08X -----\n",
                 (unsigned)(S.psh.control & 0xF), S.psh.control,
-                S.psh.final_abcd, S.psh.final_efg);
+                S.psh.final_abcd, S.psh.final_efg, S.psh.final_c0, S.psh.final_c1);
         for (k = 0; k < (int)(S.psh.control & 0xF) && k < NV2A_PSH_STAGES; k++)
             fprintf(stderr, "  stage %d: rgb in %08X out %08X | "
                             "a in %08X out %08X | c0 %08X c1 %08X\n",
@@ -1954,6 +2032,11 @@ static GLuint upload_texture_inner(const TexStage *t)
                                   ? linear_bpp(swz_to_linear(t->color))
                                   : linear_bpp(t->color));
         uint32_t step = bytes > 4096 ? bytes / 64 : 64;
+        /* RECOMP_GL_TEXHASH_FULL=1: hash every byte (slow; for testing
+         * whether a texture the CPU rewrote in place is being served stale). */
+        { static int full = -1;
+          if (full < 0) full = getenv("RECOMP_GL_TEXHASH_FULL") ? 1 : 0;
+          if (full) step = 1; }
         hash = t->color * 2654435761u;
         for (i = 0; i < bytes && step; i += step)
             hash = hash * 31u + src[i];
@@ -1985,6 +2068,18 @@ static GLuint upload_texture_inner(const TexStage *t)
         slot = (int)best;
     }
 
+    /* RECOMP_GL_TEXLOG_SEC=<s>: every texture uploaded (a cache miss) from
+     * s seconds on -- where, what size and format -- to find the texture a
+     * newly appearing object is drawn with. */
+    { static int on = -1; static double from, t0; static int n;
+      if (on < 0) { const char *v = getenv("RECOMP_GL_TEXLOG_SEC");
+                    on = v ? 1 : 0; from = v ? atof(v) : 0; t0 = mono_now(); }
+      if (on && n < 400 && mono_now() - t0 >= from) {
+          n++;
+          fprintf(stderr, "[TEXUP] draw %u flip %u: %08X %ux%u fmt %02X pitch %u (draw uses prog %s)\n",
+                  S.draws, S.flips, t->offset, w, h, t->color, t->pitch,
+                  S.xf_mode == NV2A_XF_MODE_FIXED ? "ff" : "vp");
+      } }
     if (g_tcache[slot].used && g_tcache[slot].tex)
         glDeleteTextures(1, &g_tcache[slot].tex);
     glGenTextures(1, &tex);
@@ -2025,7 +2120,22 @@ static GLuint upload_texture_inner(const TexStage *t)
         uint8_t *rgba;
         uint32_t x, y;
 
-        if (!bpp) { glDeleteTextures(1, &tex); return 0; }
+        if (!bpp) {
+            /* Say so: a texture in a format this cannot decode draws as
+             * nothing (or black), and it is otherwise invisible in every log.
+             * Once per distinct format and size, then a count. */
+            static uint32_t seen[32]; static int nseen; static unsigned long total;
+            uint32_t k = (t->color << 16) ^ (w << 4) ^ h; int q, found = 0;
+            total++;
+            for (q = 0; q < nseen; q++) if (seen[q] == k) { found = 1; break; }
+            if (!found && nseen < 32) {
+                seen[nseen++] = k;
+                fprintf(stderr, "  [GL] TEXTURE FORMAT %02X NOT DECODED: %ux%u at %08X "
+                        "(pitch %u, draw %u; %lu such uploads so far)\n",
+                        t->color, w, h, t->offset, t->pitch, S.draws, total);
+            }
+            glDeleteTextures(1, &tex); return 0;
+        }
         rgba = (uint8_t *)malloc((size_t)w * h * 4);
         if (!rgba) { glDeleteTextures(1, &tex); return 0; }
         for (y = 0; y < h; y++) {
@@ -2062,11 +2172,18 @@ static GLuint upload_texture_inner(const TexStage *t)
         /* RECOMP_GL_DUMP_TEX_OFF=<hex>: only the texture at this address. A
          * scene uploads hundreds, and the one worth looking at is usually a
          * particular address that showed up in a draw dump. */
-        { static uint32_t only; static int oinit;
+        { static uint32_t only[8]; static int oinit, nonly;
+          int hit = 0, q;
           if (!oinit) { const char *o = getenv("RECOMP_GL_DUMP_TEX_OFF");
-                        oinit = 1; only = o ? (uint32_t)strtoul(o, 0, 16) : 0; }
+                        oinit = 1;
+                        /* A comma-separated list now: "0250F000,02512000". */
+                        while (o && *o && nonly < 8) {
+                            char *e; only[nonly++] = (uint32_t)strtoul(o, &e, 16);
+                            o = (*e == ',') ? e + 1 : NULL;
+                        } }
+          for (q = 0; q < nonly; q++) if (t->offset == only[q]) hit = 1;
         if (pfx && shots < 24 && S.draws_3d >= after3d
-            && (!only || t->offset == only)) {
+            && (!nonly || hit)) {
             uint8_t *back = (uint8_t *)malloc((size_t)w * h * 4);
             if (back) {
                 char nm[128]; FILE *f; uint32_t x, y, row, sz, nz = 0;
@@ -2385,10 +2502,13 @@ static long g_draw_log_flip = -1;
 
 static void draw_log_latch(void)
 {
-    static long want = -2;
+    /* RECOMP_GL_DRAW_LOG_SEC=<s>: and not before s seconds into the run. */
+    static long want = -2; static double sec, t0;
     if (want == -2) { const char *v = getenv("RECOMP_GL_DRAW_LOG");
-                      want = v ? atol(v) : -1; }
-    if (want >= 0 && g_draw_log_flip < 0 && (long)S.since_present >= want)
+                      const char *w = getenv("RECOMP_GL_DRAW_LOG_SEC");
+                      want = v ? atol(v) : -1; sec = w ? atof(w) : 0.0; t0 = mono_now(); }
+    if (want >= 0 && g_draw_log_flip < 0 && (long)S.since_present >= want
+        && (sec <= 0.0 || mono_now() - t0 >= sec))
         g_draw_log_flip = (long)S.flips + 1;
 }
 
@@ -2609,6 +2729,56 @@ static void do_draw(void)
     }
     if (n < 1) return;
 
+    /* The attributes this draw fetched from arrays keep its last vertex's
+     * values (see sticky_attrs). Done before anything below can drop the
+     * draw, because the hardware would have fetched it regardless; the
+     * draw's own constant attributes are the ones with no array, which this
+     * leaves alone. */
+    if (sticky_attrs()) {
+        uint32_t last = S.idx[n - 1];
+        for (i = 0; i < NUM_ATTRS; i++) {
+            const Attr *a = &S.attr[i];
+            if (!a->size || !a->stride || (!inl && !a->offset)) continue;
+            /* This reads arrays the draw's program may not read -- the
+             * hardware fetches every enabled one -- so an array left enabled
+             * with a stale address is read here and nowhere else. Only
+             * where guest memory is known to be: RAM, the contiguous
+             * window, the tiled alias. */
+            if (!inl) {
+                uint32_t va = resolve(a->offset);
+                uint64_t end = (uint64_t)va + (uint64_t)(last + 1) * a->stride;
+                if (!((end <= 0x04000000u)
+                      || (va >= XBOX_CONTIG_BASE && end <= (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
+                      || (va >= 0xF0000000u && end <= 0xF4000000u)))
+                    continue;
+            }
+            fetch(a, last, S.const_attr[i], inl);
+        }
+    }
+    /* RECOMP_GL_STICKYLOG=1: every lit fixed-function draw with no normal
+     * array, and the normal it inherits; and the fixed-function draws with
+     * no diffuse array whose inherited diffuse is not white. */
+    { static int sl = -1, nl;
+      if (sl < 0) sl = getenv("RECOMP_GL_STICKYLOG") ? 1 : 0;
+      if (sl && nl < 120 && S.xf_mode == NV2A_XF_MODE_FIXED) {
+          if (S.ff_lighting && !S.attr[2].size) {
+              nl++;
+              fprintf(stderr, "[STICKY] draw %u flip %u lit, no normal array: "
+                      "normal (%.3f %.3f %.3f %.3f) n=%u\n", S.draws, S.flips,
+                      S.const_attr[2][0], S.const_attr[2][1],
+                      S.const_attr[2][2], S.const_attr[2][3], n);
+          }
+          if (!S.attr[3].size && (S.const_attr[3][0] != 1.0f || S.const_attr[3][1] != 1.0f
+                                  || S.const_attr[3][2] != 1.0f || S.const_attr[3][3] != 1.0f)) {
+              nl++;
+              fprintf(stderr, "[STICKY] draw %u flip %u %s, no diffuse array: "
+                      "diffuse (%.3f %.3f %.3f %.3f)\n", S.draws, S.flips,
+                      S.ff_lighting ? "lit" : "unlit",
+                      S.const_attr[3][0], S.const_attr[3][1],
+                      S.const_attr[3][2], S.const_attr[3][3]);
+          }
+      } }
+
     if (!S.attr[0].size) { S.skipped_no_pos++; return; }
     /* RECOMP_GL_NO_TEX1: drop every draw that has a second texture stage.
      * JSRF paints its cel shading as a second blended pass over the same
@@ -2720,6 +2890,56 @@ static void do_draw(void)
         if (!stride_floats) stride_floats = 4;   /* a stride of zero is not a
                                                   * layout GL will accept */
     }
+
+    /* RECOMP_GL_STICKYLOG: the draws that read an inherited attribute value
+     * different from the one the title last set -- everything the sticky
+     * attributes change. A line each for the first few, then a count per
+     * attribute every 120 flips. */
+    { static int sl = -1, nl; static uint32_t cnt[NUM_ATTRS], since = 0, any;
+      if (sl < 0) sl = getenv("RECOMP_GL_STICKYLOG") ? 1 : 0;
+      if (sl && const_mask) {
+          for (i = 0; i < NUM_ATTRS; i++) {
+              if (!(const_mask & (1u << i))) continue;
+              if (!memcmp(S.const_attr[i], S.const_set[i], sizeof S.const_set[i])) continue;
+              cnt[i]++; any = 1;
+              /* One line per program and attribute the first time it is
+               * seen, with the program's disassembly once per program. */
+              { static uint32_t seen_key[64]; static int nseen;
+                static int seen_slot[64]; static int nslots;
+                uint32_t key = ((uint32_t)slot << 8) | i;
+                int q, found = 0;
+                for (q = 0; q < nseen; q++) if (seen_key[q] == key) { found = 1; break; }
+                if (!found && nseen < 64 && nl < 80) {
+                    seen_key[nseen++] = key; nl++;
+                    fprintf(stderr, "[STICKY] draw %u flip %u %s slot %d start %u n %u attr %u inherited "
+                            "(%.3f %.3f %.3f %.3f), set (%.3f %.3f %.3f %.3f); arrays",
+                            S.draws, S.flips,
+                            S.xf_mode == NV2A_XF_MODE_FIXED ? "ff" : "prog", slot,
+                            S.prog_start, n, i,
+                            S.const_attr[i][0], S.const_attr[i][1],
+                            S.const_attr[i][2], S.const_attr[i][3],
+                            S.const_set[i][0], S.const_set[i][1],
+                            S.const_set[i][2], S.const_set[i][3]);
+                    for (q = 0; q < NUM_ATTRS; q++)
+                        if (S.attr[q].size)
+                            fprintf(stderr, " v%d(t%u s%u)", q, S.attr[q].type, S.attr[q].size);
+                    fprintf(stderr, " inputs %04X\n", g_pcache[slot].inputs);
+                    found = 0;
+                    for (q = 0; q < nslots; q++) if (seen_slot[q] == slot) { found = 1; break; }
+                    if (!found && nslots < 64) {
+                        seen_slot[nslots++] = slot;
+                        if (g_pcache[slot].dis) fputs(g_pcache[slot].dis, stderr);
+                    }
+                } }
+          }
+      }
+      if (sl && any && S.flips - since >= 120u) {
+          fprintf(stderr, "[STICKY] flips %u..%u, draws reading an inherited value:", since, S.flips);
+          for (i = 0; i < NUM_ATTRS; i++)
+              if (cnt[i]) fprintf(stderr, " attr%u=%u", i, cnt[i]);
+          fprintf(stderr, "\n");
+          memset(cnt, 0, sizeof cnt); any = 0; since = S.flips;
+      } }
 
     /*
      * RECOMP_GL_DMACENSUS=1: where every draw's position array is routed.
@@ -2886,6 +3106,15 @@ static void do_draw(void)
                     }
                 }
             }
+            /* A program that indexes the constant file through A0 reads
+             * constants no "c[" in its text names: print the user range. */
+            if (g_pcache[slot].uses_a0) {
+                int n;
+                fprintf(stderr, "----- c[96..135] (the program indexes through A0) -----\n");
+                for (n = 96; n < 136 && n < NV2A_VSH_NUM_CONSTS; n++)
+                    fprintf(stderr, "  c[%3d] = %12.5f %12.5f %12.5f %12.5f\n",
+                            n, S.u.c[n][0], S.u.c[n][1], S.u.c[n][2], S.u.c[n][3]);
+            }
             fprintf(stderr, "----- vertex 0 as fetched -----\n");
             { uint32_t j;
               for (j = 0; j < NUM_ATTRS; j++)
@@ -2994,14 +3223,20 @@ static void do_draw(void)
          * constant attributes with different values inherited the previous
          * object's -- every batch after the first in a run of them. Remember
          * the values too, and re-send when either changes. */
-        if (const_mask && (g_last.const_mask != const_mask
-                           || memcmp(g_last.const_attr, S.const_attr,
-                                     sizeof g_last.const_attr))) {
+        /* Per attribute, now that the constants move with every draw (the
+         * sticky attributes): comparing the whole table re-sent every
+         * constant after every draw, because the attributes that came from
+         * arrays -- which are not sent from here at all -- had changed. */
+        if (const_mask) {
+            int all = (g_last.const_mask != const_mask);
             for (i = 0; i < NUM_ATTRS; i++)
-                if (const_mask & (1u << i))
+                if ((const_mask & (1u << i))
+                    && (all || memcmp(g_last.const_attr[i], S.const_attr[i],
+                                      sizeof S.const_attr[i]))) {
                     glVertexAttrib4fv(i, S.const_attr[i]);
+                    memcpy(g_last.const_attr[i], S.const_attr[i], sizeof S.const_attr[i]);
+                }
             g_last.const_mask = const_mask;
-            memcpy(g_last.const_attr, S.const_attr, sizeof g_last.const_attr);
         }
     }
 
@@ -3283,6 +3518,33 @@ static void do_draw(void)
         if (amt < 0.0f) { const char *v = getenv("RECOMP_GL_FF_LIGHT");
                           amt = v ? (float)atof(v) : 0.0f; }
         glUniform1f(g_pcache[slot].u_litAmbient, amt);
+    }
+    /* The fixed-function lighting's state, for a lit batch. Uploaded every
+     * draw: the title changes the light's colour between batches (its pause
+     * map colours each element that way), and uniforms are per program. */
+    if (g_pcache[slot].u_ltSceneAmb >= 0) {
+        glUniform4fv(g_pcache[slot].u_ffMV, 4, &S.ff_mv[0][0]);
+        glUniform4fv(g_pcache[slot].u_ffIMV, 4, &S.ff_imv[0][0]);
+        glUniform3fv(g_pcache[slot].u_ltSceneAmb, 1, S.scene_ambient);
+        glUniform3fv(g_pcache[slot].u_ltMatEm, 1, S.material_emission);
+        glUniform1f(g_pcache[slot].u_ltMatAlpha, S.material_alpha);
+        glUniform3fv(g_pcache[slot].u_ltAmb, 8, &S.light_amb[0][0]);
+        glUniform3fv(g_pcache[slot].u_ltDif, 8, &S.light_dif[0][0]);
+        glUniform3fv(g_pcache[slot].u_ltSpc, 8, &S.light_spc[0][0]);
+        glUniform3fv(g_pcache[slot].u_ltDir, 8, &S.light_dir[0][0]);
+        glUniform3fv(g_pcache[slot].u_ltHalf, 8, &S.light_half[0][0]);
+        glUniform3fv(g_pcache[slot].u_ltPos, 8, &S.light_pos[0][0]);
+        glUniform3fv(g_pcache[slot].u_ltAtt, 8, &S.light_att[0][0]);
+        glUniform1fv(g_pcache[slot].u_ltRange, 8, S.light_range);
+        glUniform4fv(g_pcache[slot].u_ltSpotDir, 8, &S.light_spot_dir[0][0]);
+        { float eye[4]; memcpy(eye, S.eye_position, sizeof eye);
+          if (eye[3] == 0.0f) eye[3] = 1.0f;
+          glUniform4fv(g_pcache[slot].u_ltEye, 1, eye); }
+        /* The exponent: the title hands the hardware six coefficients of
+         * its own approximation (NV097_SET_SPECULAR_PARAMS), which xemu
+         * fits back to an exponent. Not reconstructed here yet -- every lit
+         * batch this title draws has a black specular colour. */
+        glUniform1f(g_pcache[slot].u_ltSpecPow, 16.0f);
     }
     if (g_pcache[slot].u_ffMat >= 0) {
         glUniform4fv(g_pcache[slot].u_ffMat, 4, &S.u.ff_mat[0][0]);
@@ -3567,6 +3829,17 @@ static void do_draw(void)
         rs.w_buffer     = S.psh.w_buffer;
         rs.cull_face    = S.cull_face;
         rs.front_face   = S.front_face;
+        /* Stencil. RECOMP_GL_NOSTENCIL=1: ignore it, as before. */
+        { static int nost = -1;
+          if (nost < 0) nost = getenv("RECOMP_GL_NOSTENCIL") ? 1 : 0;
+          rs.stencil_test  = nost ? 0 : (S.stencil_en ? 1 : 0);
+          rs.stencil_func  = S.stencil_func;
+          rs.stencil_ref   = S.stencil_ref;
+          rs.stencil_rmask = S.stencil_fmask;
+          rs.stencil_wmask = S.stencil_wmask;
+          rs.stencil_op[0] = S.stencil_op[0];
+          rs.stencil_op[1] = S.stencil_op[1];
+          rs.stencil_op[2] = S.stencil_op[2]; }
         /* The window clip. A rectangle that covers the surface is the same as
          * none and costs a state change per draw to say so, which is why the
          * test is here and not in a backend. */
@@ -3753,17 +4026,27 @@ static void do_draw(void)
                   fprintf(stderr, "  [CURTAIN] full-screen quad %ux%u: "
                           "alpha %.3f, %u this frame (worst %u), %u total%s | "
                           "tex0 en=%d off=%08X %ux%u fmt=%08X | tex1 en=%d "
-                          "off=%08X | surf=%08X\n",
+                          "off=%08X | surf=%08X | stencil %u func %X ref %X op %X/%X/%X"
+                          " | blend %04X/%04X depth %d/%d func %X z %.1f w %.3f cm %08X\n",
                           (unsigned)p3[0], (unsigned)p3[1], c[3],
                           per_frame, worst, seen,
                           mode_c == 2 ? " -- skipping" : "",
                           S.tex[0].enabled, S.tex[0].offset,
                           S.tex[0].width, S.tex[0].height, S.tex[0].format,
-                          S.tex[1].enabled, S.tex[1].offset, S.color_offset);
+                          S.tex[1].enabled, S.tex[1].offset, S.color_offset,
+                          S.stencil_en, S.stencil_func, S.stencil_ref,
+                          S.stencil_op[0], S.stencil_op[1], S.stencil_op[2],
+                          S.blend_src, S.blend_dst, S.depth_test, S.depth_mask,
+                          (unsigned)S.depth_func, p0[2], p0[3], S.color_mask);
                   (void)first_alpha;
                   fflush(stderr);
               }
-              if (mode_c == 2) curtain_skip = 1;
+              /* With the stencil emulated, a curtain drawn under the
+               * stencil test is the shadow pass, masked to the shadows: it
+               * stays. One without it is a real fade, and is still skipped
+               * under RECOMP_GL_CURTAIN=skip. */
+              if (mode_c == 2 && !(S.stencil_en && !getenv("RECOMP_GL_NOSTENCIL")))
+                  curtain_skip = 1;
           }
       } }
     /* Skipped by suppressing the draw call, NOT by returning.
@@ -5924,9 +6207,16 @@ static void do_draw(void)
         { static long atsince = -2;
           if (atsince == -2) { const char *v = getenv("RECOMP_GL_STATE_AT_SINCE");
                                atsince = v ? atol(v) : -1; }
+          /* RECOMP_GL_STATE_AT_SEC=<s>: only from s seconds after the
+           * renderer started -- a gate by time, for a phase whose draw
+           * counts are not known in advance. */
+          static double atsec = -2.0, t0;
+          if (atsec == -2.0) { const char *v = getenv("RECOMP_GL_STATE_AT_SEC");
+                               atsec = v ? atof(v) : -1.0; t0 = mono_now(); }
           if (atsince >= 0) {
               if ((long)S.since_present == atsince && shown < 6
-               && (at3d < 0 || (long)S.draws_3d >= at3d))
+               && (at3d < 0 || (long)S.draws_3d >= at3d)
+               && (atsec < 0 || mono_now() - t0 >= atsec))
                   at = (long)S.draws;
           } else if (at3d >= 0 && (long)S.draws_3d >= at3d && shown < 6) {
               at = (long)S.draws;
@@ -6159,7 +6449,7 @@ static void do_draw(void)
                 "vp %s tex0 %08X %ux%u f%02X en%d tex1 en%d "
                 "blend %d %04X/%04X depth %d/%d ctl %08X final %08X/%08X "
                 "| xf%u a9 off=%08X t%u s%u st%u u[%.3f..%.3f] v[%.3f..%.3f] "
-                "in%04X\n",
+                "in%04X | sten %u f%X r%X m%X w%X op%X/%X/%X dfunc %X cm %08X\n",
                 (long)S.flips, S.since_present, out_n, S.prim, slot,
                 S.u.vp_off[0] > 100.0f ? "3D" : "2D",
                 S.tex[0].offset, S.tex[0].width, S.tex[0].height,
@@ -6170,7 +6460,26 @@ static void do_draw(void)
                 S.xf_mode,
                 S.attr[9].offset, S.attr[9].type, S.attr[9].size,
                 S.attr[9].stride, t0lo[0], t0hi[0], t0lo[1], t0hi[1],
-                g_pcache[slot].inputs);
+                g_pcache[slot].inputs,
+                S.stencil_en, S.stencil_func, S.stencil_ref, S.stencil_fmask,
+                S.stencil_wmask, S.stencil_op[0], S.stencil_op[1], S.stencil_op[2],
+                (unsigned)S.depth_func, S.color_mask);
+        /* And, for a fixed-function batch, how it is lit. */
+        if (S.xf_mode == NV2A_XF_MODE_FIXED)
+            fprintf(stderr, "[DRAW] f%ld %4u   lit %d mask %X colmat %02X ctl %X spec %u | sceneAmb %.3f %.3f %.3f matEm %.3f %.3f %.3f"
+                    " | l0 amb %.3f %.3f %.3f dif %.3f %.3f %.3f dir %.3f %.3f %.3f | normal %u(t%u) diffuse %u specular %u"
+                    " | const normal %.3f %.3f %.3f %.3f | imv %.2f %.2f %.2f / %.2f %.2f %.2f / %.2f %.2f %.2f\n",
+                    (long)S.flips, S.since_present, S.ff_lighting, S.light_enable_mask, S.color_material,
+                    S.light_control, S.specular_enable,
+                    S.scene_ambient[0], S.scene_ambient[1], S.scene_ambient[2],
+                    S.material_emission[0], S.material_emission[1], S.material_emission[2],
+                    S.light_amb[0][0], S.light_amb[0][1], S.light_amb[0][2],
+                    S.light_dif[0][0], S.light_dif[0][1], S.light_dif[0][2],
+                    S.light_dir[0][0], S.light_dir[0][1], S.light_dir[0][2],
+                    S.attr[2].size, S.attr[2].type, S.attr[3].size, S.attr[4].size,
+                    S.const_attr[2][0], S.const_attr[2][1], S.const_attr[2][2], S.const_attr[2][3],
+                    S.ff_imv[0][0], S.ff_imv[0][1], S.ff_imv[0][2], S.ff_imv[1][0], S.ff_imv[1][1], S.ff_imv[1][2],
+                    S.ff_imv[2][0], S.ff_imv[2][1], S.ff_imv[2][2]);
     }
 
     /* Record what this draw was, for the order dump. */
@@ -6197,6 +6506,75 @@ static void do_draw(void)
         g_ring_n++;
     }
     S.draws++;
+    /* RECOMP_GL_LITLOG=<s>: from s seconds after the renderer started, the
+     * lighting state of each lit fixed-function draw whenever it changes
+     * (first 80 changes; directions and matrices are shown, not compared). */
+    { static int on = -1, n; static float last[64]; static double from, t0;
+      if (on < 0) { const char *v = getenv("RECOMP_GL_LITLOG");
+                    on = v ? 1 : 0; from = v ? atof(v) : 0.0; t0 = mono_now(); }
+      if (on && n < 80 && S.xf_mode == NV2A_XF_MODE_FIXED && S.ff_lighting
+          && mono_now() - t0 >= from) {
+          float cur[64]; int k = 0, li;
+          memset(cur, 0, sizeof cur);
+          cur[k++] = (float)S.light_enable_mask; cur[k++] = (float)S.color_material;
+          cur[k++] = (float)S.light_control; cur[k++] = (float)S.specular_enable;
+          cur[k++] = (float)S.normalization;
+          memcpy(&cur[k], S.scene_ambient, 12); k += 3;
+          memcpy(&cur[k], S.material_emission, 12); k += 3;
+          cur[k++] = S.material_alpha;
+          for (li = 0; li < 2; li++) {
+              memcpy(&cur[k], S.light_amb[li], 12); k += 3;
+              memcpy(&cur[k], S.light_dif[li], 12); k += 3;
+              memcpy(&cur[k], S.light_spc[li], 12); k += 3;
+          }
+          cur[k++] = (float)out_n; cur[k++] = (float)S.tex[0].enabled;
+          cur[k++] = (float)S.attr[2].size; cur[k++] = (float)S.attr[3].size;
+          if (memcmp(cur, last, sizeof cur)) {
+              memcpy(last, cur, sizeof cur); n++;
+              fprintf(stderr, "[LIT] draw %u flip %u verts %u: mask %08X colmat %08X ctl %08X spec %u norm %u | "
+                      "sceneAmb %.3f %.3f %.3f matEm %.3f %.3f %.3f matA %.3f | normal %s diffuse %s tex0 %d\n",
+                      S.draws, S.flips, out_n, S.light_enable_mask, S.color_material, S.light_control,
+                      S.specular_enable, S.normalization,
+                      S.scene_ambient[0], S.scene_ambient[1], S.scene_ambient[2],
+                      S.material_emission[0], S.material_emission[1], S.material_emission[2], S.material_alpha,
+                      S.attr[2].size ? "yes" : "no", S.attr[3].size ? "yes" : "no", S.tex[0].enabled);
+              for (li = 0; li < 8; li++) {
+                  uint32_t mode = (S.light_enable_mask >> (2 * li)) & 3;
+                  if (!mode) continue;
+                  fprintf(stderr, "[LIT]   light%d mode %u amb %.3f %.3f %.3f dif %.3f %.3f %.3f spc %.3f %.3f %.3f"
+                          " dir %.3f %.3f %.3f half %.3f %.3f %.3f pos %.1f %.1f %.1f att %.3f %.3f %.3f range %g\n",
+                          li, mode, S.light_amb[li][0], S.light_amb[li][1], S.light_amb[li][2],
+                          S.light_dif[li][0], S.light_dif[li][1], S.light_dif[li][2],
+                          S.light_spc[li][0], S.light_spc[li][1], S.light_spc[li][2],
+                          S.light_dir[li][0], S.light_dir[li][1], S.light_dir[li][2],
+                          S.light_half[li][0], S.light_half[li][1], S.light_half[li][2],
+                          S.light_pos[li][0], S.light_pos[li][1], S.light_pos[li][2],
+                          S.light_att[li][0], S.light_att[li][1], S.light_att[li][2], S.light_range[li]);
+              }
+              fprintf(stderr, "[LIT]   mv0 %.3f %.3f %.3f %.3f | imv0 %.3f %.3f %.3f %.3f | specpar %.3f %.3f %.3f %.3f %.3f %.3f\n",
+                      S.ff_mv[0][0], S.ff_mv[0][1], S.ff_mv[0][2], S.ff_mv[0][3],
+                      S.ff_imv[0][0], S.ff_imv[0][1], S.ff_imv[0][2], S.ff_imv[0][3],
+                      S.specular_params[0], S.specular_params[1], S.specular_params[2],
+                      S.specular_params[3], S.specular_params[4], S.specular_params[5]);
+          }
+      } }
+    /* RECOMP_GL_FOGLOG=1: the fog state each draw runs with, whenever it
+     * changes (first 400 changes) -- enable, mode, how the coordinate is
+     * made, colour, the three parameters, and which pipeline drew. */
+    { static int on = -1, n; static uint32_t last[8];
+      if (on < 0) on = getenv("RECOMP_GL_FOGLOG") ? 1 : 0;
+      if (on && n < 400) {
+          uint32_t cur[8];
+          cur[0] = S.fog_enable; cur[1] = S.fog_mode; cur[2] = S.fog_gen_mode; cur[3] = S.fog_color;
+          memcpy(&cur[4], S.fog_params, 12); cur[7] = 0;
+          if (memcmp(cur, last, sizeof cur)) {
+              memcpy(last, cur, sizeof cur); n++;
+              fprintf(stderr, "[FOG] draw %u flip %u: enable %u mode %04X gen %u colour %08X params %g %g %g | %s\n",
+                      S.draws, S.flips, S.fog_enable, S.fog_mode, S.fog_gen_mode, S.fog_color,
+                      S.fog_params[0], S.fog_params[1], S.fog_params[2],
+                      S.xf_mode == NV2A_XF_MODE_FIXED ? "fixed-function" : "program");
+          }
+      } }
     /* The title alternates viewports within a frame: a half-pixel offset for
      * its screen-space passes, a centred one for the scene. Counting the
      * centred ones is the cheapest "are we in 3D yet" signal there is, and it
@@ -6323,7 +6701,6 @@ static void glb_clear(unsigned mask, const float rgba[4], float depth,
                       uint32_t stencil, const uint32_t rect[4])
 {
     GLbitfield bits = 0;
-    (void)stencil;
 
     if (!g_ready) return;
     if (mask & 1u) {
@@ -6340,6 +6717,12 @@ static void glb_clear(unsigned mask, const float rgba[4], float depth,
         glDepthMask(GL_TRUE);
         g_last.depth_mask = -1;   /* the clear forced it; re-apply next draw */
         bits |= GL_DEPTH_BUFFER_BIT;
+    }
+    if (mask & 4u) {
+        glClearStencil((GLint)(stencil & 0xFFu));
+        glStencilMask(0xFFu);
+        g_last_stencil_reset = 1; /* the write mask; re-apply next draw */
+        bits |= GL_STENCIL_BUFFER_BIT;
     }
     if (!bits) return;
 
@@ -6434,11 +6817,15 @@ static void do_clear(uint32_t param)
         rgba[0] = r; rgba[1] = g; rgba[2] = b; rgba[3] = a;
         mask |= 1u;
     }
-    if (param & 0x03) {
+    if (param & 0x01) {
         /* Z is the top 24 bits of the combined z/stencil clear value. */
         depth = (float)((double)(S.clear_zstencil >> 8) / 16777215.0);
         mask |= 2u;
     }
+    /* NV097_CLEAR_SURFACE_STENCIL, bit 1, is its own request: this used to
+     * clear depth for it too, so a stencil-only clear wiped the depth. */
+    if (param & 0x02)
+        mask |= 4u;
     if (!mask) return;
 
     /* A clear is bounded by the clear rectangle, not by the surface -- see
@@ -6579,9 +6966,21 @@ static void frame_pace(void)
             } else if (now < deadline) {
                 int held = xbox_guest_lock_drop ? xbox_guest_lock_drop() : 0;
                 double spin = deadline - 0.0012;
-                if (now < spin) {
+                /* Answer the display interrupt while waiting: this thread is
+                 * the one that completes its acknowledgement, and the title's
+                 * handler holds the guest lock until it does -- see
+                 * xbox_nv2a_vblank_service(). So the sleep is taken in slices
+                 * of a millisecond with the interrupt serviced between them.
+                 * RECOMP_PACE_VBLANK=0: one sleep, as before, for A/B. */
+                static int service = -1;
+                if (service < 0) {
+                    const char *v = getenv("RECOMP_PACE_VBLANK");
+                    service = (v ? atoi(v) : 1) && xbox_nv2a_vblank_service;
+                }
+                while (now < spin) {
                     struct timespec ts;
                     double wait = spin - now;
+                    if (service && wait > 0.001) wait = 0.001;
                     ts.tv_sec = (time_t)wait;
                     ts.tv_nsec = (long)((wait - (double)ts.tv_sec) * 1e9);
                     /* Wait the way the console waits: with the rest of the
@@ -6589,8 +6988,11 @@ static void frame_pace(void)
                      * that serialises guest threads, so sleeping here without
                      * giving it up stops the loader and the sound thread too. */
                     nanosleep(&ts, NULL);
+                    if (!service) break;
+                    xbox_nv2a_vblank_service();
+                    now = mono_now();
                 }
-                while (mono_now() < deadline) { }
+                while (mono_now() < deadline) { if (service) xbox_nv2a_vblank_service(); }
                 if (held && xbox_guest_lock_retake) xbox_guest_lock_retake(held);
             }
         }
@@ -6985,9 +7387,49 @@ static void ensure_ready(void)
     backend()->surface(S.color_offset, S.clip_w, S.clip_h, gl_scale());
 }
 
+/*
+ * RECOMP_GL_METHVAL=<s>: which VALUES the title writes to a set of methods
+ * this backend ignores or only half-handles -- texture coordinate generation
+ * (0x03C0..0x03FC per stage S/T/R/Q), stencil (0x032C..0x0378), polygon
+ * offset (0x0330..0x0338, 0x0384/0x0388), point sprites (0x0318/0x031C,
+ * 0x043C) and the texgen planes (0x0840..0x093C) -- each distinct value
+ * with a count, printed every s seconds. The counts alone (RECOMP_GL_UNHANDLED)
+ * cannot say whether a feature is ever switched ON, and that is the question.
+ */
+static void methval_note(uint32_t method, uint32_t param)
+{
+    enum { NM = 96, NV = 6 };
+    static int on = -1; static double every, next;
+    static uint32_t meth[NM], val[NM][NV], cnt[NM][NV]; static int nm, nv[NM];
+    int i, j;
+    if (on < 0) { const char *v = getenv("RECOMP_GL_METHVAL");
+                  on = v ? 1 : 0; every = v ? atof(v) : 0.0; if (every <= 0) every = 10.0;
+                  next = mono_now() + every; }
+    if (!on) return;
+    if (!((method >= 0x0318 && method <= 0x0390) || (method >= 0x03C0 && method < 0x0400)
+          || method == 0x043C || (method >= 0x0840 && method < 0x0940))) return;
+    for (i = 0; i < nm; i++) if (meth[i] == method) break;
+    if (i == nm) { if (nm >= NM) return; meth[nm++] = method; }
+    for (j = 0; j < nv[i]; j++) if (val[i][j] == param) break;
+    if (j == nv[i]) { if (nv[i] >= NV) j = NV - 1; else { val[i][j] = param; nv[i]++; } }
+    cnt[i][j]++;
+    if (mono_now() >= next) {
+        next = mono_now() + every;
+        fprintf(stderr, "[METHVAL] draw %u:", S.draws);
+        for (i = 0; i < nm; i++) {
+            fprintf(stderr, " %04X{", meth[i]);
+            for (j = 0; j < nv[i]; j++) fprintf(stderr, "%s%X:%u", j ? "," : "", val[i][j], cnt[i][j]);
+            fprintf(stderr, "}");
+        }
+        fprintf(stderr, "\n");
+        fflush(stderr);
+    }
+}
+
 void nv2a_gl_method(uint32_t method, uint32_t param)
 {
     if (!nv2a_gl_enabled() || g_failed) return;
+    methval_note(method, param);
 
     if (!S.const_attr_init) {
         int i;
@@ -7000,6 +7442,7 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
          * surface with no colour stream is meant to come out as. */
         S.const_attr[3][0] = S.const_attr[3][1] = S.const_attr[3][2] = 1.0f;
         S.const_attr[4][0] = S.const_attr[4][1] = S.const_attr[4][2] = 1.0f;
+        memcpy(S.const_set, S.const_attr, sizeof S.const_set);
     }
 
     /* Ranged methods first: they are the ones a title spends its bandwidth on. */
@@ -7136,11 +7579,22 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
          * 24 and 32 with IMMAT0..3 in the gaps. The hardware blends between
          * them when skinning is on; the composite matrix alone is only the
          * rigid case. */
-        /* Not kept: nothing reads them. The composite matrix covers the
-         * rigid case, which is every fixed-function batch this title draws --
-         * measured, zero of them enable skinning. Writing them into the
-         * constant file was pure damage. */
-        (void)param;
+        /* Not written into the constant file -- the composite matrix covers
+         * the transform, and zero of this title's fixed-function batches
+         * enable skinning; writing them there was pure damage. Matrix 0 is
+         * kept for the lighting, which needs eye-space positions. Stored as
+         * sent, four groups of four, each the vector a component is dotted
+         * with -- the composite matrix's own arrangement (xemu: no
+         * transpose). */
+        uint32_t k = (method - M_SET_MODEL_VIEW_MATRIX) / 4;
+        if (k < 16) memcpy(&S.ff_mv[k / 4][k & 3], &param, 4);
+        return;
+    }
+    if (method >= 0x0580 && method < 0x0580 + 4 * 64) {  /* NV097_SET_INVERSE_MODEL_VIEW_MATRIX */
+        /* Its matrix 0 turns normals into eye space for the lighting:
+         * tNormal = (normal, 0) against these, as xemu's vsh-ff does. */
+        uint32_t k = (method - 0x0580) / 4;
+        if (k < 16) memcpy(&S.ff_imv[k / 4][k & 3], &param, 4);
         return;
     }
     if (method >= M_SET_TEXTURE_MATRIX && method < M_SET_TEXTURE_MATRIX + 4 * 64) {
@@ -7156,9 +7610,23 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
         else       S.ff_texmat_enable &= ~(1u << i);
         return;
     }
+    /* RECOMP_GL_INLINELOG=1: the named per-vertex constant methods
+     * (NV097_SET_NORMAL3F 0x1530, _NORMAL3S 0x1540, _DIFFUSE_COLOR* 0x1550..,
+     * _SPECULAR_COLOR* ...) -- which of them the title sends, with values. */
+    if ((method >= 0x1500 && method < 0x1600 && (method < 0x1500 || method >= 0x1530))
+        || method == 0x1890 || method == 0x1894 || method == 0x1908 || method == 0x1948
+        || method == 0x1990 || method == 0x1994 || (method >= 0x1A20 && method < 0x1A30)) {
+        /* (the inline vertex positions, 0x1500..0x152C, are left out) --
+         * and every route to the normal's constant, attribute 2. */
+        static int on = -1, n;
+        if (on < 0) on = getenv("RECOMP_GL_INLINELOG") ? 1 : 0;
+        if (on && n < 200) { float fv; memcpy(&fv, &param, 4); n++;
+            fprintf(stderr, "[INLINE] m %04X = %08X (%g) at draw %u flip %u\n", method, param, fv, S.draws, S.flips); }
+    }
     if (method >= M_SET_VERTEX_DATA4F && method < M_SET_VERTEX_DATA4F + NUM_ATTRS * 16) {
         uint32_t i = (method - M_SET_VERTEX_DATA4F) / 16;
         memcpy(&S.const_attr[i][((method - M_SET_VERTEX_DATA4F) / 4) & 3], &param, 4);
+        memcpy(&S.const_set[i][((method - M_SET_VERTEX_DATA4F) / 4) & 3], &param, 4);
         return;
     }
     if (method >= M_SET_VERTEX_DATA4UB && method < M_SET_VERTEX_DATA4UB + NUM_ATTRS * 4) {
@@ -7167,6 +7635,7 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
         S.const_attr[i][1] = ((param >>  8) & 0xFF) / 255.0f;
         S.const_attr[i][2] = ((param >> 16) & 0xFF) / 255.0f;
         S.const_attr[i][3] = ((param >> 24) & 0xFF) / 255.0f;
+        memcpy(S.const_set[i], S.const_attr[i], sizeof S.const_set[i]);
         return;
     }
     if (method >= M_SET_VERTEX_ARRAY_OFFSET && method < M_SET_VERTEX_ARRAY_OFFSET + 0x40) {
@@ -7235,21 +7704,27 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
      * values are logged the first few times they change, to see what the
      * title's sun looks like. */
     if (method >= 0x1000 && method < 0x1000 + 8 * 0x80) {
-        uint32_t li = (method - 0x1000) / 0x80, off = (method - 0x1000) % 0x80, c = (off & 0xC) / 4; float fv;
+        /* The fields are three floats apiece (the spot direction four), so
+         * they do not sit on 16-byte boundaries: ambient 0x00, diffuse 0x0C,
+         * specular 0x18, range 0x24, infinite half vector 0x28, infinite
+         * direction 0x34, spot falloff 0x40, spot direction 0x4C, local
+         * position 0x5C, attenuation 0x68 (xemu nv2a_regs.h). This used to
+         * decode by masking off bits 2-3, which only finds fields that start
+         * on 16 bytes: everything but the ambient colour was dropped, and
+         * every light read as black -- the "null light" of the earlier
+         * notes was this decoder. */
+        uint32_t li = (method - 0x1000) / 0x80, off = (method - 0x1000) % 0x80; float fv;
         memcpy(&fv, &param, 4);
-        switch (off & ~0xCu) {
-        case 0x00: if (c < 3) S.light_amb[li][c] = fv; break;
-        case 0x0C: if (c < 3) S.light_dif[li][c] = fv; break;   /* 0x0C..0x14 */
-        case 0x18: if (c < 3) S.light_spc[li][c] = fv; break;   /* 0x18..0x20 */
-        case 0x24: if (c == 0) S.light_range[li] = fv; break;
-        case 0x28: if (c < 3) S.light_half[li][c] = fv; break;  /* 0x28..0x30 */
-        case 0x34: if (c < 3) S.light_dir[li][c] = fv; break;   /* 0x34..0x3C */
-        case 0x40: if (c < 3) S.light_spot_falloff[li][c] = fv; break;
-        case 0x4C: if (c < 4) S.light_spot_dir[li][c] = fv; break;
-        case 0x5C: if (c < 3) S.light_pos[li][c] = fv; break;
-        case 0x68: if (c < 3) S.light_att[li][c] = fv; break;
-        default: break;
-        }
+        if      (off < 0x0C) S.light_amb[li][off / 4] = fv;
+        else if (off < 0x18) S.light_dif[li][(off - 0x0C) / 4] = fv;
+        else if (off < 0x24) S.light_spc[li][(off - 0x18) / 4] = fv;
+        else if (off < 0x28) S.light_range[li] = fv;
+        else if (off < 0x34) S.light_half[li][(off - 0x28) / 4] = fv;
+        else if (off < 0x40) S.light_dir[li][(off - 0x34) / 4] = fv;
+        else if (off < 0x4C) S.light_spot_falloff[li][(off - 0x40) / 4] = fv;
+        else if (off < 0x5C) S.light_spot_dir[li][(off - 0x4C) / 4] = fv;
+        else if (off < 0x68) S.light_pos[li][(off - 0x5C) / 4] = fv;
+        else if (off < 0x74) S.light_att[li][(off - 0x68) / 4] = fv;
         if (li == 0 && off == 0x3C) { static int said; if (said++ < 4)
             fprintf(stderr, "  [LIGHT] light0 amb %.2f %.2f %.2f dif %.2f %.2f %.2f spc %.2f %.2f %.2f dir %.3f %.3f %.3f half %.3f %.3f %.3f at draw %u\n",
                     S.light_amb[0][0], S.light_amb[0][1], S.light_amb[0][2], S.light_dif[0][0], S.light_dif[0][1], S.light_dif[0][2],
@@ -7257,9 +7732,13 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
                     S.light_half[0][0], S.light_half[0][1], S.light_half[0][2], S.draws); }
         return;
     }
-    if (method >= 0x181C && method < 0x181C + 16) {   /* NV097_SET_EYE_POSITION */
-        memcpy(&S.eye_position[(method - 0x181C) / 4], &param, 4); return;
+    if (method >= 0x0A50 && method < 0x0A50 + 16) {   /* NV097_SET_EYE_POSITION (was 0x181C: wrong) */
+        memcpy(&S.eye_position[(method - 0x0A50) / 4], &param, 4); return;
     }
+    if (method >= 0x09E0 && method < 0x09E0 + 24) {   /* NV097_SET_SPECULAR_PARAMS, six floats */
+        memcpy(&S.specular_params[(method - 0x09E0) / 4], &param, 4); return;
+    }
+
     if (method >= M_SET_VIEWPORT_OFFSET && method < M_SET_VIEWPORT_OFFSET + 0x10) {
         static uint32_t last, sub;
         sub = (method == last) ? ((sub + 1) & 3)
@@ -7370,6 +7849,8 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
     case M_SET_COMBINER_CONTROL:     S.psh.control = param; break;
     case M_SET_COMBINER_SPECFOG_CW0: S.psh.final_abcd = param; break;
     case M_SET_COMBINER_SPECFOG_CW1: S.psh.final_efg = param; break;
+    case 0x1E20: S.psh.final_c0 = param; break;   /* NV097_SET_SPECULAR_FOG_FACTOR */
+    case 0x1E24: S.psh.final_c1 = param; break;
     case M_SET_FOG_COLOR:            S.fog_color = param; break;
     /* The texture shaders: what each of the four stages does with its
      * coordinates before the combiners see it. Not decoded before -- every
@@ -7621,6 +8102,25 @@ void nv2a_gl_method(uint32_t method, uint32_t param)
      * writes off, to prime the depth buffer or to lay down an invisible
      * occluder -- had that pass painted in full here. */
     case M_SET_COLOR_MASK:        S.color_mask = param; break;
+    case 0x032C: S.stencil_en = param;              /* SET_STENCIL_TEST_ENABLE */
+        if (g_draw_log_flip >= 0 && (long)S.flips >= g_draw_log_flip
+         && (long)S.flips < g_draw_log_flip + 6)
+            fprintf(stderr, "[STW] f%ld after draw %u: stencil test %u (func %X ref %X ops %X/%X/%X)\n",
+                    (long)S.flips, S.since_present, param, S.stencil_func, S.stencil_ref,
+                    S.stencil_op[0], S.stencil_op[1], S.stencil_op[2]);
+        break;
+    case 0x0360: S.stencil_wmask = param; break;    /* SET_STENCIL_MASK (writes) */
+    case 0x0364: S.stencil_func = param;            /* SET_STENCIL_FUNC */
+        if (g_draw_log_flip >= 0 && (long)S.flips >= g_draw_log_flip
+         && (long)S.flips < g_draw_log_flip + 6)
+            fprintf(stderr, "[STW] f%ld after draw %u: stencil func %X (test %u)\n",
+                    (long)S.flips, S.since_present, param, S.stencil_en);
+        break;
+    case 0x0368: S.stencil_ref = param; break;      /* SET_STENCIL_FUNC_REF */
+    case 0x036C: S.stencil_fmask = param; break;    /* SET_STENCIL_FUNC_MASK */
+    case 0x0370: S.stencil_op[0] = param; break;    /* SET_STENCIL_OP_FAIL */
+    case 0x0374: S.stencil_op[1] = param; break;    /* SET_STENCIL_OP_ZFAIL */
+    case 0x0378: S.stencil_op[2] = param; break;    /* SET_STENCIL_OP_ZPASS */
     case M_SET_DEPTH_FUNC:        S.depth_func = (int)param; break;
     case M_SET_ALPHA_TEST_ENABLE: S.alpha_test = (int)param; break;
     case M_SET_ALPHA_FUNC:        S.alpha_func = (int)param; break;
@@ -7850,6 +8350,19 @@ static void glb_texture(int stage, const void *rgba, uint32_t w, uint32_t h,
  * values, and OpenGL charges for each one. The comparison is now against a
  * copy of the descriptor, so a backend that is handed identical state twice
  * costs nothing whichever front half produced it. */
+/* NV097_SET_STENCIL_OP_V_*: OpenGL's own values (INCRSAT and DECRSAT are
+ * GL_INCR and GL_DECR, which saturate). Anything else keeps. */
+static GLenum gl_stencil_op(uint32_t v)
+{
+    switch (v) {
+    case 0x0000: case 0x1E00: case 0x1E01: case 0x1E02: case 0x1E03:
+    case 0x150A: case 0x8507: case 0x8508:
+        return (GLenum)v;
+    default:
+        return GL_KEEP;
+    }
+}
+
 static void glb_state(const Nv2aRenderState *rs)
 {
     if (rs->depth_test != g_last.depth_test || rs->depth_func != g_last.depth_func) {
@@ -7906,6 +8419,43 @@ static void glb_state(const Nv2aRenderState *rs)
         g_last.blend_src = rs->blend_src;
         g_last.blend_dst = rs->blend_dst;
     }
+    /*
+     * Stencil.
+     *
+     * JSRF draws its shadows with stencil volumes: each shadow volume twice
+     * with colour writes off (blend ZERO/ONE), depth GEQUAL, incrementing
+     * the stencil on one pass and decrementing it on the other; then one
+     * full-screen black quad at alpha ~0.98 that the stencil test lets
+     * through only where the count is non-zero. None of this was emulated,
+     * so that quad covered the whole frame -- "the curtain" -- and has been
+     * skipped since the tutorial went black (RECOMP_GL_CURTAIN=skip), which
+     * took every shadow with it. The surfaces now carry an 8-bit stencil
+     * (depth24/stencil8) and the state is applied here.
+     */
+    { static int valid; static Nv2aRenderState last;
+      if (g_last_stencil_reset) { valid = 0; g_last_stencil_reset = 0; }
+      if (!valid || rs->stencil_test != last.stencil_test
+       || (rs->stencil_test
+           && (rs->stencil_func != last.stencil_func || rs->stencil_ref != last.stencil_ref
+            || rs->stencil_rmask != last.stencil_rmask || rs->stencil_wmask != last.stencil_wmask
+            || rs->stencil_op[0] != last.stencil_op[0] || rs->stencil_op[1] != last.stencil_op[1]
+            || rs->stencil_op[2] != last.stencil_op[2]))) {
+          if (rs->stencil_test) {
+              uint32_t f = rs->stencil_func;
+              if (f < 0x200 || f > 0x207) f = 0x207;           /* ALWAYS */
+              glEnable(GL_STENCIL_TEST);
+              glStencilFunc((GLenum)f, (GLint)(rs->stencil_ref & 0xFFu),
+                            (GLuint)(rs->stencil_rmask & 0xFFu));
+              glStencilOp(gl_stencil_op(rs->stencil_op[0]),
+                          gl_stencil_op(rs->stencil_op[1]),
+                          gl_stencil_op(rs->stencil_op[2]));
+              glStencilMask((GLuint)(rs->stencil_wmask & 0xFFu));
+          } else {
+              glDisable(GL_STENCIL_TEST);
+          }
+          last = *rs; valid = 1;
+      } }
+
     g_last.valid = 1;
 
     /*

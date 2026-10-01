@@ -252,6 +252,36 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
                 right += k * (mixbins[5][i] + mixbins[2][i])
                        + xg * (mixbins[7][i] + k * mixbins[9][i]);
             }
+            /*
+             * A limiter where there used to be only the clamp below.
+             *
+             * With the crosstalk bins folded in, a busy moment adds up to more
+             * than full scale -- Julien's session: bins 6/7 at 2.7, the
+             * output pinned at 32767 in six seconds of play -- and the clamp
+             * then squares the tops of the waveform off, which is heard as
+             * crackle and pops over the loud moments. The gain now drops at
+             * once to whatever keeps the peak under the ceiling (-0.5 dB) and
+             * comes back to unity over ~150 ms, so a loud moment is a little
+             * quieter instead of distorted. Linked: both channels take the
+             * same gain, so the stereo image does not move.
+             * RECOMP_APU_LIMIT=0: the clamp alone, as before.
+             */
+            {
+                static int lim = -1;
+                static float g = 1.0f;
+                if (lim < 0) { const char *v = getenv("RECOMP_APU_LIMIT");
+                               lim = v ? atoi(v) : 1; }
+                if (lim) {
+                    const float ceil = 0.944f;              /* -0.5 dBFS */
+                    float al = left < 0 ? -left : left;
+                    float ar = right < 0 ? -right : right;
+                    float pk = al > ar ? al : ar;
+                    if (pk * g > ceil) g = ceil / pk;       /* attack: at once */
+                    else g += (1.0f - g) * 0.00015f;        /* release: ~150 ms */
+                    left *= g;
+                    right *= g;
+                }
+            }
             if (left > 1.0f) left = 1.0f;
             if (left < -1.0f) left = -1.0f;
             if (right > 1.0f) right = 1.0f;

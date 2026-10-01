@@ -129,6 +129,12 @@ typedef struct Nv2aRenderState {
      * near or far plane is clamped to it rather than culled. */
     uint32_t zclamp;
     int      w_buffer;       /* CONTROL0 Z_PERSPECTIVE_ENABLE: depth is w */
+    /* NV097_SET_STENCIL_*: the test, its function, reference and read mask,
+     * the write mask, and the three operations (fail, z-fail, z-pass). The
+     * console's values are OpenGL's enums. */
+    int      stencil_test;
+    uint32_t stencil_func, stencil_ref, stencil_rmask, stencil_wmask;
+    uint32_t stencil_op[3];
 } Nv2aRenderState;
 
 typedef struct {

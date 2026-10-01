@@ -719,6 +719,26 @@ int nv2a_vsh_emit_ff_glsl(const Nv2aVshFixed *f, char *buf, int bufsize)
         if (f->inputs_read & (1u << i))
             sb_add(&sb, "layout(location = %d) in vec4 v%d;\n", i, i);
 
+    if (f->lit)
+        sb_add(&sb,
+            "\n// The T&L unit's lighting state (xemu vsh-ff.c reads the same from\n"
+            "// its lighting context).\n"
+            "uniform vec4 ffMV[4];       // NV097_SET_MODEL_VIEW_MATRIX 0, as sent\n"
+            "uniform vec4 ffIMV[4];      // NV097_SET_INVERSE_MODEL_VIEW_MATRIX 0\n"
+            "uniform vec3 ltSceneAmb;    // NV097_SET_SCENE_AMBIENT_COLOR\n"
+            "uniform vec3 ltMatEm;       // NV097_SET_MATERIAL_EMISSION\n"
+            "uniform float ltMatAlpha;   // NV097_SET_MATERIAL_ALPHA\n"
+            "uniform vec3 ltAmb[8];      // NV097_SET_LIGHT_AMBIENT_COLOR\n"
+            "uniform vec3 ltDif[8];      // NV097_SET_LIGHT_DIFFUSE_COLOR\n"
+            "uniform vec3 ltSpc[8];      // NV097_SET_LIGHT_SPECULAR_COLOR\n"
+            "uniform vec3 ltDir[8];      // NV097_SET_LIGHT_INFINITE_DIRECTION\n"
+            "uniform vec3 ltHalf[8];     // NV097_SET_LIGHT_INFINITE_HALF_VECTOR\n"
+            "uniform vec3 ltPos[8];      // NV097_SET_LIGHT_LOCAL_POSITION\n"
+            "uniform vec3 ltAtt[8];      // NV097_SET_LIGHT_LOCAL_ATTENUATION\n"
+            "uniform float ltRange[8];   // NV097_SET_LIGHT_LOCAL_RANGE\n"
+            "uniform vec4 ltSpotDir[8];  // NV097_SET_LIGHT_SPOT_DIRECTION\n"
+            "uniform vec4 ltEye;         // NV097_SET_EYE_POSITION\n"
+            "uniform float ltSpecPow;    // specular exponent\n");
     sb_add(&sb,
         "\nuniform vec4 ffMat[4];      // NV097_SET_COMPOSITE_MATRIX\n"
         "uniform vec4 ffVpOff;       // NV097_SET_VIEWPORT_OFFSET, as written\n"
@@ -766,12 +786,100 @@ int nv2a_vsh_emit_ff_glsl(const Nv2aVshFixed *f, char *buf, int bufsize)
      * reference and the title does enable lighting for some batches, so which
      * of the two this is has to be decided rather than assumed.
      */
-    sb_add(&sb,
-        !f->has_diffuse ? "    oD0 = vec4(1.0);\n"
-        : f->lit        ? "    oD0 = vec4(v3.rgb + vec3(litAmbient), v3.a);\n"
-                        : "    oD0 = v3;\n");
-    sb_add(&sb,
-        f->has_specular ? "    oD1 = v4;\n" : "    oD1 = vec4(0.0);\n");
+    if (!f->lit) {
+        sb_add(&sb, !f->has_diffuse ? "    oD0 = vec4(1.0);\n" : "    oD0 = v3;\n");
+        sb_add(&sb, f->has_specular ? "    oD1 = v4;\n" : "    oD1 = vec4(0.0);\n");
+    } else {
+        /*
+         * The T&L unit's lighting, as the hardware does it (the model and
+         * the register roles follow xemu's vsh-ff.c).
+         *
+         * This used to pass the stream colour through, or white when the
+         * batch had none -- and a batch with no colour of its own is exactly
+         * the one that gets all of it from the lighting. This title's pause
+         * map is drawn that way from end to end: one infinite light facing
+         * the viewer, whose DIFFUSE colour the title sets per element --
+         * teal districts, grey outlines, orange graffiti marks with dark red
+         * rims -- and every one of them came out white.
+         *
+         * Register roles: the driver folds the material into these. With the
+         * ambient taken from the material, "scene ambient" holds the whole
+         * constant term; with it taken from a vertex colour, "material
+         * emission" holds the scene ambient that colour is scaled by. The
+         * light colours arrive premultiplied by the material likewise.
+         */
+        static const char *src_rgb[4] = { "ltSceneAmb", "inD.rgb", "inS.rgb", "ltSceneAmb" };
+        static const char *src_mod[4] = { "vec3(1.0)", "inD.rgb", "inS.rgb", "vec3(1.0)" };
+        static const char *src_a[4]   = { "ltMatAlpha", "inD.a", "inS.a", "ltMatAlpha" };
+        unsigned em = f->colmat & 3, am = (f->colmat >> 2) & 3,
+                 dm = (f->colmat >> 4) & 3, sm = (f->colmat >> 6) & 3;
+        int li;
+        sb_add(&sb, "    vec4 inD = %s;\n", f->has_diffuse ? "v3" : "vec4(1.0)");
+        sb_add(&sb, "    vec4 inS = %s;\n", f->has_specular ? "v4" : "vec4(0.0)");
+        sb_add(&sb, "    vec3 nrm = %s;\n", f->has_normal ? "v2.xyz" : "vec3(0.0, 0.0, 1.0)");
+        sb_add(&sb,
+            "    vec4 tPosition = vec4(dot(v0, ffMV[0]), dot(v0, ffMV[1]),\n"
+            "                          dot(v0, ffMV[2]), dot(v0, ffMV[3]));\n"
+            "    vec4 n4 = vec4(nrm, 0.0);\n"
+            "    vec3 tNormal = vec3(dot(n4, ffIMV[0]), dot(n4, ffIMV[1]), dot(n4, ffIMV[2]));\n");
+        if (f->lflags & 8) sb_add(&sb, "    tNormal = normalize(tNormal);\n");
+        if (f->lflags & 2)
+            sb_add(&sb, "    vec3 VPeye = normalize(ltEye.xyz / ltEye.w - tPosition.xyz / tPosition.w);\n");
+        sb_add(&sb, "    oD0 = vec4(%s, %s);\n", src_rgb[am], src_a[dm]);
+        sb_add(&sb, "    oD0.rgb *= ltMatEm;\n");
+        sb_add(&sb, "    oD0.rgb += %s;\n", src_rgb[em]);
+        sb_add(&sb, "    oD1 = vec4(0.0, 0.0, 0.0, inS.a);\n");
+        for (li = 0; li < 8; li++) {
+            unsigned mode = (f->light_mask >> (2 * li)) & 3;
+            if (!mode) continue;
+            sb_add(&sb, "    { // light %d, %s\n", li,
+                   mode == 1 ? "infinite" : mode == 2 ? "local" : "spot");
+            if (mode == 1) {
+                sb_add(&sb,
+                    "      float att = 1.0;\n"
+                    "      vec3 L = normalize(ltDir[%d]);\n"
+                    "      float nDotVP = max(0.0, dot(tNormal, L));\n", li);
+                if (f->lflags & 2)
+                    sb_add(&sb, "      float nDotHV = max(0.0, dot(tNormal, normalize(L + VPeye)));\n");
+                else
+                    sb_add(&sb, "      float nDotHV = max(0.0, dot(tNormal, ltHalf[%d]));\n", li);
+                sb_add(&sb, "      {\n");
+            } else {
+                sb_add(&sb,
+                    "      vec3 VP = ltPos[%d] - tPosition.xyz / tPosition.w;\n"
+                    "      float d = length(VP);\n"
+                    "      if (d <= ltRange[%d]) {\n"
+                    "      VP = normalize(VP);\n"
+                    "      float att = 1.0 / (ltAtt[%d].x + ltAtt[%d].y * d + ltAtt[%d].z * d * d);\n"
+                    "      vec3 hv = normalize(VP + %s);\n"
+                    "      float nDotVP = max(0.0, dot(tNormal, VP));\n"
+                    "      float nDotHV = max(0.0, dot(tNormal, hv));\n",
+                    li, li, li, li, li, (f->lflags & 2) ? "VPeye" : "vec3(0.0)");
+                if (mode == 3)
+                    sb_add(&sb,
+                        "      vec4 sd = ltSpotDir[%d];\n"
+                        "      float invScale = 1.0 / length(sd.xyz);\n"
+                        "      float cosHalfPhi = -invScale * sd.w;\n"
+                        "      float cosHalfTheta = invScale + cosHalfPhi;\n"
+                        "      float sdDotVP = dot(sd.xyz, VP);\n"
+                        "      float rho = invScale * sdDotVP;\n"
+                        "      if (rho <= cosHalfPhi) att = 0.0;\n"
+                        "      else if (rho <= cosHalfTheta) att *= sdDotVP + sd.w;\n", li);
+            }
+            sb_add(&sb,
+                "      float pf = (nDotVP == 0.0 || nDotHV <= 0.0) ? 0.0 : pow(nDotHV, ltSpecPow);\n"
+                "      oD0.rgb += ltAmb[%d] * att;\n"
+                "      oD0.rgb += %s * ltDif[%d] * (att * nDotVP);\n"
+                "      oD1.rgb += %s * ltSpc[%d] * (att * pf);\n"
+                "      }\n"
+                "    }\n", li, src_mod[dm], li, src_mod[sm], li);
+        }
+        if (!(f->lflags & 4))
+            sb_add(&sb, "    oD1 = vec4(0.0, 0.0, 0.0, 1.0);\n");
+        else if (!(f->lflags & 1))
+            sb_add(&sb, "    oD0.rgb += oD1.rgb;\n    oD1 = inS;\n");
+        sb_add(&sb, "    oD0 = clamp(oD0, 0.0, 1.0);\n    oD1 = clamp(oD1, 0.0, 1.0);\n");
+    }
 
     for (i = 0; i < 4; i++) {
         const char *o[4] = { "oT0", "oT1", "oT2", "oT3" };

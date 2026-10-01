@@ -221,10 +221,17 @@ typedef struct {
     uint8_t  tex_matrix;    /* bit n: transform oTn by the stage matrix */
     uint8_t  has_diffuse;   /* v3 is a real array or a set constant */
     uint8_t  has_specular;  /* v4 likewise */
-    /* The title asked the hardware T&L unit to light these vertices. Nothing
-     * here lights anything, so the flag exists to make the choice explicit:
-     * pass the stream colour through, or treat it as an unlit material. */
+    /* The title asked the hardware T&L unit to light these vertices. */
     uint8_t  lit;
+    /* The shape of that lighting, all zero when lit is: */
+    uint8_t  has_normal;    /* v2 is a real array or a set constant */
+    uint8_t  colmat;        /* NV097_SET_COLOR_MATERIAL: 2 bits each, from bit 0,
+                             * emission / ambient / diffuse / specular source,
+                             * 0 the material, 1 the vertex diffuse, 2 its specular */
+    uint8_t  lflags;        /* 1 separate specular, 2 local eye,
+                             * 4 specular enable, 8 normalization */
+    uint16_t light_mask;    /* NV097_SET_LIGHT_ENABLE_MASK, 2 bits a light:
+                             * 0 off, 1 infinite, 2 local, 3 spot */
 } Nv2aVshFixed;
 
 int nv2a_vsh_emit_ff_glsl(const Nv2aVshFixed *f, char *buf, int bufsize);

@@ -1073,9 +1073,12 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
              * this reads it with the wrong stride. Dumping what is actually
              * there separates them: audio is smooth from one sample to the
              * next, and nothing else is. */
-            { static int done; const char *pth;
+            { static int done, looked; static const char *pth;
+              /* Look the variable up once: this runs for every voice on
+               * every audio frame, and a getenv per call was six percent of
+               * the audio thread with nothing set. */
+              if (!looked) { looked = 1; pth = getenv("RECOMP_APU_SRC"); }
               if (!done) {
-                  pth = getenv("RECOMP_APU_SRC");
                   if (pth && !stream && ebo > 4096) {
                       done = 1;
                       FILE *f = fopen(pth, "wb");
@@ -1593,7 +1596,17 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
 
             if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
-                fe_method(d, SE2FE_IDLE_VOICE, v);
+                /* Only while the front end is free to take it. The voice
+                 * processor now keeps running while the front end is trapped
+                 * (apu_core.c), and a second report then would overwrite the
+                 * method and parameter the title's handler is about to read
+                 * (FEDECMETH/FEDECPARAM). An idle voice stays in its list
+                 * until the handler takes it out, so it is simply reported
+                 * again on the first frame after the trap clears -- the
+                 * hardware queues these; this re-detects them. */
+                if ((d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE)
+                    == NV_PAPU_FECTL_FEMETHMODE_FREE_RUNNING)
+                    fe_method(d, SE2FE_IDLE_VOICE, v);
             } else {
                 /* Process voice directly (single-threaded) */
                 voice_process(d, mixbins, d->vp.sample_buf, v, list);

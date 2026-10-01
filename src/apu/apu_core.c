@@ -516,6 +516,32 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
  * Throttle (timing control for frame pacing)
  * ============================================================ */
 
+/*
+ * How much output to keep queued ahead of the speaker, in frames.
+ *
+ * The APU used to be paced by the wall clock alone, and the output ring
+ * between it and the audio device held about 11 ms. Any stretch in which the
+ * APU could not run -- its front end trapped, waiting for the title's
+ * interrupt handler, which here waits for the guest lock -- therefore had
+ * nothing to fall back on; the frame thread filled the gap by sending the
+ * previous 5 ms again (a stutter), and a trap lasts up to 30 ms. Now the
+ * frame thread keeps the ring at this level (RECOMP_APU_RING_MS, default
+ * 40 ms): it produces whenever the ring is below it and waits when it is
+ * above, so the APU runs on the device's clock, a trap drains the ring
+ * instead of repeating sound, and the frames are made up at once when it
+ * clears. 0 = the wall clock, as before.
+ */
+static int ring_target_frames(void)
+{
+    static int t = -1;
+    if (t < 0) {
+        const char *v = getenv("RECOMP_APU_RING_MS");
+        int ms = v ? atoi(v) : 40;
+        t = ms > 0 ? ms * 48 : 0;
+    }
+    return t;
+}
+
 static void throttle(MCPXAPUState *d)
 {
     if (d->ep_frame_div % 8) {
@@ -524,8 +550,33 @@ static void throttle(MCPXAPUState *d)
 
     int64_t now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
 
+    if (ring_target_frames() > 0 && xa2_ring_level() >= 0) {
+        for (;;) {
+            int since;
+            if (xa2_ring_level() < ring_target_frames()) break;   /* room: produce */
+            if (d->pause_requested) break;
+            since = xa2_ms_since_pull();
+            /* Nothing is pulling (the device stopped): fall back to the
+             * wall clock rather than stop the title's audio time. */
+            if (since < 0 || since > 60) goto wall_clock;
+            qemu_cond_timedwait(&d->cond, &d->lock, 1);
+        }
+        d->next_frame_time_us = 0;
+        d->sleep_acc_us += (int)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) - now_us);
+        return;
+    }
+
+wall_clock:
+
     if (d->next_frame_time_us == 0 ||
         now_us - d->next_frame_time_us > EP_FRAME_US) {
+        /* RECOMP_APU_STATS: how often the thread fell behind and gave up
+         * the time it had lost (each is up to 8 frames never produced). */
+        extern int g_apu_throttle_resets; extern int64_t g_apu_throttle_lost_us;
+        if (d->next_frame_time_us) {
+            g_apu_throttle_resets++;
+            g_apu_throttle_lost_us += now_us - d->next_frame_time_us;
+        }
         d->next_frame_time_us = now_us;
     }
 
@@ -589,9 +640,20 @@ static void se_frame(MCPXAPUState *d)
  * APU frame thread (background processing)
  * ============================================================ */
 
+int g_apu_throttle_resets; int64_t g_apu_throttle_lost_us;
+
 static void *mcpx_apu_frame_thread(void *arg)
 {
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
+    /* RECOMP_APU_STATS: what the loop did each second -- frames through
+     * the whole pipeline, and frames where the APU was not running (counter
+     * mode off, front end trapped or halted), which re-send the previous
+     * output (see the lightweight branch). */
+    int st_on = getenv("RECOMP_APU_STATS") ? 1 : 0;
+    int64_t st_last = 0; int st_full = 0, st_off = 0, st_trap = 0, st_halt = 0,
+            st_run = 0, st_longest = 0;
+    int64_t st_trap_us = 0, st_halt_us = 0, st_run_us = 0, st_longest_us = 0;
+    int st_ran_trapped = 0;
     qemu_mutex_lock(&d->lock);
 
     while (!qatomic_read(&d->exiting)) {
@@ -603,6 +665,58 @@ static void *mcpx_apu_frame_thread(void *arg)
             continue;
         }
 
+        /*
+         * The front end trapped or halted, with the counter running.
+         *
+         * A trap is the front end asking the title's interrupt handler to
+         * do something -- above all, retire a voice that went idle -- and
+         * here that handler runs only once it gets the guest lock: traps
+         * of 10 to 60 ms are ordinary. The whole pipeline used to stop for
+         * them (as in xemu) and fall into the lightweight branch below,
+         * which re-sends the previous output frame: the same 5 ms of sound
+         * over and over for as long as the trap lasted, heard as a stutter
+         * or a pop -- every time a sound effect ended.
+         *
+         * On the console only the front end stops; the setup engine and the
+         * voice processor keep running and their messages to the front end
+         * queue up. So a TRAPPED front end now leaves the pipeline running
+         * (the voice processor holds its idle-voice reports until the trap
+         * clears, apu_vp.c) -- RECOMP_APU_RUN_TRAPPED=0 stops it as before.
+         * HALTED is the title stopping the front end on purpose, and waits:
+         * nothing is produced until it resumes (the output ring covers the
+         * gap and the throttle makes the frames up), instead of repeats.
+         * RECOMP_APU_TRAP_RESEND=1: the old repeat-the-last-frame behaviour.
+         */
+        static int run_trapped = -1;
+        if (run_trapped < 0) { const char *v = getenv("RECOMP_APU_RUN_TRAPPED");
+                               run_trapped = v ? atoi(v) : 1; }
+        {
+            static int resend = -1;
+            int xm = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
+                              NV_PAPU_SECTL_XCNTMODE);
+            uint32_t fc = qatomic_read(&d->regs[NV_PAPU_FECTL]);
+            uint32_t mode = fc & NV_PAPU_FECTL_FEMETHMODE;
+            if (resend < 0) { const char *v = getenv("RECOMP_APU_TRAP_RESEND");
+                              resend = v ? atoi(v) : 0; }
+            if (!resend && xm != NV_PAPU_SECTL_XCNTMODE_OFF
+                && mode != NV_PAPU_FECTL_FEMETHMODE_FREE_RUNNING
+                && !(mode == NV_PAPU_FECTL_FEMETHMODE_TRAPPED && run_trapped)
+                && !g_test_tone.active && !g_mixer_active_count) {
+                extern void mcpx_apu_dsp_ack_tick(MCPXAPUState *d);
+                int64_t t0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+                mcpx_apu_dsp_ack_tick(d);
+                qemu_cond_timedwait(&d->cond, &d->lock, 1);
+                if (st_on) {
+                    int64_t w = qemu_clock_get_us(QEMU_CLOCK_REALTIME) - t0;
+                    if (mode == NV_PAPU_FECTL_FEMETHMODE_TRAPPED) st_trap_us += w;
+                    else st_halt_us += w;
+                    st_run_us += w;
+                    if (st_run_us > st_longest_us) st_longest_us = st_run_us;
+                }
+                continue;
+            }
+        }
+
         /* Always run the audio output loop — the software mixer and test tone
          * need continuous frame delivery regardless of APU register state.
          * The VP/DSP pipeline (se_frame) only runs when registers allow it. */
@@ -611,10 +725,39 @@ static void *mcpx_apu_frame_thread(void *arg)
         int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
                                 NV_PAPU_SECTL_XCNTMODE);
         uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
+        uint32_t femode = fectl & NV_PAPU_FECTL_FEMETHMODE;
         bool apu_active = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) &&
-                          !(fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
-                          !(fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED);
+                          (femode == NV_PAPU_FECTL_FEMETHMODE_FREE_RUNNING ||
+                           (femode == NV_PAPU_FECTL_FEMETHMODE_TRAPPED && run_trapped));
+        if (apu_active) st_run_us = 0;
+        if (st_on && apu_active && femode == NV_PAPU_FECTL_FEMETHMODE_TRAPPED)
+            st_ran_trapped++;
 
+        if (st_on) {
+            int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+            if (apu_active) { st_full++; st_run = 0; }
+            else {
+                if (xcntmode == NV_PAPU_SECTL_XCNTMODE_OFF) st_off++;
+                else if (femode == NV_PAPU_FECTL_FEMETHMODE_TRAPPED) st_trap++;
+                else st_halt++;
+                if (++st_run > st_longest) st_longest = st_run;
+            }
+            if (!st_last) st_last = now;
+            if (now - st_last >= 1000) {
+                fprintf(stderr, "[APU] loop: %d full (%d of them trapped), %d re-sent (off %d, "
+                        "trapped %d, halted %d; longest %d frames); waited out traps %.1f ms, "
+                        "halts %.1f ms (longest %.1f ms); %d throttle resets losing %.1f ms; "
+                        "ring %d frames\n",
+                        st_full, st_ran_trapped, st_off + st_trap + st_halt, st_off, st_trap,
+                        st_halt, st_longest, st_trap_us / 1000.0, st_halt_us / 1000.0,
+                        st_longest_us / 1000.0, g_apu_throttle_resets,
+                        g_apu_throttle_lost_us / 1000.0, xa2_ring_level());
+                st_full = st_off = st_trap = st_halt = st_longest = 0; st_ran_trapped = 0;
+                st_trap_us = st_halt_us = st_longest_us = 0;
+                g_apu_throttle_resets = 0; g_apu_throttle_lost_us = 0;
+                st_last = now;
+            }
+        }
         if (apu_active && !g_test_tone.active) {
             /* Full pipeline: VP voices → DSP → monitor → waveOut */
             se_frame(d);

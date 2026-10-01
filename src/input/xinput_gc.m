@@ -15,6 +15,7 @@
 
 #import <Foundation/Foundation.h>
 #import <GameController/GameController.h>
+#include <stdio.h>
 
 /* Button bits, in this file's own order; xinput_device.c translates them. */
 enum {
@@ -35,15 +36,37 @@ static void pump_runloop(void)
                              beforeDate:[NSDate distantPast]];
 }
 
+/* Say which controller serves each port, once per change: "the pad does
+ * nothing" has too many possible causes to leave this unsaid. The pointer is
+ * only compared, never followed. */
+static void note_pad(unsigned port, GCController *c)
+{
+    static const void *seen[4];
+    const void *id = (__bridge const void *)c;
+    if (port >= 4 || seen[port] == id) return;
+    if (c) {
+        const char *cat = "?";
+        if (@available(macOS 10.15, iOS 13.0, *))
+            cat = c.productCategory ? [c.productCategory UTF8String] : "?";
+        fprintf(stderr, "[PAD] port %u: %s (%s)\n", port,
+                c.vendorName ? [c.vendorName UTF8String] : "unnamed controller", cat);
+    } else if (seen[port]) {
+        fprintf(stderr, "[PAD] port %u: controller gone\n", port);
+    }
+    fflush(stderr);
+    seen[port] = id;
+}
+
 static GCExtendedGamepad *pad_for(unsigned port)
 {
     NSUInteger slot = 0;
     for (GCController *c in [GCController controllers]) {
         GCExtendedGamepad *g = c.extendedGamepad;
         if (!g) continue;               /* a remote, or a micro gamepad */
-        if (slot == (NSUInteger)port) return g;
+        if (slot == (NSUInteger)port) { note_pad(port, c); return g; }
         slot++;
     }
+    note_pad(port, nil);
     return nil;
 }
 
@@ -78,7 +101,13 @@ void nv_gc_init(void)
 }
 
 /* 1 if a pad is present on this port, 0 if not. analog[] is
- * A, B, X, Y, LB, RB, LT, RT; axes[] is LX, LY, RX, RY. */
+ * A, B, X, Y, Black, White, LT, RT; axes[] is LX, LY, RX, RY.
+ *
+ * Every controller macOS knows arrives here as an extended gamepad -- the
+ * DualSense and DualShock 4 are subclasses of it, as are the Xbox, Switch Pro
+ * and MFi pads -- so there is nothing per-model to do: Cross is A, Options is
+ * Menu (Start), Create/Share is Options (Back). The PS button stays with the
+ * system and the touchpad is not used. */
 int nv_gc_poll(unsigned port, unsigned short *buttons,
                unsigned char *analog, short *axes)
 {
@@ -106,8 +135,11 @@ int nv_gc_poll(unsigned port, unsigned short *buttons,
         analog[1] = b255(g.buttonB);
         analog[2] = b255(g.buttonX);
         analog[3] = b255(g.buttonY);
-        analog[4] = b255(g.leftShoulder);
-        analog[5] = b255(g.rightShoulder);
+        /* [4] is Black and [5] White, in xinput_device.c's order. The left
+         * bumper (L1 on a DualSense) is White and the right one Black, the
+         * way xemu maps them; this had them the other way round. */
+        analog[4] = b255(g.rightShoulder);
+        analog[5] = b255(g.leftShoulder);
         analog[6] = b255(g.leftTrigger);
         analog[7] = b255(g.rightTrigger);
 

@@ -654,6 +654,23 @@ static void vblank_intr_tick(volatile uint32_t *regs)
         *pmc = 0;
 }
 
+/* The same, for code that keeps this thread away from its loop.
+ *
+ * The title's vblank handler (a DPC, so it holds the guest lock) writes its
+ * acknowledgement and then spins until PMC_INTR_0 says the PCRTC is quiet,
+ * which here happens only when vblank_intr_tick() next runs. The renderer's
+ * frame pacing sleeps on this thread for up to a frame at every flip, and for
+ * all of that sleep the handler spun and every guest thread that wanted the
+ * lock -- the game's sound calls, DirectSound's own thread -- waited behind
+ * it. Worst on black and loading screens, where a whole frame is sleep: the
+ * lock was held for most of each second and a vblank in four was lost.
+ * frame_pace() calls this between short sleeps so the wait is under a
+ * millisecond. */
+void xbox_nv2a_vblank_service(void)
+{
+    if (g_nv2a_memory) vblank_intr_tick((volatile uint32_t *)g_nv2a_memory);
+}
+
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;

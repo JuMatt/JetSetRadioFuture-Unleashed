@@ -39,17 +39,26 @@ static int16_t          g_ring[CA_RING_FRAMES][CA_CHANNELS];
 static _Atomic uint32_t g_wr, g_rd;
 static _Atomic uint32_t g_underruns;
 static _Atomic uint32_t g_drops;
+static _Atomic uint64_t g_last_pull_ms;
 
-static void ca_callback(void *user, AudioQueueRef q, AudioQueueBufferRef buf)
+static uint64_t ca_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
+}
+
+/* One device pull: CA_BUF_FRAMES frames out of the ring, silence for any
+ * the ring does not have. */
+static void ca_pull(int16_t (*out)[CA_CHANNELS])
 {
     uint32_t want = CA_BUF_FRAMES;
     uint32_t rd = atomic_load_explicit(&g_rd, memory_order_relaxed);
     uint32_t wr = atomic_load_explicit(&g_wr, memory_order_acquire);
     uint32_t have = wr - rd;
-    int16_t (*out)[CA_CHANNELS] = (int16_t (*)[CA_CHANNELS])buf->mAudioData;
     uint32_t i, n = have < want ? have : want;
 
-    (void)user;
+    atomic_store_explicit(&g_last_pull_ms, ca_now_ms(), memory_order_relaxed);
     for (i = 0; i < n; i++)
         memcpy(out[i], g_ring[(rd + i) & (CA_RING_FRAMES - 1)], sizeof g_ring[0]);
     if (n < want) {
@@ -57,9 +66,53 @@ static void ca_callback(void *user, AudioQueueRef q, AudioQueueBufferRef buf)
         atomic_fetch_add_explicit(&g_underruns, 1, memory_order_relaxed);
     }
     atomic_store_explicit(&g_rd, rd + n, memory_order_release);
+}
 
-    buf->mAudioDataByteSize = want * (UInt32)sizeof g_ring[0];
+static void ca_callback(void *user, AudioQueueRef q, AudioQueueBufferRef buf)
+{
+    (void)user;
+    ca_pull((int16_t (*)[CA_CHANNELS])buf->mAudioData);
+    buf->mAudioDataByteSize = CA_BUF_FRAMES * (UInt32)sizeof g_ring[0];
     AudioQueueEnqueueBuffer(q, buf, 0, NULL);
+}
+
+/* RECOMP_APU_FAKE_SINK=1 (test only): no audio device -- a thread pulls
+ * CA_BUF_FRAMES from the ring every CA_BUF_FRAMES/48000 s and throws them
+ * away, the way the queue would. The APU's ring pacing (apu_core.c,
+ * throttle) runs against it exactly as against a real device, which is what
+ * a machine whose audio output has gone away overnight cannot otherwise
+ * test. */
+#include <pthread.h>
+static pthread_t g_fake_thread;
+static void *ca_fake_sink(void *arg)
+{
+    static int16_t scratch[CA_BUF_FRAMES][CA_CHANNELS];
+    struct timespec next;
+    const long period_ns = (long)((uint64_t)CA_BUF_FRAMES * 1000000000ull / CA_RATE);
+    /* RECOMP_APU_SINK_RAW=<path>: what the "device" received, raw s16
+     * stereo 48 kHz -- underrun silence and dropped audio included, which
+     * RECOMP_APU_WAV (the encode processor's output) cannot show. */
+    FILE *raw = NULL;
+    { const char *p = getenv("RECOMP_APU_SINK_RAW");
+      if (p) raw = fopen(p, "wb"); }
+    (void)arg;
+    clock_gettime(CLOCK_MONOTONIC, &next);
+    for (;;) {
+        next.tv_nsec += period_ns;
+        while (next.tv_nsec >= 1000000000L) { next.tv_nsec -= 1000000000L; next.tv_sec++; }
+        for (;;) {
+            struct timespec now, d;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            d.tv_sec = next.tv_sec - now.tv_sec;
+            d.tv_nsec = next.tv_nsec - now.tv_nsec;
+            if (d.tv_nsec < 0) { d.tv_nsec += 1000000000L; d.tv_sec--; }
+            if (d.tv_sec < 0) break;
+            nanosleep(&d, NULL);
+        }
+        ca_pull(scratch);
+        if (raw) fwrite(scratch, sizeof scratch, 1, raw);
+    }
+    return NULL;
 }
 
 int xa2_init(void)
@@ -69,6 +122,19 @@ int xa2_init(void)
     int i;
 
     if (g_active) return 1;
+
+    if (getenv("RECOMP_APU_FAKE_SINK")) {
+        atomic_store(&g_wr, 0);
+        atomic_store(&g_rd, 0);
+        if (pthread_create(&g_fake_thread, NULL, ca_fake_sink, NULL) != 0) {
+            fprintf(stderr, "[APU] fake sink: no thread\n");
+            return 0;
+        }
+        g_active = 1;
+        fprintf(stderr, "[APU] RECOMP_APU_FAKE_SINK: a thread pulls %d frames every %.2f ms, "
+                "no device\n", CA_BUF_FRAMES, CA_BUF_FRAMES * 1000.0 / CA_RATE);
+        return 1;
+    }
 
     memset(&fmt, 0, sizeof fmt);
     fmt.mSampleRate       = CA_RATE;
@@ -117,6 +183,7 @@ int xa2_init(void)
 void xa2_shutdown(void)
 {
     if (!g_active) return;
+    if (!g_queue) { g_active = 0; return; }   /* the fake sink */
     AudioQueueStop(g_queue, true);
     AudioQueueDispose(g_queue, true);
     g_queue = NULL;
@@ -128,6 +195,24 @@ void xa2_shutdown(void)
 int xa2_is_active(void) { return g_active; }
 
 int xa2_get_buffer_size(void) { return CA_BUF_FRAMES; }
+
+/* What the APU paces itself on (apu_core.c, throttle): how much is waiting,
+ * and whether the device is still pulling at all. */
+int xa2_ring_level(void)
+{
+    if (!g_active) return -1;
+    return (int)(atomic_load_explicit(&g_wr, memory_order_acquire)
+               - atomic_load_explicit(&g_rd, memory_order_acquire));
+}
+
+int xa2_ms_since_pull(void)
+{
+    uint64_t t;
+    if (!g_active) return -1;
+    t = atomic_load_explicit(&g_last_pull_ms, memory_order_relaxed);
+    if (!t) return 1 << 30;
+    return (int)(ca_now_ms() - t);
+}
 
 int xa2_submit_samples(const int16_t *samples, int num_samples)
 {

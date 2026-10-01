@@ -57,6 +57,8 @@ typedef struct {
     uint32_t control;                    /* NV097_SET_COMBINER_CONTROL    */
     uint32_t final_abcd;                 /* SPECULAR_FOG_CW0              */
     uint32_t final_efg;                  /* SPECULAR_FOG_CW1              */
+    uint32_t final_c0, final_c1;         /* NV097_SET_SPECULAR_FOG_FACTOR:
+                                          * the final combiner's C0 / C1   */
 
     /* Which texture stages have something bound, and whether each texture's
      * alpha is meaningful. A one-channel texture reads as (0,0,0,a) in GL and

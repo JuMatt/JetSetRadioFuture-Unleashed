@@ -28,6 +28,7 @@
  */
 
 #import <Cocoa/Cocoa.h>
+#import <QuartzCore/QuartzCore.h>
 #import <OpenGL/OpenGL.h>
 #import <OpenGL/gl.h>
 #include <pthread.h>
@@ -50,6 +51,46 @@ static GLuint          g_tex;
 @interface NvGLView : NSOpenGLView
 @end
 
+static NvGLView *g_view;
+
+/* The frame is sRGB: the console's output is video with BT.709 primaries,
+ * which are sRGB's, and every colour the title chose was chosen on that.
+ * An OpenGL layer is not colour-matched unless it is told what its content
+ * is ("if nil, no colormatching occurs"), so on a wide-gamut panel -- every
+ * recent Mac's own screen is Display P3 -- the numbers went to the display
+ * as P3 and every colour came out more saturated than the title made it,
+ * this title's greens and yellows most visibly. Tagging the layer (and the
+ * window) sRGB has the window server convert, as it does for everything
+ * else on screen. Done once the view has its layer; RECOMP_WINDOW_SRGB=0
+ * leaves it untagged, as before. */
+static void nv_window_colour_space(void)
+{
+    static int on = -1, done;
+    CALayer *layer;
+    NSColorSpace *scr;
+    if (done || !g_window || !g_view) return;
+    if (on < 0) { const char *e = getenv("RECOMP_WINDOW_SRGB"); on = e ? atoi(e) : 1; }
+    layer = [g_view layer];
+    if (!layer) return;                    /* not yet: try at the next draw */
+    done = 1;
+    scr = [[g_window screen] colorSpace];
+    if (on) {
+        [g_window setColorSpace:[NSColorSpace sRGBColorSpace]];
+        if ([layer isKindOfClass:[CAOpenGLLayer class]]) {
+            CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+            ((CAOpenGLLayer *)layer).colorspace = cs;
+            CGColorSpaceRelease(cs);
+        }
+    }
+    fprintf(stderr, "[WIN] screen colour space: %s; window %s; layer %s%s\n",
+            scr ? [[scr localizedName] UTF8String] : "?",
+            [g_window colorSpace] ? [[[g_window colorSpace] localizedName] UTF8String] : "(screen's)",
+            [NSStringFromClass([layer class]) UTF8String],
+            !on ? " (untagged: RECOMP_WINDOW_SRGB=0)"
+                : [layer isKindOfClass:[CAOpenGLLayer class]] ? " tagged sRGB" : " (not a GL layer: window only)");
+    fflush(stderr);
+}
+
 @implementation NvGLView
 
 - (BOOL)isOpaque          { return YES; }
@@ -64,6 +105,7 @@ static GLuint          g_tex;
     int pw = 0, ph = 0;
 
     (void)dirty;
+    nv_window_colour_space();
     [ctx makeCurrentContext];
 
     pthread_mutex_lock(&g_lock);
@@ -90,6 +132,15 @@ static GLuint          g_tex;
     glClear(GL_COLOR_BUFFER_BIT);
 
     if (g_tex) {
+        /* The frame keeps its shape. The window can be resized and can go
+         * full screen, and a 4:3 picture stretched over a 16:10 screen is not
+         * the picture: black bars instead, the frame centred between them. */
+        static int fw = 640, fh = 480;
+        int dw = vw, dh = vh;
+        if (pw > 0 && ph > 0) { fw = pw; fh = ph; }
+        if ((long)vw * fh > (long)vh * fw) dw = (int)((long)vh * fw / fh);
+        else                               dh = (int)((long)vw * fh / fw);
+        glViewport((vw - dw) / 2, (vh - dh) / 2, dw, dh);
         glMatrixMode(GL_PROJECTION); glLoadIdentity();
         glMatrixMode(GL_MODELVIEW);  glLoadIdentity();
         glDisable(GL_DEPTH_TEST);
@@ -128,8 +179,6 @@ static GLuint          g_tex;
       } }
 }
 @end
-
-static NvGLView *g_view;
 
 @interface NvWindowDelegate : NSObject <NSWindowDelegate>
 @end
@@ -244,9 +293,10 @@ int nv_window_keys(unsigned short *buttons, unsigned char *analog)
  *
  * Resolution is the one setting worth putting in front of a player. The game
  * draws a 640x480 surface and always will; what changes is the resolution the
- * renderer works at internally, and the window follows it so the picture is
- * presented one-to-one instead of being stretched. At 1x in a 1280x960 window
- * every pixel is doubled and it looks like it: the default is 2x.
+ * renderer works at internally -- how sharp the picture is. (The window used
+ * to follow it, in points, which made 4x a window twice the screen's height;
+ * it opens at one size now and can be resized or made full screen.) At 1x
+ * every pixel of a 1280x960 window is a 2x2 block: the default is 2x.
  *
  * The choice is stored rather than applied live, because the render targets,
  * the depth buffer and the texture cache are all sized at startup, and tearing
@@ -273,9 +323,35 @@ int nv_window_pref_scale(void)
 @interface NvMenuTarget : NSObject
 - (void)pickScale:(id)sender;
 - (void)showKeys:(id)sender;
+- (void)showPad:(id)sender;
 @end
 
 @implementation NvMenuTarget
+- (void)showPad:(id)sender
+{
+    NSAlert *a = [[NSAlert alloc] init];
+    (void)sender;
+    kb_release_all();
+    a.messageText = @"Game controllers";
+    a.informativeText =
+        @"Any controller macOS recognises works: PlayStation DualSense and "
+         "DualShock 4, Xbox, Switch Pro, MFi. Pair it in System Settings > "
+         "Bluetooth (or plug it in by USB), before or during the game.\n\n"
+         "PlayStation / Xbox label -> original Xbox button\n\n"
+         "Cross / A\t\tA - jump\n"
+         "Circle / B\t\tB\n"
+         "Square / X\t\tX\n"
+         "Triangle / Y\t\tY\n"
+         "L1 / LB\t\t\tWhite\n"
+         "R1 / RB\t\t\tBlack\n"
+         "L2 / LT\t\t\tL trigger\n"
+         "R2 / RT\t\t\tR trigger - talk, spray\n"
+         "Options / Menu\t\tStart\n"
+         "Create / View\t\tBack\n"
+         "Sticks, stick clicks\tthe same\n\n"
+         "The keyboard keeps working alongside it. No vibration yet.";
+    [a runModal];
+}
 - (void)showKeys:(id)sender
 {
     NSAlert *a = [[NSAlert alloc] init];
@@ -301,8 +377,33 @@ int nv_window_pref_scale(void)
 - (void)pickScale:(id)sender
 {
     NSInteger want = [(NSMenuItem *)sender tag];
+    NSInteger stored = [[NSUserDefaults standardUserDefaults] integerForKey:@"glScale"];
+    NSAlert *a;
+    NSModalResponse r;
+    NSMenuItem *it;
+
+    /* Changing it restarts the game, and a restart loses whatever was not
+     * saved -- so it is asked, never done on the spot. (The items used to
+     * carry Cmd+1..4 as shortcuts, which made one stray keystroke a restart;
+     * they have none now.) */
+    if (want == nv_window_pref_scale() && (!stored || stored == want)) return;
+    kb_release_all();
+    a = [[NSAlert alloc] init];
+    a.messageText = [NSString stringWithFormat:@"Render at %ldx (%ld x %ld)?",
+                     (long)want, (long)(640 * want), (long)(480 * want)];
+    a.informativeText = @"The resolution is set when the game starts. "
+                         "Restarting now loses anything you have not saved.";
+    [a addButtonWithTitle:@"Restart Now"];
+    [a addButtonWithTitle:@"At Next Launch"];
+    [a addButtonWithTitle:@"Cancel"];
+    r = [a runModal];
+    if (r != NSAlertFirstButtonReturn && r != NSAlertSecondButtonReturn) return;
+
     [[NSUserDefaults standardUserDefaults] setInteger:want forKey:@"glScale"];
     [[NSUserDefaults standardUserDefaults] synchronize];
+    for (it in [[(NSMenuItem *)sender menu] itemArray])
+        [it setState:([it tag] == want) ? NSControlStateValueOn : NSControlStateValueOff];
+    if (r != NSAlertFirstButtonReturn) return;
 
     {
         extern void recomp_restart_self(void) __attribute__((weak));
@@ -310,12 +411,12 @@ int nv_window_pref_scale(void)
             recomp_restart_self();           /* does not return on success */
         }
         {
-            NSAlert *a = [[NSAlert alloc] init];
-            a.messageText = @"Restart to change the resolution";
-            a.informativeText = @"The renderer is set up once at startup. "
+            NSAlert *b = [[NSAlert alloc] init];
+            b.messageText = @"Restart to change the resolution";
+            b.informativeText = @"The renderer is set up once at startup. "
                                  "Quit and launch again and it will be at the "
                                  "size you picked.";
-            [a runModal];
+            [b runModal];
         }
     }
 }
@@ -352,7 +453,7 @@ static void build_menu(void)
             initWithTitle:[NSString stringWithFormat:@"%dx  (%d x %d)",
                                                      i, 640 * i, 480 * i]
                    action:@selector(pickScale:)
-            keyEquivalent:[NSString stringWithFormat:@"%d", i]];
+            keyEquivalent:@""];
         [it setTag:i];
         [it setTarget:g_menu_target];
         [it setState:(i == cur) ? NSControlStateValueOn : NSControlStateValueOff];
@@ -360,6 +461,17 @@ static void build_menu(void)
     }
     [resItem setSubmenu:res];
     [video addItem:resItem];
+    {
+        /* No target: it goes up the responder chain to the window, which
+         * implements toggleFullScreen: and retitles the item itself. */
+        NSMenuItem *fs = [[NSMenuItem alloc] initWithTitle:@"Enter Full Screen"
+                                                   action:@selector(toggleFullScreen:)
+                                            keyEquivalent:@"f"];
+        [fs setKeyEquivalentModifierMask:(NSEventModifierFlagCommand |
+                                          NSEventModifierFlagControl)];
+        [video addItem:[NSMenuItem separatorItem]];
+        [video addItem:fs];
+    }
     [videoItem setSubmenu:video];
     [bar addItem:videoItem];
 
@@ -371,6 +483,13 @@ static void build_menu(void)
                                                keyEquivalent:@"k"];
         [keys setTarget:g_menu_target];
         [ctl addItem:keys];
+        {
+            NSMenuItem *pad = [[NSMenuItem alloc] initWithTitle:@"Game Controller..."
+                                                        action:@selector(showPad:)
+                                                 keyEquivalent:@""];
+            [pad setTarget:g_menu_target];
+            [ctl addItem:pad];
+        }
         [ctlItem setSubmenu:ctl];
         [bar addItem:ctlItem];
     }
@@ -393,23 +512,69 @@ int nv_window_prepare(int width, int height, const char *title)
             0
         };
         NSOpenGLPixelFormat *pf;
-        NSRect frame = NSMakeRect(0, 0, width, height);
+        NSRect frame;
+        NSWindowStyleMask mask = NSWindowStyleMaskTitled |
+                                 NSWindowStyleMaskClosable |
+                                 NSWindowStyleMaskMiniaturizable |
+                                 NSWindowStyleMaskResizable;
 
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+
+        /*
+         * Never larger than the screen.
+         *
+         * The size used to be the internal resolution (640x480 times the
+         * Video menu's scale), which AppKit counts in points -- two pixels
+         * each way on a Retina screen. At 4x that was a 2560x1920-point
+         * window, over twice the height of a MacBook's screen, with no way to
+         * shrink it. main.c now asks for 1280x960 whatever the scale (or
+         * RECOMP_WINDOW_W/H), and the frame is drawn scaled to whatever size
+         * the view is, so the window only has to fit: the largest 4:3 size
+         * that does. The internal resolution stays what the menu says (at 4x
+         * on a Retina screen, about a pixel-for-pixel picture in a window
+         * that fits). RECOMP_WINDOW_FIT=0: the size as asked.
+         */
+        { const char *e = getenv("RECOMP_WINDOW_FIT");
+          NSScreen *scr = [NSScreen mainScreen];
+          if (scr && !(e && e[0] == '0')) {
+              NSRect vis = [scr visibleFrame];
+              NSRect chrome = [NSWindow frameRectForContentRect:NSMakeRect(0, 0, 100, 100)
+                                                      styleMask:mask];
+              double maxw = vis.size.width  - (chrome.size.width  - 100.0) - 40.0;
+              double maxh = vis.size.height - (chrome.size.height - 100.0) - 24.0;
+              double k = 1.0;
+              if (maxw >= 320.0 && maxh >= 240.0) {
+                  if (width > maxw)      k = maxw / width;
+                  if (height * k > maxh) k = maxh / height;
+              }
+              if (k < 1.0) {
+                  int w2 = (int)(width * k), h2 = (int)(height * k);
+                  if ((long)height * 4 == (long)width * 3) h2 = w2 * 3 / 4;
+                  fprintf(stderr, "[WIN] %dx%d does not fit the screen (%.0fx%.0f "
+                          "points free, %.0fx backing): %dx%d\n", width, height,
+                          vis.size.width, vis.size.height,
+                          (double)[scr backingScaleFactor], w2, h2);
+                  width = w2; height = h2;
+              }
+          } }
+        frame = NSMakeRect(0, 0, width, height);
 
         pf = [[NSOpenGLPixelFormat alloc] initWithAttributes:attrs];
         if (!pf) { fprintf(stderr, "[WIN] no pixel format\n"); return 0; }
 
         g_window = [[NSWindow alloc]
             initWithContentRect:frame
-                      styleMask:(NSWindowStyleMaskTitled |
-                                 NSWindowStyleMaskClosable |
-                                 NSWindowStyleMaskMiniaturizable)
+                      styleMask:mask
                         backing:NSBackingStoreBuffered
                           defer:NO];
         [g_window setTitle:[NSString stringWithUTF8String:title ? title : "JSRF"]];
         [g_window setDelegate:[[NvWindowDelegate alloc] init]];
+        /* Resizable, in the picture's shape; and it can go full screen (the
+         * green button, or Video > Enter Full Screen, Ctrl+Cmd+F). */
+        [g_window setContentAspectRatio:NSMakeSize(4.0, 3.0)];
+        [g_window setContentMinSize:NSMakeSize(320.0, 240.0)];
+        [g_window setCollectionBehavior:NSWindowCollectionBehaviorFullScreenPrimary];
         [g_window center];
 
         g_view = [[NvGLView alloc] initWithFrame:frame pixelFormat:pf];
