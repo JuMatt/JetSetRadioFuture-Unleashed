@@ -544,6 +544,57 @@ static BOOL posix_partition_device_path(const char *xbox_path, char *out, DWORD 
 }
 
 /* Strip a single trailing '/' (but never the root '/'). */
+/* The disc's file names are case-insensitive, as they are on the console
+ * and on a Mac's default filesystem -- the title asks for
+ * Media\\Player\\TypeA.bin and the disc has typea.bin. On a case-sensitive
+ * filesystem (Linux) that open fails, and the title's loader retries it
+ * forever on the "Now Loading" screen. So when a translated path does not
+ * exist as spelled, each component under the game or save directory that
+ * does not is looked up in its parent ignoring case. A component with no
+ * match ends the walk and the rest is left as asked, which is what creating
+ * a new file wants. */
+#include <dirent.h>
+#include <strings.h>
+static void resolve_case(char *path, const char *base)
+{
+    struct stat st;
+    size_t blen;
+    char *p;
+    if (!base || !*base || lstat(path, &st) == 0) return;
+    if (errno != ENOENT && errno != ENOTDIR) return;
+    blen = strlen(base);
+    if (strncmp(path, base, blen) != 0) return;
+    p = path + blen;
+    while (*p == '/') p++;
+    while (*p) {
+        char *slash = strchr(p, '/');
+        if (slash) *slash = '\0';
+        if (lstat(path, &st) != 0) {
+            char *sep = p - 1;            /* the '/' this component follows */
+            DIR *d;
+            struct dirent *e;
+            int found = 0;
+            *sep = '\0';
+            d = opendir(path[0] ? path : "/");
+            *sep = '/';
+            if (d) {
+                while ((e = readdir(d)) != NULL)
+                    if (!strcasecmp(e->d_name, p)) {
+                        memcpy(p, e->d_name, strlen(p));
+                        found = 1;
+                        break;
+                    }
+                closedir(d);
+            }
+            if (!found) { if (slash) *slash = '/'; return; }
+        }
+        if (!slash) return;
+        *slash = '/';
+        p = slash + 1;
+        while (*p == '/') p++;
+    }
+}
+
 static void strip_trailing_slash(char* s)
 {
     size_t len = strlen(s);
@@ -683,6 +734,7 @@ translate:
             while (n > 1 && host_path_buf[n - 1] == '/')
                 host_path_buf[--n] = '\0';
         }
+        resolve_case(host_path_buf, base_dir);
 
         XBOX_TRACE(XBOX_LOG_PATH, "%s -> %s", xbox_path, host_path_buf);
         return TRUE;
