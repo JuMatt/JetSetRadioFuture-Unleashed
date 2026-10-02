@@ -50,6 +50,7 @@
 #  include <OpenGL/gl3ext.h>
 #elif defined(NV2A_GL_USE_SDL)
 #  include <SDL2/SDL.h>
+#  include <sys/stat.h>
 #  if defined(__APPLE__)
 #    include <OpenGL/gl3.h>
 #    include <OpenGL/gl3ext.h>
@@ -541,6 +542,7 @@ static CGLContextObj g_cgl_ctx;
 #elif defined(NV2A_GL_USE_SDL)
 static SDL_Window   *g_window;
 static SDL_GLContext g_sdl_ctx;
+int  nv2a_widescreen(void);   /* below; the window opens in its shape */
 #else
 static EGLDisplay g_dpy;
 static EGLContext g_ctx;
@@ -998,21 +1000,50 @@ static int gl_init(uint32_t w, uint32_t h)
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
 
-    g_window = SDL_CreateWindow("Jet Set Radio Future",
-                                SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                                (int)(w ? w : 640), (int)(h ? h : 480),
-                                SDL_WINDOW_OPENGL | SDL_WINDOW_ALLOW_HIGHDPI);
+    /* The window is not the game's resolution: the game draws 640x480, the
+     * renderer works at a multiple of that (RECOMP_GL_SCALE), and the window
+     * is whatever size the player makes it -- each frame is fitted into it
+     * (sdl_present). It opens at 1280x960, or 16:9 at that height when
+     * widescreen is on, shrunk to fit the screen. */
+    {
+        int ww = 1280, wh = 960;
+        Uint32 flags = SDL_WINDOW_OPENGL | SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_RESIZABLE;
+        SDL_Rect usable;
+        const char *e;
+        (void)w; (void)h;
+        if (nv2a_widescreen()) ww = wh * 16 / 9;
+        if (SDL_GetDisplayUsableBounds(0, &usable) == 0 && usable.h > 0 && usable.w > 0) {
+            int maxh = usable.h * 9 / 10, maxw = usable.w * 9 / 10;
+            if (wh > maxh) { ww = ww * maxh / wh; wh = maxh; }
+            if (ww > maxw) { wh = wh * maxw / ww; ww = maxw; }
+        }
+        if ((e = getenv("RECOMP_WINDOW_W")) && atoi(e) >= 320) ww = atoi(e);
+        if ((e = getenv("RECOMP_WINDOW_H")) && atoi(e) >= 240) wh = atoi(e);
+        if ((e = getenv("RECOMP_FULLSCREEN")) && atoi(e)) flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+        g_window = SDL_CreateWindow("JSRF Unleashed",
+                                    SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                                    ww, wh, flags);
+    }
     if (!g_window) {
         fprintf(stderr, "  [GL] SDL_CreateWindow failed: %s\n", SDL_GetError());
         return 0;
     }
+    SDL_SetWindowMinimumSize(g_window, 320, 240);
     g_sdl_ctx = SDL_GL_CreateContext(g_window);
     if (!g_sdl_ctx) {
         fprintf(stderr, "  [GL] no 3.3 core context: %s\n", SDL_GetError());
         return 0;
     }
     SDL_GL_MakeCurrent(g_window, g_sdl_ctx);
-    SDL_GL_SetSwapInterval(0);       /* never wait for vblank while profiling */
+    /* No waiting for the display's refresh by default: the frame is paced
+     * by the emulated vblank (RECOMP_FPS), and the swap happens on the
+     * thread that runs the GPU. RECOMP_VSYNC=1 asks for it anyway. */
+    { const char *v = getenv("RECOMP_VSYNC");
+      SDL_GL_SetSwapInterval(v && atoi(v) ? 1 : 0); }
+    if (SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN_DESKTOP)
+        SDL_ShowCursor(SDL_DISABLE);
+    fprintf(stderr, "  [WIN] SDL window (%s video), %s\n", SDL_GetCurrentVideoDriver(),
+            nv2a_widescreen() ? "16:9" : "4:3");
 
     fprintf(stderr, "  [GL] %s | %s | GLSL %s\n",
             (const char *)glGetString(GL_VERSION),
@@ -1020,6 +1051,250 @@ static int gl_init(uint32_t w, uint32_t h)
             (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION));
 
     return gl_init_common(w, h);
+}
+
+/* ---- the SDL window: settings, keyboard, presenting, events --------------
+ *
+ * What the AppKit window (nv2a_window_mac.m) does on the Mac, for the SDL
+ * build (Linux): the frame fitted into a resizable window, the keyboard as a
+ * pad, full screen, and Widescreen with its choice remembered. All of it on
+ * the thread that created the window, which is the one that presents. */
+
+int  nv2a_widescreen(void);
+void nv2a_set_widescreen(int on);
+int  nv2a_wide_scene(void);
+
+/* $XDG_CONFIG_HOME/jsrf-unleashed/settings (or JSRF_SETTINGS_FILE): lines of
+ * key=value, shared with the launcher script, which keeps game_dir and
+ * scale there. Only the keys this file owns are rewritten. */
+static void sdl_cfg_path(char *buf, size_t n)
+{
+    const char *f = getenv("JSRF_SETTINGS_FILE"), *x = getenv("XDG_CONFIG_HOME"),
+               *h = getenv("HOME");
+    if (f && *f)      snprintf(buf, n, "%s", f);
+    else if (x && *x) snprintf(buf, n, "%s/jsrf-unleashed/settings", x);
+    else if (h && *h) snprintf(buf, n, "%s/.config/jsrf-unleashed/settings", h);
+    else buf[0] = 0;
+}
+
+static int sdl_cfg_get(const char *key, int def)
+{
+    char path[1024], line[1200];
+    size_t kl = strlen(key);
+    FILE *f;
+    int v = def;
+    sdl_cfg_path(path, sizeof path);
+    if (!path[0] || !(f = fopen(path, "r"))) return def;
+    while (fgets(line, sizeof line, f))
+        if (!strncmp(line, key, kl) && line[kl] == '=') v = atoi(line + kl + 1);
+    fclose(f);
+    return v;
+}
+
+static void sdl_cfg_set(const char *key, int val)
+{
+    char path[1024], tmp[1100], line[1200];
+    size_t kl = strlen(key);
+    FILE *in, *out;
+    int done = 0;
+    sdl_cfg_path(path, sizeof path);
+    if (!path[0]) return;
+    {   /* mkdir -p the directory */
+        char dir[1024]; char *p;
+        snprintf(dir, sizeof dir, "%s", path);
+        if ((p = strrchr(dir, '/')) != NULL) {
+            *p = 0;
+            for (p = dir + 1; *p; p++)
+                if (*p == '/') { *p = 0; mkdir(dir, 0755); *p = '/'; }
+            mkdir(dir, 0755);
+        }
+    }
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    if (!(out = fopen(tmp, "w"))) return;
+    if ((in = fopen(path, "r")) != NULL) {
+        while (fgets(line, sizeof line, in)) {
+            if (!strncmp(line, key, kl) && line[kl] == '=') {
+                if (!done) fprintf(out, "%s=%d\n", key, val);
+                done = 1;
+            } else fputs(line, out);
+        }
+        fclose(in);
+    }
+    if (!done) fprintf(out, "%s=%d\n", key, val);
+    fclose(out);
+    rename(tmp, path);
+}
+
+/* nv2a_widescreen() asks this when RECOMP_WIDESCREEN is not set. */
+int nv_window_pref_widescreen(void) { return sdl_cfg_get("widescreen", 0) != 0; }
+
+/* The keyboard as a gamepad -- the same layout as the Mac's, by key POSITION
+ * (scancodes), so W A S D on QWERTY is Z Q S D on AZERTY:
+ *   W A S D    left stick + d-pad       arrows   right stick
+ *   Space, J   A        K  B            H  X     L  Y
+ *   E          R trigger                Q  L trigger
+ *   R          Black                    F  White
+ *   Return     Start                    Esc  Back
+ *   C / V      left / right stick click
+ * F11 or Alt+Return: full screen. F10: widescreen. */
+static volatile unsigned short g_sdl_kb_buttons;
+static volatile unsigned char  g_sdl_kb_analog[8];
+
+static void sdl_key(SDL_Scancode sc, int down)
+{
+    unsigned short bit = 0;
+    int analog = -1;
+    switch (sc) {
+    case SDL_SCANCODE_W:      bit = 1u << 0; break;
+    case SDL_SCANCODE_S:      bit = 1u << 1; break;
+    case SDL_SCANCODE_A:      bit = 1u << 2; break;
+    case SDL_SCANCODE_D:      bit = 1u << 3; break;
+    case SDL_SCANCODE_RETURN: case SDL_SCANCODE_KP_ENTER: bit = 1u << 4; break;
+    case SDL_SCANCODE_ESCAPE: bit = 1u << 5; break;
+    case SDL_SCANCODE_UP:     bit = 1u << 6; break;
+    case SDL_SCANCODE_DOWN:   bit = 1u << 7; break;
+    case SDL_SCANCODE_LEFT:   bit = 1u << 8; break;
+    case SDL_SCANCODE_RIGHT:  bit = 1u << 9; break;
+    case SDL_SCANCODE_C:      bit = 1u << 10; break;
+    case SDL_SCANCODE_V:      bit = 1u << 11; break;
+    case SDL_SCANCODE_SPACE: case SDL_SCANCODE_J: analog = 0; break;   /* A */
+    case SDL_SCANCODE_K:      analog = 1; break;                       /* B */
+    case SDL_SCANCODE_H:      analog = 2; break;                       /* X */
+    case SDL_SCANCODE_L:      analog = 3; break;                       /* Y */
+    case SDL_SCANCODE_R:      analog = 4; break;                       /* Black */
+    case SDL_SCANCODE_F:      analog = 5; break;                       /* White */
+    case SDL_SCANCODE_Q:      analog = 6; break;                       /* L trigger */
+    case SDL_SCANCODE_E:      analog = 7; break;                       /* R trigger */
+    default: return;
+    }
+    if (bit) {
+        if (down) g_sdl_kb_buttons |= bit;
+        else      g_sdl_kb_buttons &= (unsigned short)~bit;
+    }
+    if (analog >= 0) g_sdl_kb_analog[analog] = down ? 255 : 0;
+}
+
+/* Read by the input layer (xinput_device.c), with the Mac's signature. */
+int nv_window_keys(unsigned short *buttons, unsigned char *analog)
+{
+    int i, any;
+    unsigned short b = g_sdl_kb_buttons;
+    if (buttons) *buttons = b;
+    any = b != 0;
+    for (i = 0; i < 8; i++) {
+        unsigned char v = g_sdl_kb_analog[i];
+        if (analog) analog[i] = v;
+        if (v) any = 1;
+    }
+    return any;
+}
+
+static void sdl_toggle_fullscreen(void)
+{
+    int fs = (SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN_DESKTOP) != 0;
+    SDL_SetWindowFullscreen(g_window, fs ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
+    SDL_ShowCursor(fs ? SDL_ENABLE : SDL_DISABLE);
+    fprintf(stderr, "[WIN] full screen %s\n", fs ? "off" : "on");
+}
+
+static void sdl_toggle_widescreen(void)
+{
+    int on = !nv2a_widescreen();
+    nv2a_set_widescreen(on);
+    sdl_cfg_set("widescreen", on);
+    /* A window (not full screen, not maximised) takes the new shape at the
+     * same height, as the Mac's does. */
+    if (!(SDL_GetWindowFlags(g_window) & (SDL_WINDOW_FULLSCREEN_DESKTOP | SDL_WINDOW_MAXIMIZED))) {
+        int ww, wh;
+        SDL_GetWindowSize(g_window, &ww, &wh);
+        SDL_SetWindowSize(g_window, on ? wh * 16 / 9 : wh * 4 / 3, wh);
+    }
+    fprintf(stderr, "[WIN] widescreen %s\n", on ? "on (16:9)" : "off (4:3)");
+}
+
+/* The frame, fitted into the window between black bars: a widened scene at
+ * 16:9 (the 640x480 surface holds a 16:9 view squeezed), anything else at its
+ * own shape. One blit; every piece of GL state the renderer caches is put
+ * back the way it was. */
+static void sdl_present(GLuint src_fbo, int sw, int sh)
+{
+    GLint vp[4], sbox[4], rfb = 0, dfb = 0;
+    GLboolean sc = glIsEnabled(GL_SCISSOR_TEST), cm[4];
+    int ww = 0, wh = 0, fw = sw, fh = sh, dw, dh;
+    if (sw <= 0 || sh <= 0) return;
+    glGetIntegerv(GL_VIEWPORT, vp);
+    glGetIntegerv(GL_SCISSOR_BOX, sbox);
+    glGetBooleanv(GL_COLOR_WRITEMASK, cm);
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &rfb);
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &dfb);
+    SDL_GL_GetDrawableSize(g_window, &ww, &wh);
+    if (ww <= 0 || wh <= 0) return;
+    if (nv2a_wide_scene()) { fw = 16; fh = 9; }
+    dw = ww; dh = wh;
+    if ((long)ww * fh > (long)wh * fw) dw = (int)((long)wh * fw / fh);
+    else                               dh = (int)((long)ww * fh / fw);
+    glDisable(GL_SCISSOR_TEST);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    glViewport(0, 0, ww, wh);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, src_fbo);
+    glBlitFramebuffer(0, 0, sw, sh,
+                      (ww - dw) / 2, (wh - dh) / 2, (ww - dw) / 2 + dw, (wh - dh) / 2 + dh,
+                      GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    SDL_GL_SwapWindow(g_window);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)rfb);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)dfb);
+    glViewport(vp[0], vp[1], vp[2], vp[3]);
+    glScissor(sbox[0], sbox[1], sbox[2], sbox[3]);
+    if (sc) glEnable(GL_SCISSOR_TEST);
+    glColorMask(cm[0], cm[1], cm[2], cm[3]);
+    { static int said;
+      if (said < 3) {
+          said++;
+          fprintf(stderr, "[WIN] presented #%d: %dx%d frame into %dx%d (%dx%d)\n",
+                  said, sw, sh, ww, wh, dw, dh);
+      } }
+}
+
+static void sdl_pump(void)
+{
+    SDL_Event ev;
+    while (SDL_PollEvent(&ev)) {
+        switch (ev.type) {
+        case SDL_QUIT:
+            fprintf(stderr, "  [GL] window closed; stopping\n");
+            nv2a_gl_report();
+            fflush(stderr);
+            exit(0);
+        case SDL_KEYDOWN:
+            if (!ev.key.repeat) {
+                SDL_Scancode k = ev.key.keysym.scancode;
+                if (k == SDL_SCANCODE_F11
+                 || (k == SDL_SCANCODE_RETURN && (ev.key.keysym.mod & KMOD_ALT))) {
+                    sdl_toggle_fullscreen();
+                    break;
+                }
+                if (k == SDL_SCANCODE_F10) { sdl_toggle_widescreen(); break; }
+            }
+            sdl_key(ev.key.keysym.scancode, 1);
+            break;
+        case SDL_KEYUP:
+            sdl_key(ev.key.keysym.scancode, 0);
+            break;
+        case SDL_WINDOWEVENT:
+            /* Losing focus with a key held never delivers its key-up. */
+            if (ev.window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
+                int i;
+                g_sdl_kb_buttons = 0;
+                for (i = 0; i < 8; i++) g_sdl_kb_analog[i] = 0;
+            }
+            break;
+        default:
+            break;
+        }
+    }
 }
 
 #else
@@ -7183,6 +7458,20 @@ static void present(int is_frame)
             nv2a_gl_report();
             exit(0);
         }
+    }
+#elif defined(NV2A_GL_USE_SDL)
+    if (g_window && is_frame) {
+        GLuint pfbo = g_fbo;
+        uint32_t pw = g_fbo_pw ? g_fbo_pw : g_fbo_w;
+        uint32_t ph = g_fbo_ph ? g_fbo_ph : g_fbo_h;
+        /* The surface the title flipped to (see the CGL path above). */
+        if (g_present_slot >= 0 && g_present_slot < SURF_CACHE && g_surf[g_present_slot].used) {
+            pfbo = g_surf[g_present_slot].fbo;
+            pw = g_surf[g_present_slot].w * gl_scale();
+            ph = g_surf[g_present_slot].h * gl_scale();
+        }
+        sdl_present(pfbo, (int)pw, (int)ph);
+        sdl_pump();
     }
 #endif
 

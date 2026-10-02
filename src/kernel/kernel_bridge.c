@@ -7609,8 +7609,11 @@ void xbox_kernel_bridge_init(void)
  * This function is deliberately out of line: its return address then points
  * into the recompiled function whose store was inlined around the call, and
  * that address, less the ASLR slide, is what `atos` needs to name it. */
+#ifdef __APPLE__
 #include <mach-o/dyld.h>
+#endif
 #include <time.h>
+#include <pthread.h>
 #include <execinfo.h>
 
 uint32_t g_recomp_watch_lo, g_recomp_watch_span;
@@ -7666,7 +7669,11 @@ void recomp_watch_hit(uint32_t a, uint32_t n)
     }
     clock_gettime(CLOCK_MONOTONIC, &now);
     if (now.tv_sec - last.tv_sec >= 4) {
+#ifdef __APPLE__
         uintptr_t slide = (uintptr_t)_dyld_get_image_vmaddr_slide(0);
+#else
+        uintptr_t slide = 0;   /* addr2line takes the address as it is */
+#endif
         int f;
         last = now;
         fprintf(stderr, "[WATCH] %lu stores so far, %d distinct writers:\n",

@@ -1,0 +1,144 @@
+#!/bin/bash
+#
+# JSRF Unleashed -- the Linux launcher.
+#
+# Finds your copy of Jet Set Radio Future (the folder with default.xbe in it),
+# remembers it, and starts the game with the settings it needs.
+#
+#   ./jsrf-unleashed                  play (asks where the game is, the first time)
+#   ./jsrf-unleashed /path/to/game    use that folder (or a .iso -- see below), and remember it
+#   ./jsrf-unleashed --choose         ask where the game is again
+#   ./jsrf-unleashed --scale N        internal resolution, 1 to 4 times 640x480 (default 2); remembered
+#   ./jsrf-unleashed --fullscreen     start full screen
+#   ./jsrf-unleashed --install        add JSRF Unleashed to your applications menu
+#
+# A .iso of your disc is unpacked once, if extract-xiso is installed.
+# In game: F11 (or Alt+Return) full screen, F10 widescreen 16:9.
+#
+set -u
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+CFG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/jsrf-unleashed"
+CFG="$CFG_DIR/settings"
+DATA="${XDG_DATA_HOME:-$HOME/.local/share}/jsrf-unleashed"
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/jsrf-unleashed"
+mkdir -p "$CFG_DIR" "$DATA/save" "$STATE/logs"
+
+cfg_get() { [ -f "$CFG" ] && sed -n "s/^$1=//p" "$CFG" | tail -n 1; }
+cfg_set() {   # key value: replace or append, keeping every other line
+    local tmp="$CFG.tmp"
+    { [ -f "$CFG" ] && grep -v "^$1=" "$CFG"; printf '%s=%s\n' "$1" "$2"; } > "$tmp" && mv "$tmp" "$CFG"
+}
+
+# A message the player can see: a dialog when there is a desktop to show one.
+say() {
+    if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && command -v zenity >/dev/null 2>&1; then
+        zenity --info --no-wrap --title="JSRF Unleashed" --text="$1" 2>/dev/null
+    elif [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && command -v kdialog >/dev/null 2>&1; then
+        kdialog --title "JSRF Unleashed" --msgbox "$1" 2>/dev/null
+    else
+        printf '%s\n' "$1" >&2
+    fi
+}
+fail() { say "$1"; exit 1; }
+
+is_game() { [ -n "$1" ] && [ -f "$1/default.xbe" ] && [ -d "$1/Media" ]; }
+
+ask_game() {
+    local q="Where is Jet Set Radio Future? Pick the folder that contains default.xbe."
+    if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && command -v zenity >/dev/null 2>&1; then
+        zenity --file-selection --directory --title="$q" 2>/dev/null
+    elif [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && command -v kdialog >/dev/null 2>&1; then
+        kdialog --getexistingdirectory "$HOME" --title "$q" 2>/dev/null
+    elif [ -t 0 ]; then
+        printf '%s\nFolder: ' "$q" >&2
+        local d; IFS= read -r d; printf '%s' "$d"
+    fi
+}
+
+# A disc image: unpacked once into ~/.local/share/jsrf-unleashed/<name>.
+from_iso() {
+    local iso="$1" dest
+    dest="$DATA/$(basename "${iso%.*}")"
+    if is_game "$dest"; then printf '%s' "$dest"; return; fi
+    command -v extract-xiso >/dev/null 2>&1 || \
+        fail "To use a disc image, install extract-xiso first (https://github.com/XboxDev/extract-xiso), or extract it yourself and pick the folder."
+    say "Unpacking $(basename "$iso") -- this happens once. The files go to: $dest" &
+    mkdir -p "$dest" && extract-xiso -x "$iso" -d "$dest" >/dev/null 2>&1 || fail "extract-xiso could not unpack $iso."
+    is_game "$dest" || fail "$iso does not look like Jet Set Radio Future (no default.xbe and Media after unpacking)."
+    printf '%s' "$dest"
+}
+
+install_desktop() {
+    local apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+    mkdir -p "$apps"
+    cat > "$apps/jsrf-unleashed.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=JSRF Unleashed
+Comment=Jet Set Radio Future, running natively
+Exec="$HERE/jsrf-unleashed"
+Icon=$HERE/share/jsrf-unleashed.png
+Terminal=false
+Categories=Game;
+EOF
+    echo "Added JSRF Unleashed to your applications menu ($apps/jsrf-unleashed.desktop)."
+}
+
+GAME=""; CHOOSE=0; FULLSCREEN=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --choose)     CHOOSE=1 ;;
+        --scale)      shift
+                      case "${1:-}" in [1-4]) cfg_set scale "$1" ;;
+                                       *) fail "--scale takes 1, 2, 3 or 4." ;; esac ;;
+        --fullscreen) FULLSCREEN=1 ;;
+        --install)    install_desktop; exit 0 ;;
+        -h|--help)    sed -n '4,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *)            GAME="$1" ;;
+    esac
+    shift
+done
+
+# Which game folder: the argument, else the remembered one, else ask.
+if [ -n "$GAME" ]; then
+    case "$GAME" in *.iso|*.ISO) GAME="$(from_iso "$GAME")" || exit 1 ;; esac
+elif [ "$CHOOSE" = 0 ] && is_game "$(cfg_get game_dir)"; then
+    GAME="$(cfg_get game_dir)"
+else
+    GAME="$(ask_game)"
+    [ -n "$GAME" ] || exit 0
+    case "$GAME" in *.iso|*.ISO) GAME="$(from_iso "$GAME")" || exit 1 ;; esac
+fi
+GAME="$(cd "$GAME" 2>/dev/null && pwd)" || fail "That folder does not exist."
+is_game "$GAME" || fail "That folder has no default.xbe and Media in it. Pick the folder you extracted the game into."
+cfg_set game_dir "$GAME"
+
+SCALE="$(cfg_get scale)"; case "$SCALE" in [1-4]) ;; *) SCALE=2 ;; esac
+
+# The previous run's log is kept (five of them), then a fresh one.
+LOG="$STATE/last-run.log"
+if [ -f "$LOG" ]; then
+    mv "$LOG" "$STATE/logs/run-$(date +%Y%m%d-%H%M%S).log"
+    ls -1t "$STATE"/logs/run-*.log 2>/dev/null | tail -n +6 | while IFS= read -r old; do rm -f "$old"; done
+fi
+
+export RECOMP_USB=1 RECOMP_GL=1 RECOMP_PB_EXEC=1 RECOMP_VBLANK=1 RECOMP_AC97_READY_NOTRAP=1 \
+       RECOMP_TRACE_BUDGET=0 RECOMP_GL_READBACK=0 RECOMP_FPS=60 RECOMP_ABI_RESTORE=1 \
+       RECOMP_LOCK_IDLE=1 RECOMP_GL_CURTAIN=skip RECOMP_MUTE=0 RECOMP_WINDOW=1
+export RECOMP_GL_SCALE="$SCALE"
+[ "$FULLSCREEN" = 1 ] && export RECOMP_FULLSCREEN=1
+export JSRF_GAME_DIR="$GAME" JSRF_SAVE_DIR="$DATA/save" JSRF_SETTINGS_FILE="$CFG"
+export LD_LIBRARY_PATH="$HERE/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+cd "$GAME" || exit 1
+"$HERE/bin/jsrf_recomp" "$GAME" > "$LOG" 2>&1
+status=$?
+if [ "$status" -ne 0 ]; then
+    say "JSRF Unleashed stopped unexpectedly (exit $status).
+
+The log is at:
+$LOG
+
+If you report the problem, please attach it."
+fi
+exit "$status"

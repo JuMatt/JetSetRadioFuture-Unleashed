@@ -16,8 +16,11 @@ if(APPLE)
     # file compiles to nothing here and waveOut does not exist at all, so the
     # AudioQueue backend answers the same five entry points instead.
     list(APPEND XBOX_APU_SOURCES apu_coreaudio.c)
-else()
+elseif(WIN32)
     list(APPEND XBOX_APU_SOURCES apu_xaudio2.c)
+else()
+    # Linux: SDL2's audio, answering the same entry points (apu_sdl.c).
+    list(APPEND XBOX_APU_SOURCES apu_sdl.c)
 endif()
 
 add_library(xbox_apu STATIC ${XBOX_APU_SOURCES})

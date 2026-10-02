@@ -1,6 +1,6 @@
 # JSRF Unleashed
 
-**Jet Set Radio Future, running natively on your Mac.** Not an emulator — the
+**Jet Set Radio Future, running natively on Mac and Linux.** Not an emulator — the
 game's own code, statically recompiled into C and built as a native
 application.
 
@@ -22,7 +22,7 @@ you own.
 | Platform | Download |
 |---|---|
 | macOS 12 or later, Apple Silicon (M1 or later) | [JSRF-Unleashed-macOS-arm64.zip](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/latest/download/JSRF-Unleashed-macOS-arm64.zip) |
-| Linux | in progress |
+| Linux, x86_64 (glibc 2.34 or later: Ubuntu 22.04, Debian 12, Fedora 36 and newer) | [JSRF-Unleashed-linux-x86_64.tar.gz](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/latest/download/JSRF-Unleashed-linux-x86_64.tar.gz) — new, less tested than the Mac build |
 | Windows, iPhone | not started |
 
 Every version is on the [Releases](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases) page.
@@ -45,6 +45,19 @@ Saves are kept in `~/Library/Application Support/JSRF Unleashed/save`. Each
 run writes `last-run.log` into the game folder (with a few older ones in
 `logs/`) — attach it when you report a bug.
 
+### Installing on Linux
+
+Extract the archive anywhere and run `./jsrf-unleashed`. The first time, it
+asks for the folder that contains `default.xbe` (with a folder picker if
+`zenity` or `kdialog` is installed, otherwise in the terminal) and remembers
+it. `./jsrf-unleashed --install` adds it to your applications menu. It needs
+OpenGL 3.3 drivers and an X11 or Wayland desktop; SDL2 is bundled. The
+`README.txt` inside lists the options (`--scale`, `--fullscreen`, `--choose`)
+and where settings, saves and logs are kept.
+
+On Linux the keyboard layout is the same as below; **F11** (or Alt+Return)
+toggles full screen and **F10** widescreen.
+
 ### Your game files
 
 You need the **USA (NTSC-U) release** of *Jet Set Radio Future* — the game
@@ -55,7 +68,7 @@ you want the folder with `default.xbe`, `Media/` and the rest.
 ## Playing
 
 **Controller:** any pad macOS recognises — Xbox, DualSense, DualShock 4 and
-others, over Bluetooth or USB.
+others, over Bluetooth or USB. On Linux, any pad SDL knows.
 
 **Keyboard.** Keys go by position, so `W A S D` on a QWERTY keyboard is
 `Z Q S D` on an AZERTY one:
@@ -91,6 +104,7 @@ Playable, early, and not yet played from start to finish.
 | Skating, grinding, tricks, graffiti, the pause map | works |
 | Music, sound effects, voices | works |
 | Widescreen 16:9 | works in game; the title screen stays 4:3 |
+| Linux build | new: boots, menus, starting a new game; far less played than the Mac build |
 | Later areas | little tested — expect bugs |
 | Known issues | an occasional "disc error" screen during a load; a 1-pixel dark line along the right edge |
 
@@ -138,7 +152,7 @@ The target is the shape [Ship of Harkinian](https://github.com/HarbourMasters/Sh
 set: you own the game, you point the app at it, it plays. Next:
 
 1. The rest of the game — later areas get far less testing than the first.
-2. Linux, then Windows.
+2. Windows.
 3. The Metal renderer, and with it an iPhone build, with touch controls.
 
 ## Legality
