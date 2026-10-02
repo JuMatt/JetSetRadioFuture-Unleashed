@@ -11,6 +11,7 @@
 #   ./jsrf-unleashed --scale N        internal resolution, 1 to 4 times 640x480 (default 2); remembered
 #   ./jsrf-unleashed --fullscreen     start full screen
 #   ./jsrf-unleashed --install        add JSRF Unleashed to your applications menu
+#   ./jsrf-unleashed --version        which version this is
 #
 # A .iso of your disc is unpacked once, if extract-xiso is installed.
 # In game: F11 (or Alt+Return) full screen, F10 widescreen 16:9.
@@ -93,7 +94,8 @@ while [ $# -gt 0 ]; do
                                        *) fail "--scale takes 1, 2, 3 or 4." ;; esac ;;
         --fullscreen) FULLSCREEN=1 ;;
         --install)    install_desktop; exit 0 ;;
-        -h|--help)    sed -n '4,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --version)    cat "$HERE/VERSION" 2>/dev/null || "$HERE/bin/jsrf_recomp" --version; exit 0 ;;
+        -h|--help)    sed -n '4,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)            GAME="$1" ;;
     esac
     shift

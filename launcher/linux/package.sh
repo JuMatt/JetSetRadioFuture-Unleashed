@@ -6,9 +6,9 @@
 #   launcher/linux/package.sh <jsrf_recomp> <libSDL2-2.0.so.0> [out dir]
 #
 # How the release build is made (Ubuntu 22.04, so glibc 2.35, and the result
-# runs on glibc 2.34 or later):
+# runs on glibc 2.34 or later), from the repository at the release tag:
 #
-#   CC=clang cmake -S <game project> -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+#   CC=clang cmake -S port -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
 #       -DNV2A_GL_CONTEXT=sdl -DOpenGL_GL_PREFERENCE=LEGACY \
 #       -DCMAKE_EXE_LINKER_FLAGS=-Wl,--as-needed
 #   cmake --build build
@@ -35,6 +35,10 @@ mkdir -p "$dir/bin" "$dir/lib" "$dir/share" "$dir/licences"
 install -m 755 "$here/jsrf-unleashed" "$dir/jsrf-unleashed"
 install -m 644 "$here/README.txt" "$dir/README.txt"
 install -m 755 "$engine" "$dir/bin/jsrf_recomp"
+# The version is the engine's own (port/CMakeLists.txt builds it in from the
+# release tag); the launcher's --version reads it from here.
+"$engine" --version > "$dir/VERSION"
+echo "version: $(cat "$dir/VERSION")"
 install -m 644 "$sdl" "$dir/lib/libSDL2-2.0.so.0"
 strip --strip-unneeded "$dir/lib/libSDL2-2.0.so.0" 2>/dev/null || true
 install -m 644 "$repo/launcher/icon/AppIcon.iconset/icon_256x256.png" "$dir/share/jsrf-unleashed.png"

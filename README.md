@@ -25,7 +25,7 @@ you own.
 | Linux, x86_64 (glibc 2.34 or later: Ubuntu 22.04, Debian 12, Fedora 36 and newer) | [JSRF-Unleashed-linux-x86_64.tar.gz](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/latest/download/JSRF-Unleashed-linux-x86_64.tar.gz) — new, less tested than the Mac build |
 | Windows, iPhone | not started |
 
-Every version is on the [Releases](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases) page.
+Every version is on the [Releases](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases) page; what changed is in the [changelog](CHANGELOG.md).
 
 ### Installing on macOS
 
@@ -133,18 +133,21 @@ work this stands on.
 The generated code — hundreds of thousands of lines of C translated from the
 game's executable — is not in this repository and will not be: it is derived
 from SEGA's binary. You produce it on your own machine, from your own
-`default.xbe`, with the pipeline in [`tools/recomp`](tools/recomp):
+`default.xbe`, with the pipeline in [`tools/recomp`](tools/recomp) — the
+[getting-started guide](docs/GETTING_STARTED.md) walks through it (it is written
+for the toolkit in general), and `--exclude-manual port/recomp_manual.c` tells
+it about the hand-written overrides in [`port/`](port). Put the result in
+`port/recomp/gen`, then:
 
-- [`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md) walks through the
-  pipeline and the game-project template (it is written for the toolkit in
-  general);
-- [`port/`](port) holds the half of this repository that is specific to JSRF
-  — the entry point and the hand-written overrides, which the pipeline is
-  told about with `--exclude-manual port/recomp_manual.c`;
-- [`launcher/build_app.sh`](launcher/build_app.sh) wraps the built engine into
-  *JSRF Unleashed.app*.
+```sh
+cmake -S port -B build -DCMAKE_BUILD_TYPE=Release    # on Linux add -DNV2A_GL_CONTEXT=sdl
+cmake --build build
+launcher/package_mac.sh build/jsrf_recomp             # macOS: the app, zipped
+```
 
-A step-by-step guide for building JSRF itself is still to be written.
+On Linux, [`launcher/linux/package.sh`](launcher/linux/package.sh) packages the
+build and records how the release one is made. The version comes from the git
+tag the tree is at.
 
 ## Where this is going
 

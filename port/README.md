@@ -20,3 +20,7 @@ The bulk of the port — the hundreds of thousands of lines of C the pipeline
 generates from the XBE — is **not** here and will not be: it is derived from a
 copyrighted binary. It is produced on your machine, from your own disc, by the
 pipeline in `tools/`.
+
+`CMakeLists.txt` here builds the game from this repository once the generated
+code is in `port/recomp/gen` (see the main README), and stamps it with the
+version of the git tag the tree is at.

@@ -35,3 +35,16 @@ tools/split/output/
 
 # Built from launcher/icon/AppIcon.iconset by launcher/build_app.sh
 launcher/AppIcon.icns
+
+# Builds of the game (see port/CMakeLists.txt) and packaged apps
+/build*/
+*.app/
+*.tar.gz
+*.zip
+
+# The generated code: derived from the game's executable, never committed
+port/recomp/
+
+# Backups and merge leftovers
+*.bak*
+*.orig

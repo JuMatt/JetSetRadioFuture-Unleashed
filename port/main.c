@@ -55,6 +55,12 @@
 #include <errno.h>
 #include <math.h>
 
+/* The version (port/CMakeLists.txt passes the release tag); a build that
+ * does not say is a development build. */
+#ifndef JSRF_VERSION
+#define JSRF_VERSION "dev"
+#endif
+
 /* xboxrecomp runtime headers */
 #include <xbox/xboxrecomp.h>
 #include "ohci.h"
@@ -536,7 +542,8 @@ static int host_main(void)
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 
-    printf("=== Jet Set Radio Future - Static Recompilation ===\n");
+    printf("=== JSRF Unleashed %s -- Jet Set Radio Future, statically recompiled ===\n",
+           JSRF_VERSION);
     printf("Loading XBE...\n");
 
     /* Install VEH handler (first handler in chain) */
@@ -852,6 +859,12 @@ static BOOL load_xbe(const char *path, void **out_data, size_t *out_size)
 /* Console entry point (for debugging -- lets you see printf output) */
 int main(int argc, char **argv)
 {
+    /* --version: the version this engine was built as (port/CMakeLists.txt:
+     * the release tag), for the launchers and for anyone asking. */
+    if (argc > 1 && !strcmp(argv[1], "--version")) {
+        printf("%s\n", JSRF_VERSION);
+        return 0;
+    }
     g_argv = argv;
     if (argc > 1) g_game_dir_arg = argv[1];
     return host_main();

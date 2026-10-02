@@ -35,6 +35,7 @@ Playing
    ./jsrf-unleashed --scale N     internal resolution, 1 to 4 (default 2); remembered
    ./jsrf-unleashed --fullscreen  starts full screen
    ./jsrf-unleashed --choose      asks where the game is again
+   ./jsrf-unleashed --version     which version this is
 
 
 Controls
