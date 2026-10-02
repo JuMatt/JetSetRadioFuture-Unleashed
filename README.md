@@ -1,7 +1,8 @@
 # JSRF Unleashed
 
-**Jet Set Radio Future, running natively.** Not an emulator — the game's own
-code, statically recompiled into C and built as a native application.
+**Jet Set Radio Future, running natively on your Mac.** Not an emulator — the
+game's own code, statically recompiled into C and built as a native
+application.
 
 > **This project is about one game.** It is not an Xbox emulator and it will
 > not run other Xbox titles. Everything here — the graphics translation, the
@@ -10,31 +11,91 @@ code, statically recompiled into C and built as a native application.
 > want [xemu](https://xemu.app); if you want to port a different Xbox title,
 > you want the [toolkit this is built on](docs/xboxrecomp-toolkit.md).
 
-**You need your own copy of the game.** No game data is distributed here and
-none ever will be. You supply the disc you own; this supplies the engine.
+**You need your own copy of the game.** The download is the engine only — no
+game files, no textures, no music, no video. It plays the files from a disc
+you own.
 
 ---
 
+## Download
+
+| Platform | Download |
+|---|---|
+| macOS 12 or later, Apple Silicon (M1 or later) | [JSRF-Unleashed-macOS-arm64.zip](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/latest/download/JSRF-Unleashed-macOS-arm64.zip) |
+| Linux | in progress |
+| Windows, iPhone | not started |
+
+Every version is on the [Releases](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases) page.
+
+### Installing on macOS
+
+1. Unzip, and move **JSRF Unleashed** to Applications (or wherever you like).
+2. Open it. The app is not notarised by Apple — that needs a paid developer
+   account — so the first time, macOS says it cannot check it. Click
+   **Done**, open **System Settings › Privacy & Security**, find
+   *"JSRF Unleashed" was blocked* and click **Open Anyway**. (On macOS 13 or
+   earlier, right-click the app and choose **Open** instead.) This is needed
+   once.
+3. It asks where your game is: pick the folder that contains `default.xbe`,
+   or a disc image (`.iso`), which it unpacks once if
+   [extract-xiso](https://github.com/XboxDev/extract-xiso) is installed
+   (`brew install extract-xiso`). It remembers the choice.
+
+Saves are kept in `~/Library/Application Support/JSRF Unleashed/save`. Each
+run writes `last-run.log` into the game folder (with a few older ones in
+`logs/`) — attach it when you report a bug.
+
+### Your game files
+
+You need the **USA (NTSC-U) release** of *Jet Set Radio Future* — the game
+code inside the app is translated from that version's executable, so other
+regions' discs will not work. Make an image of your own disc and extract it:
+you want the folder with `default.xbe`, `Media/` and the rest.
+
+## Playing
+
+**Controller:** any pad macOS recognises — Xbox, DualSense, DualShock 4 and
+others, over Bluetooth or USB.
+
+**Keyboard.** Keys go by position, so `W A S D` on a QWERTY keyboard is
+`Z Q S D` on an AZERTY one:
+
+| Key | Does | Key | Does |
+|---|---|---|---|
+| W A S D | move (left stick), menus | Arrow keys | camera (right stick) |
+| Space or J | A — jump | K | B |
+| H | X | L | Y |
+| E | R trigger — talk, spray | Q | L trigger |
+| R | Black | F | White |
+| Return | Start | Esc | Back |
+| C / V | left / right stick click | | |
+
+**Controls › Keyboard…** in the menu bar shows the same list.
+
+**Video menu:**
+- **Resolution** — the internal resolution, 1× to 4× (2× by default). The
+  game restarts to apply it.
+- **Full Screen** — Ctrl ⌘ F.
+- **Widescreen (16:9)** — ⇧ ⌘ W. The game is shown at 16:9 with a wider
+  field of view, not stretched; the HUD and text keep their shape. The title
+  screen stays 4:3.
+
 ## Status
 
-Early. It boots, it draws, it plays music, and it is not yet a game you can
-finish. Honest state of things:
+Playable, early, and not yet played from start to finish.
 
 | | |
 |---|---|
-| Boots to the title screen | works |
-| World geometry, characters, textures | works — correctly placed since the fixed-function viewport fix |
-| Streaming music (CRI ADX through the emulated MCPX APU) | works — plays in order and in time |
-| Gamepad (DualSense and Xbox pads over Bluetooth) | works via Apple's GameController framework |
-| Keyboard fallback | works |
-| Getting from the menu into a level | **unreliable** — hangs in the loader |
-| Title-screen logo flash, mirrored 2D overlays | known cosmetic faults |
-| Metal renderer | early; OpenGL is the working path today |
-| Windows / Linux | the code is portable and unproven — not yet built or run |
-| iPhone | not started |
+| Title, menus, new game, saving and loading | works |
+| New Game through the tutorial, the DJ K scene and Dogenzaka Hill | works — the part played and tested most |
+| Skating, grinding, tricks, graffiti, the pause map | works |
+| Music, sound effects, voices | works |
+| Widescreen 16:9 | works in game; the title screen stays 4:3 |
+| Later areas | little tested — expect bugs |
+| Known issues | an occasional "disc error" screen during a load; a 1-pixel dark line along the right edge |
 
-If you are looking for "download and play", it is not that yet. It is close
-enough to be interesting and far enough to need work.
+Found a bug? [Open an issue](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/issues)
+with your `last-run.log` and what you were doing.
 
 ## Why static recompilation
 
@@ -53,58 +114,52 @@ the MCPX audio processor, and the Xbox kernel the game calls into. Those parts
 come from the toolkit and from [xemu](https://xemu.app), whose NV2A and APU
 work this stands on.
 
-## Getting it running
+## Building from source
 
-Today this is a build-it-yourself project on macOS (Apple Silicon).
+The generated code — hundreds of thousands of lines of C translated from the
+game's executable — is not in this repository and will not be: it is derived
+from SEGA's binary. You produce it on your own machine, from your own
+`default.xbe`, with the pipeline in [`tools/recomp`](tools/recomp):
 
-```sh
-# 1. Extract your own disc. You want the folder that contains default.xbe.
-extract-xiso -x "Jet Set Radio Future.iso"
+- [`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md) walks through the
+  pipeline and the game-project template (it is written for the toolkit in
+  general);
+- [`port/`](port) holds the half of this repository that is specific to JSRF
+  — the entry point and the hand-written overrides, which the pipeline is
+  told about with `--exclude-manual port/recomp_manual.c`;
+- [`launcher/build_app.sh`](launcher/build_app.sh) wraps the built engine into
+  *JSRF Unleashed.app*.
 
-# 2. Build.
-cmake -B build-arm64 -DCMAKE_BUILD_TYPE=Release
-cmake --build build-arm64 -j
-
-# 3. Run, pointing it at those files.
-JSRF_GAME_DIR="/path/to/extracted" ./build-arm64/jsrf_recomp
-```
-
-### The launcher
-
-`launcher/build_app.sh` wraps the engine into **JSRF Unleashed.app**: it asks
-once where your game files are, remembers them, and starts the game. It asks
-again only if they have actually gone — a folder you rename or move is
-followed, because being asked a question you cannot usefully answer is not a
-feature. Hand it a `.iso` and it unpacks it once (with `extract-xiso`, if you
-have it) and remembers the result.
-
-```sh
-launcher/build_app.sh
-open "JSRF Unleashed.app"
-```
+A step-by-step guide for building JSRF itself is still to be written.
 
 ## Where this is going
 
 The target is the shape [Ship of Harkinian](https://github.com/HarbourMasters/Shipwright)
-set: you own the game, you point the app at it, it plays — on Windows, Linux,
-macOS, and iPhone (through AltStore), with a touch layout when no gamepad is
-connected. Nothing about the approach rules any of that out; all of it is work
-that has not been done yet.
+set: you own the game, you point the app at it, it plays. Next:
 
-Nearest first:
-
-1. The loader hang between the menu and a level — the last thing standing
-   between this and actually playing.
-2. Windows and Linux builds, which the code is written for but has not seen.
-3. The Metal renderer, and with it the iPhone build.
-4. Touch controls.
+1. The rest of the game — later areas get far less testing than the first.
+2. Linux, then Windows.
+3. The Metal renderer, and with it an iPhone build, with touch controls.
 
 ## Legality
 
-The recompiled code is derived from a copyrighted binary, so **no compiled
-game binary is distributed here** — only the tools that turn a disc you own
-into one, and the runtime that hosts it. Bring your own disc. This follows the
-same line as the Zelda and Mario recompilation projects.
+The releases contain the engine: the runtime (the kernel layer and the
+graphics and audio hardware models) and the game's own code, machine-translated
+to native code. They contain **no game data** — no textures, models, music,
+video or text — and do nothing without the files from your own copy of the
+game. This repository holds no game code at all; that is generated on your
+machine from your own disc. It is the same approach as
+[Ship of Harkinian](https://github.com/HarbourMasters/Shipwright) and
+[Zelda 64: Recompiled](https://github.com/Zelda64Recomp/Zelda64Recomp).
+
+*Jet Set Radio Future* is © SEGA. This is an unofficial fan project, not
+affiliated with or endorsed by SEGA. If you represent a rights holder and have
+a concern, please open an issue.
+
+## Licence
+
+MIT for this project's own code; the MCPX audio-processor code extracted from
+xemu is LGPL-2.1-or-later. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
 ## Credits
 
@@ -113,4 +168,4 @@ same line as the Zelda and Mario recompilation projects.
   [docs/xboxrecomp-toolkit.md](docs/xboxrecomp-toolkit.md).
 - [xemu](https://xemu.app) — the NV2A and MCPX APU hardware models, without
   which none of the graphics or audio would exist.
-- Smilebit and Sega, who made the game.
+- Smilebit and SEGA, who made the game.

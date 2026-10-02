@@ -1394,6 +1394,82 @@ static void mission_at_step(void)
 /* JSRF_OPEN_SAVE="t[:mode]" (test only): open the save menu at t seconds;
  * mode 1 opens it to LOAD, which is how a test gets a player's saved
  * progress into a run that started with New Game. */
+/* Video > Widescreen toggled in play: the title sets its camera once, at
+ * startup, so the projection and the culling planes are recomputed here --
+ * the same two calls SetCamera makes, on the device it made them on -- the
+ * frame after the switch changes. */
+static uint32_t s_cam_dev;      /* the device the camera was last set on */
+static int s_wide_applied = -1; /* the mode it was set for */
+extern int nv2a_widescreen(void);
+extern int nv2a_wide_scene(void);
+extern void nv2a_set_wide_scene(int on);
+extern void sub_00153A90(void);
+extern void sub_00153EC0(void);
+static void wide_reapply_step(void)
+{
+    uint8_t *m = (uint8_t *)g_xbox_mem_offset;
+    uint32_t sv_eax, sv_ecx, sv_edx;
+    /* JSRF_WIDE_AT=<t> (test only): flip the mode at time t, as the menu would. */
+    { static int st = -1; static double t;
+      if (st < 0) { const char *e = getenv("JSRF_WIDE_AT");
+                    st = (e && sscanf(e, "%lf", &t) == 1) ? 1 : 0; }
+      if (st == 1 && pad_now() >= t) {
+          extern void nv2a_set_widescreen(int on);
+          st = 2;
+          nv2a_set_widescreen(!nv2a_widescreen());
+          fprintf(stderr, "[WIDE] t=%.1f JSRF_WIDE_AT: widescreen %s\n", pad_now(),
+                  nv2a_widescreen() ? "on" : "off");
+      } }
+    if (!s_cam_dev || s_wide_applied < 0 || s_wide_applied == nv2a_wide_scene()) return;
+    /* Only on the device the camera was set on, and only while it is still
+     * one: the graphics device class, vtable 0x1E0F00. */
+    if (s_cam_dev < 0x10000u || s_cam_dev + 0x60u >= (64u << 20)
+     || *(uint32_t *)(m + s_cam_dev) != 0x001E0F00u) { s_cam_dev = 0; return; }
+    sv_eax = g_eax; sv_ecx = g_ecx; sv_edx = g_edx;
+    g_esp -= 4; *(uint32_t *)(m + g_esp) = 0;   /* each callee's ret pops it */
+    g_ecx = s_cam_dev;
+    sub_00153A90();
+    g_esp -= 4; *(uint32_t *)(m + g_esp) = 0;
+    g_ecx = s_cam_dev;
+    sub_00153EC0();
+    g_eax = sv_eax; g_ecx = sv_ecx; g_edx = sv_edx;
+    fprintf(stderr, "[WIDE] t=%.1f camera re-set for %s\n", pad_now(),
+            nv2a_wide_scene() ? "16:9" : "4:3");
+}
+
+/* JSRF_FIND_PROJ=<t> (test only): at time t, scan guest RAM for projection
+ * matrices -- [a 0 0 0; 0 b 0 0; 0 0 c d; 0 0 e f] with b/a = 4/3 -- in
+ * both the row-major and the transposed layout, to find where the title
+ * keeps the one it draws the world with. */
+static void find_proj_step(void)
+{
+    static int state = -1; static double t;
+    const uint8_t *m = (const uint8_t *)g_xbox_mem_offset;
+    uint32_t a, n = 0;
+    if (state < 0) {
+        const char *e = getenv("JSRF_FIND_PROJ");
+        state = (e && sscanf(e, "%lf", &t) == 1) ? 1 : 0;
+    }
+    if (state != 1 || pad_now() < t) return;
+    state = 2;
+    for (a = 0x10000; a + 64 <= (64u << 20) && n < 64; a += 4) {
+        const float *f = (const float *)(m + a);
+        float x = f[0], y;
+        if (!(x > 0.2f && x < 8.0f)) continue;
+        /* row-major: m00 at 0, m11 at 5 */
+        y = f[5];
+        if (y > 0.0f && fabsf(y / x - 4.0f / 3.0f) < 2e-3f
+            && f[1] == 0 && f[2] == 0 && f[3] == 0 && f[4] == 0 && f[6] == 0 && f[7] == 0
+            && f[8] == 0 && f[9] == 0 && f[12] == 0 && f[13] == 0) {
+            fprintf(stderr, "[PROJ] t=%.1f %08X: %.5f %.5f %.5f %.5f | %.5f %.5f %.5f %.5f | %.5f %.5f %.5f %.5f | %.5f %.5f %.5f %.5f\n",
+                    pad_now(), a, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7],
+                    f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15]);
+            n++;
+        }
+    }
+    fprintf(stderr, "[PROJ] t=%.1f scan done, %u found\n", pad_now(), n);
+}
+
 static void save_menu_open_step(void)
 {
     static int state = -1; static double t; static int mode;
@@ -1581,6 +1657,17 @@ static void mscript_dump(uint32_t flow, uint32_t state)
     mscript_list("trig", *(uint32_t *)(m + ms + 0x17C), *(uint32_t *)(m + ms + 0x180));
     fflush(stderr);
 }
+extern void nv2a_set_wide_scene(int on);
+/* What the flow last said about widescreen (-1 nothing yet: the boot logos
+ * stay 4:3 too, see jsrf_wide_boot). */
+static int s_wide_scene_said = -1;
+static int wide_log_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("JSRF_WIDE_LOG") ? 1 : 0;
+    return on;
+}
+__attribute__((constructor)) static void jsrf_wide_boot(void) { nv2a_set_wide_scene(0); }
 extern void sub_00051FC0_gen(void);
 void sub_00051FC0(void)
 {
@@ -1639,6 +1726,23 @@ void sub_00051FC0(void)
               if ((st == 14 && !(ms_done & 1)) || (st == 15 && (ms_done & 6) == 2)) {
                   ms_done |= st == 14 ? 1 : 4;
                   mscript_dump(flow, st);
+              }
+          } }
+        /* Widescreen by scene: the title (mission 0x5A, the attract
+         * demo and its menu) stays 4:3, pillarboxed -- its overlays park
+         * things just past the 4:3 edges (and its sky stops there), which
+         * a wider view shows as black bars down the sides. Every mission
+         * after it is widened. A flow handing over to the next one (states
+         * 93/94) has no say. */
+        { uint32_t mi = *(uint32_t *)(m + flow + 0x58), st = *(uint32_t *)(m + flow + 0x5C);
+          if (st != 93 && st != 94) {
+              int want = (mi != 0x5Au);
+              if (want != s_wide_scene_said) {
+                  s_wide_scene_said = want;
+                  nv2a_set_wide_scene(want);
+                  if (wide_log_on())
+                      fprintf(stderr, "[WIDE] t=%.1f mission %08X: %s\n", pad_now(), mi,
+                              want ? "widened" : "kept 4:3 (pillarboxed)");
               }
           } }
         if (log_on && *(uint32_t *)(m + flow + 0x5C) != last_state) {
@@ -3336,6 +3440,132 @@ void sub_0003FEC0(void)
 }
 
 
+/* ---- widescreen -------------------------------------------------------------
+ *
+ * The title draws 4:3 and never asks the console whether the TV is 16:9 (its
+ * one XGetVideoFlags call, at 0x18AEC6, is about PAL-60). Its camera is the
+ * graphics device class at vtable 0x1E0F00:
+ *
+ *   +0x7C SetCamera(angle, near, far), sub_00153FE0: +0x48 the horizontal
+ *         field of view (0x10000 = 360 degrees), +0x54 tan(hfov/2), +0x50
+ *         the projection distance in pixels; then
+ *   sub_00153A90, the culling frustum: per side plane a slope (tan, at
+ *         0x264E84 = -tan and 0x264E8C = +tan) and a sphere-radius factor
+ *         (sec = sqrt(1 + tan^2), 0x264E80 / 0x264E88) -- the vertical
+ *         planes at 0x264E78.. are separate;
+ *   sub_00153EC0, the projection: the static matrix at 0x22E6B8, whose
+ *         m00 is a constant 1.0 and whose field of view rides in w (m23 =
+ *         tan), copied to 0x264EF8 for the shaders and passed to
+ *         D3DDevice_SetTransform(D3DTS_PROJECTION = 1 on Xbox).
+ *   +0x6C SetTransform(state, matrix) (sub_00154420): any other matrix the
+ *         title sets explicitly.
+ *
+ * Widescreen (nv2a_widescreen(): RECOMP_WIDESCREEN, or Video > Widescreen)
+ * keeps the vertical field of view and widens the horizontal one to 16:9:
+ * m00 = 0.75 (= (4/3) / (16/9)) for every perspective projection, and the
+ * side planes' slope x 4/3 so the title culls against what is now on screen.
+ * The 640x480 frame then holds a 16:9 view squeezed, and the window shows it
+ * at 16:9; the renderer squeezes the 2D overlays (nv2a_gl.c) so they keep
+ * their shape. JSRF_WIDE_LOG=1 logs the projections the title sets. */
+extern int nv2a_widescreen(void);
+static int wide_log(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("JSRF_WIDE_LOG") ? 1 : 0;
+    return on;
+}
+/* JSRF_WIDE_NOPROJ=1 (test only): leave the 3D projection and culling 4:3,
+ * so a widescreen run differs from a 4:3 one only by the 2D squeeze. */
+static int wide_proj(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("JSRF_WIDE_NOPROJ") ? 0 : 1;
+    return on && nv2a_wide_scene();
+}
+
+extern void sub_00153EC0_gen(void);
+void sub_00153EC0(void)
+{
+    float *m00 = (float *)((uint8_t *)g_xbox_mem_offset + 0x22E6B8u);
+    if (wide_log()) {
+        static uint32_t said;
+        if (g_ecx != said && g_ecx >= 0x10000u && g_ecx < (64u << 20)) {
+            said = g_ecx;
+            fprintf(stderr, "[WIDE] t=%.1f camera device %08X, vtable %08X\n", pad_now(), g_ecx,
+                    *(uint32_t *)((uint8_t *)g_xbox_mem_offset + g_ecx));
+        }
+    }
+    s_cam_dev = g_ecx;
+    s_wide_applied = nv2a_wide_scene();
+    float want = wide_proj() ? 0.75f : 1.0f;
+    if ((*m00 == 1.0f || *m00 == 0.75f) && *m00 != want) {
+        if (wide_log())
+            fprintf(stderr, "[WIDE] t=%.1f camera projection m00 %.2f -> %.2f\n",
+                    pad_now(), *m00, want);
+        *m00 = want;
+    }
+    sub_00153EC0_gen();
+}
+
+extern void sub_00153A90_gen(void);
+void sub_00153A90(void)
+{
+    sub_00153A90_gen();
+    if (wide_proj()) {
+        float *f = (float *)((uint8_t *)g_xbox_mem_offset + 0x264E78u);
+        /* f[2] = sec at 0x264E80, f[3] = -tan, f[4] = sec, f[5] = +tan */
+        float t = f[5] * (4.0f / 3.0f);
+        float sec = sqrtf(1.0f + t * t);
+        f[2] = sec; f[3] = -t; f[4] = sec; f[5] = t;
+        { static float said;
+          if (wide_log() && t != said) {
+              said = t;
+              fprintf(stderr, "[WIDE] t=%.1f culling: side slope %.4f (camera tan %.4f), radius factor %.4f\n",
+                      pad_now(), t, t * 0.75f, sec);
+          } }
+    }
+}
+
+extern void sub_00154420_gen(void);
+void sub_00154420(void)
+{
+    uint8_t *m = (uint8_t *)g_xbox_mem_offset;
+    uint32_t self = *(uint32_t *)(m + g_esp + 4);
+    uint32_t state = *(uint32_t *)(m + g_esp + 8);
+    uint32_t mat = *(uint32_t *)(m + g_esp + 12);
+    float *mf = NULL, keep[4];
+    int i;
+    if (state == 1 && wide_proj()) {
+        if (mat == 0xFFFFFFFFu && self >= 0x10000u && self + 0x68u < (64u << 20)) {
+            uint32_t top = *(uint32_t *)(m + self + 0x64);
+            if (top >= 0x10000u && top + 4u < (64u << 20))
+                mat = *(uint32_t *)(m + top);
+        }
+        if (mat >= 0x10000u && mat != 0xFFFFFFFFu && mat + 64u < (64u << 20)) {
+            float *p = (float *)(m + mat);
+            /* Perspective: w comes from z (m23) and not from the constant
+             * (m33). An orthographic projection is a 2D overlay -- left to
+             * the renderer. */
+            if (p[11] != 0.0f && p[15] == 0.0f) {
+                mf = p;
+                for (i = 0; i < 4; i++) { keep[i] = p[i * 4]; p[i * 4] *= 0.75f; }
+            }
+            if (wide_log()) {
+                static int n;
+                if (n++ < 40)
+                    fprintf(stderr, "[WIDE] t=%.1f SetTransform(PROJECTION) %08X: %s m00 %.3f m11 %.3f "
+                            "m22 %.3f m23 %.3f m32 %.3f m33 %.3f\n", pad_now(), mat,
+                            mf ? "perspective, widened" : "not perspective, left",
+                            mf ? keep[0] : p[0], p[5], p[10], p[11], p[14], p[15]);
+            }
+        }
+    }
+    sub_00154420_gen();
+    if (mf)
+        for (i = 0; i < 4; i++) mf[i * 4] = keep[i];
+}
+
+
 /* ---- a graffiti mesh's draw ---------------------------------------------------
  * sub_00042EE0 (ecx = the spot's mesh, spot +0x90) draws a sprayed spot: the
  * mesh's texture (+8: count, id) on stages 0-3, c0 = (256, 1, 0, 0.5), and per
@@ -3458,6 +3688,8 @@ void sub_000A5070(void)
     }
     save_menu_open_step();
     mission_at_step();
+    find_proj_step();
+    wide_reapply_step();
     if (cam >= 0x10000u && cam + 0x240u < lim) {
         uint32_t who = ((const uint32_t *)(m + cam))[0x24 / 4];
         if (who >= 0x10000u && who + 0x1000u < lim) {

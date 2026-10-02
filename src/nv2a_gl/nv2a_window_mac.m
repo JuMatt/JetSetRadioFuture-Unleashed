@@ -135,9 +135,16 @@ static void nv_window_colour_space(void)
         /* The frame keeps its shape. The window can be resized and can go
          * full screen, and a 4:3 picture stretched over a 16:10 screen is not
          * the picture: black bars instead, the frame centred between them. */
-        static int fw = 640, fh = 480;
-        int dw = vw, dh = vh;
-        if (pw > 0 && ph > 0) { fw = pw; fh = ph; }
+        static int lw = 640, lh = 480;
+        int fw, fh, dw = vw, dh = vh;
+        extern int nv2a_wide_scene(void);
+        if (pw > 0 && ph > 0) { lw = pw; lh = ph; }
+        fw = lw; fh = lh;
+        /* Widescreen: the frame holds a 16:9 view squeezed into 4:3
+         * (nv2a_widescreen in nv2a_gl.c) -- shown at 16:9 it is the right
+         * shape again. A scene the game kept 4:3 (the title) keeps its
+         * shape too, between black bars. */
+        if (nv2a_wide_scene()) { fw = 16; fh = 9; }
         if ((long)vw * fh > (long)vh * fw) dw = (int)((long)vh * fw / fh);
         else                               dh = (int)((long)vw * fh / fw);
         glViewport((vw - dw) / 2, (vh - dh) / 2, dw, dh);
@@ -320,13 +327,64 @@ int nv_window_pref_scale(void)
     }
 }
 
+/* Video > Widescreen (16:9), stored as the "widescreen" default; applied at
+ * once (nv2a_set_widescreen). RECOMP_WIDESCREEN in the environment wins
+ * (nv2a_widescreen in nv2a_gl.c reads it first). */
+int nv_window_pref_widescreen(void);
+int nv_window_pref_widescreen(void)
+{
+    @autoreleasepool {
+        return [[NSUserDefaults standardUserDefaults] boolForKey:@"widescreen"] ? 1 : 0;
+    }
+}
+
+/* The window in the picture's shape: 16:9 or 4:3, keeping its height (and
+ * fitting the screen). Not while full screen -- the frame is letterboxed
+ * there anyway. */
+static void nv_window_shape_for_mode(void)
+{
+    extern int nv2a_widescreen(void);
+    double aw = nv2a_widescreen() ? 16.0 : 4.0, ah = nv2a_widescreen() ? 9.0 : 3.0;
+    NSRect content;
+    if (!g_window) return;
+    [g_window setContentAspectRatio:NSMakeSize(aw, ah)];
+    if ([g_window styleMask] & NSWindowStyleMaskFullScreen) return;
+    content = [g_window contentRectForFrameRect:[g_window frame]];
+    {
+        double h = content.size.height, w = h * aw / ah;
+        NSScreen *scr = [g_window screen] ? [g_window screen] : [NSScreen mainScreen];
+        if (scr) {
+            NSRect vis = [scr visibleFrame];
+            double maxw = vis.size.width - 40.0;
+            if (w > maxw) { w = maxw; h = w * ah / aw; }
+        }
+        content.origin.x += (content.size.width - w) / 2.0;
+        content.size.width = w;
+        content.size.height = h;
+        [g_window setFrame:[g_window frameRectForContentRect:content] display:YES animate:NO];
+    }
+}
+
 @interface NvMenuTarget : NSObject
 - (void)pickScale:(id)sender;
+- (void)toggleWidescreen:(id)sender;
 - (void)showKeys:(id)sender;
 - (void)showPad:(id)sender;
 @end
 
 @implementation NvMenuTarget
+- (void)toggleWidescreen:(id)sender
+{
+    extern int nv2a_widescreen(void);
+    extern void nv2a_set_widescreen(int on);
+    int on = !nv2a_widescreen();
+    nv2a_set_widescreen(on);
+    [[NSUserDefaults standardUserDefaults] setBool:(on ? YES : NO) forKey:@"widescreen"];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    [(NSMenuItem *)sender setState:on ? NSControlStateValueOn : NSControlStateValueOff];
+    nv_window_shape_for_mode();
+    fprintf(stderr, "[WIN] widescreen %s\n", on ? "on (16:9)" : "off (4:3)");
+}
 - (void)showPad:(id)sender
 {
     NSAlert *a = [[NSAlert alloc] init];
@@ -472,6 +530,18 @@ static void build_menu(void)
         [video addItem:[NSMenuItem separatorItem]];
         [video addItem:fs];
     }
+    {
+        /* Cmd+Shift+W: Cmd+W alone closes windows everywhere else. */
+        extern int nv2a_widescreen(void);
+        NSMenuItem *ws = [[NSMenuItem alloc] initWithTitle:@"Widescreen (16:9)"
+                                                   action:@selector(toggleWidescreen:)
+                                            keyEquivalent:@"W"];
+        [ws setKeyEquivalentModifierMask:(NSEventModifierFlagCommand |
+                                          NSEventModifierFlagShift)];
+        [ws setTarget:g_menu_target];
+        [ws setState:nv2a_widescreen() ? NSControlStateValueOn : NSControlStateValueOff];
+        [video addItem:ws];
+    }
     [videoItem setSubmenu:video];
     [bar addItem:videoItem];
 
@@ -535,6 +605,10 @@ int nv_window_prepare(int width, int height, const char *title)
          * on a Retina screen, about a pixel-for-pixel picture in a window
          * that fits). RECOMP_WINDOW_FIT=0: the size as asked.
          */
+        /* Widescreen: the same height, 16:9 wide. */
+        { extern int nv2a_widescreen(void);
+          if (nv2a_widescreen() && (long)height * 4 == (long)width * 3)
+              width = height * 16 / 9; }
         { const char *e = getenv("RECOMP_WINDOW_FIT");
           NSScreen *scr = [NSScreen mainScreen];
           if (scr && !(e && e[0] == '0')) {
@@ -551,6 +625,7 @@ int nv_window_prepare(int width, int height, const char *title)
               if (k < 1.0) {
                   int w2 = (int)(width * k), h2 = (int)(height * k);
                   if ((long)height * 4 == (long)width * 3) h2 = w2 * 3 / 4;
+                  if ((long)height * 16 == (long)width * 9) h2 = w2 * 9 / 16;
                   fprintf(stderr, "[WIN] %dx%d does not fit the screen (%.0fx%.0f "
                           "points free, %.0fx backing): %dx%d\n", width, height,
                           vis.size.width, vis.size.height,
@@ -572,7 +647,9 @@ int nv_window_prepare(int width, int height, const char *title)
         [g_window setDelegate:[[NvWindowDelegate alloc] init]];
         /* Resizable, in the picture's shape; and it can go full screen (the
          * green button, or Video > Enter Full Screen, Ctrl+Cmd+F). */
-        [g_window setContentAspectRatio:NSMakeSize(4.0, 3.0)];
+        { extern int nv2a_widescreen(void);
+          [g_window setContentAspectRatio:nv2a_widescreen() ? NSMakeSize(16.0, 9.0)
+                                                            : NSMakeSize(4.0, 3.0)]; }
         [g_window setContentMinSize:NSMakeSize(320.0, 240.0)];
         [g_window setCollectionBehavior:NSWindowCollectionBehaviorFullScreenPrimary];
         [g_window center];

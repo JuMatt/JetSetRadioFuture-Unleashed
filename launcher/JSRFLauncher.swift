@@ -348,8 +348,8 @@ final class Launcher: NSObject, NSApplicationDelegate {
         // register dump and the guest call chain were gone.
         //
         // Each run's log is moved aside under a timestamp before the new one
-        // opens, and the twenty most recent are kept -- a few hundred MB at
-        // worst, against a crash that may take a dozen launches to see again.
+        // opens, and the five most recent are kept: they live in the player's
+        // game folder, and a run's log can reach a few tens of MB.
         let fm = FileManager.default
         let history = base.appendingPathComponent("logs")
         try? fm.createDirectory(at: history, withIntermediateDirectories: true)
@@ -361,8 +361,8 @@ final class Launcher: NSObject, NSApplicationDelegate {
         }
         if let kept = try? fm.contentsOfDirectory(atPath: history.path)
                               .filter({ $0.hasPrefix("run-") }).sorted(),
-           kept.count > 20 {
-            for old in kept.prefix(kept.count - 20) {
+           kept.count > 5 {
+            for old in kept.prefix(kept.count - 5) {
                 try? fm.removeItem(at: history.appendingPathComponent(old))
             }
         }

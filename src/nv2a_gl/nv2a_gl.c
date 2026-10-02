@@ -2677,6 +2677,45 @@ static void surface_sync(void)
     }
 }
 
+/* ---- widescreen ---------------------------------------------------------
+ *
+ * The title only ever draws 4:3. In widescreen mode the port widens its
+ * camera (jsrf-recomp recomp_manual.c: m00 = 0.75 for every perspective
+ * projection, culling widened to match), so the 640x480 frame holds a 16:9
+ * view squeezed horizontally and the window shows it stretched back to
+ * 16:9. Everything 3D comes out right that way; what does not is 2D drawn
+ * in screen pixels -- the HUD, text, menus -- which would be stretched. Those
+ * draws come through D3D's XYZRHW pass-through program (inputs 0x1F9B), and
+ * this squeezes them by the same 3/4 about the centre, so they keep their
+ * shape and sit in the middle 4:3. A pass-through draw that spans (nearly)
+ * the whole width -- a backdrop, a fade, the copy of the scene to the
+ * display -- is left to fill the screen. RECOMP_WIDESCREEN=1/0 overrides the
+ * window's Video > Widescreen choice. */
+static int g_wide = -1;
+int nv2a_widescreen(void)
+{
+    if (g_wide < 0) {
+        const char *v = getenv("RECOMP_WIDESCREEN");
+        extern int nv_window_pref_widescreen(void) __attribute__((weak));
+        if (v && *v) g_wide = atoi(v) != 0;
+        else g_wide = (getenv("RECOMP_WINDOW") && nv_window_pref_widescreen)
+                    ? (nv_window_pref_widescreen() != 0) : 0;
+    }
+    return g_wide;
+}
+void nv2a_set_widescreen(int on) { g_wide = on ? 1 : 0; }
+/* Whether the scene on screen is one the game side widened. A title can
+ * keep a screen 4:3 -- JSRF keeps its title and the boot logos that way,
+ * since their overlays put things just past the 4:3 edges that a 16:9 view
+ * would show -- and such a screen is shown pillarboxed in the 16:9 window,
+ * with nothing squeezed. Titles that never say anything are widened
+ * throughout. */
+static volatile int g_wide_scene = 1;
+void nv2a_set_wide_scene(int on) { g_wide_scene = on ? 1 : 0; }
+int nv2a_wide_scene(void) { return nv2a_widescreen() && g_wide_scene; }
+static int g_wide_squeeze;   /* this draw's 2D squeeze, set in do_draw */
+static float g_wide_ext[4];  /* its x and y extent, for the draw log */
+
 static void do_draw(void)
 {
     static float *vbuf;
@@ -3181,6 +3220,38 @@ static void do_draw(void)
         }
     }
 
+    g_wide_squeeze = 0;
+    memset(g_wide_ext, 0, sizeof g_wide_ext);
+    if (nv2a_wide_scene() && S.xf_mode != NV2A_XF_MODE_FIXED
+        && g_pcache[slot].inputs == 0x1F9B && attr_at[0] >= 0
+        && S.clip_w == 640 && S.clip_h == 480) {
+        float lo = 1e30f, hi = -1e30f, ylo = 1e30f, yhi = -1e30f;
+        uint32_t k3;
+        for (k3 = 0; k3 < out_n; k3++) {
+            const float *p3 = &vbuf[(size_t)k3 * stride_floats + (uint32_t)attr_at[0]];
+            if (p3[0] < lo) lo = p3[0];
+            if (p3[0] > hi) hi = p3[0];
+            if (p3[1] < ylo) ylo = p3[1];
+            if (p3[1] > yhi) yhi = p3[1];
+        }
+        /* In NDC, through the viewport the epilogue divides by: D3D's own
+         * copy of the scene to the display works in the surface's scaled
+         * pixels (0..2560 at 4x), the title's overlays in 640x480 ones. */
+        { float sx = fabsf(S.u.vp_scale[0]) > 1e-6f ? fabsf(S.u.vp_scale[0]) : 320.0f;
+          float sy = fabsf(S.u.vp_scale[1]) > 1e-6f ? fabsf(S.u.vp_scale[1]) : 240.0f;
+          lo = (lo - S.u.vp_off[0]) / sx; hi = (hi - S.u.vp_off[0]) / sx;
+          ylo = (ylo - S.u.vp_off[1]) / sy; yhi = (yhi - S.u.vp_off[1]) / sy; }
+        g_wide_ext[0] = lo; g_wide_ext[1] = hi; g_wide_ext[2] = ylo; g_wide_ext[3] = yhi;
+        /* Spanning (nearly) the whole width or the whole height: a backdrop,
+         * a fade, a frame -- left to fill the 16:9 screen. Anything smaller
+         * is an overlay and keeps its shape. */
+        if (hi - lo < 1.8f && yhi - ylo < 1.8f) g_wide_squeeze = 1;
+        /* RECOMP_WIDE_NOSQUEEZE=1 (test only): measure, never squeeze. */
+        { static int nosq = -1;
+          if (nosq < 0) nosq = getenv("RECOMP_WIDE_NOSQUEEZE") ? 1 : 0;
+          if (nosq) g_wide_squeeze = 0; }
+    }
+
     { PROF_T0();
       glBindVertexArray(g_vao);
       glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
@@ -3561,7 +3632,12 @@ static void do_draw(void)
         g_prof.n_const_upload++;
         g_prof.unif_vec4 += NV2A_VSH_NUM_CONSTS;
     }
-    if (memcmp(g_last.vp_scale, S.u.vp_scale, sizeof S.u.vp_scale)
+    /* Widescreen's 2D squeeze (see nv2a_widescreen): ndc.x is
+     * (x - vpOff.x) / vpScale.x, so 4/3 more scale is 3/4 the width. */
+    float vp_scale_eff[4];
+    memcpy(vp_scale_eff, S.u.vp_scale, sizeof vp_scale_eff);
+    if (g_wide_squeeze) vp_scale_eff[0] *= 4.0f / 3.0f;
+    if (memcmp(g_last.vp_scale, vp_scale_eff, sizeof vp_scale_eff)
      || memcmp(g_last.vp_off, S.u.vp_off, sizeof S.u.vp_off)) {
         /* The viewport, whenever it changes.
          *
@@ -3580,10 +3656,10 @@ static void do_draw(void)
                     S.u.vp_off[0], S.u.vp_off[1], S.u.vp_off[2], S.u.vp_off[3],
                     S.xf_mode);
         }
-        glUniform4fv(g_pcache[slot].u_vpScale, 1, S.u.vp_scale);
+        glUniform4fv(g_pcache[slot].u_vpScale, 1, vp_scale_eff);
         glUniform4fv(g_pcache[slot].u_vpOff, 1, S.u.vp_off);
         glUniform2f(g_pcache[slot].u_vpSurface, (float)g_fbo_w, (float)g_fbo_h);
-        memcpy(g_last.vp_scale, S.u.vp_scale, sizeof S.u.vp_scale);
+        memcpy(g_last.vp_scale, vp_scale_eff, sizeof vp_scale_eff);
         memcpy(g_last.vp_off, S.u.vp_off, sizeof S.u.vp_off);
     }
 
@@ -6449,7 +6525,7 @@ static void do_draw(void)
                 "vp %s tex0 %08X %ux%u f%02X en%d tex1 en%d "
                 "blend %d %04X/%04X depth %d/%d ctl %08X final %08X/%08X "
                 "| xf%u a9 off=%08X t%u s%u st%u u[%.3f..%.3f] v[%.3f..%.3f] "
-                "in%04X | sten %u f%X r%X m%X w%X op%X/%X/%X dfunc %X cm %08X\n",
+                "in%04X | sten %u f%X r%X m%X w%X op%X/%X/%X dfunc %X cm %08X%s\n",
                 (long)S.flips, S.since_present, out_n, S.prim, slot,
                 S.u.vp_off[0] > 100.0f ? "3D" : "2D",
                 S.tex[0].offset, S.tex[0].width, S.tex[0].height,
@@ -6463,7 +6539,12 @@ static void do_draw(void)
                 g_pcache[slot].inputs,
                 S.stencil_en, S.stencil_func, S.stencil_ref, S.stencil_fmask,
                 S.stencil_wmask, S.stencil_op[0], S.stencil_op[1], S.stencil_op[2],
-                (unsigned)S.depth_func, S.color_mask);
+                (unsigned)S.depth_func, S.color_mask,
+                g_wide_squeeze ? " | WIDE-SQUEEZED" : "");
+        if (nv2a_wide_scene() && g_pcache[slot].inputs == 0x1F9B)
+            fprintf(stderr, "[DRAW] f%ld %4u   2D ndc x[%.2f..%.2f] y[%.2f..%.2f]%s\n",
+                    (long)S.flips, S.since_present, g_wide_ext[0], g_wide_ext[1],
+                    g_wide_ext[2], g_wide_ext[3], g_wide_squeeze ? " squeezed" : "");
         /* And, for a fixed-function batch, how it is lit. */
         if (S.xf_mode == NV2A_XF_MODE_FIXED)
             fprintf(stderr, "[DRAW] f%ld %4u   lit %d mask %X colmat %02X ctl %X spec %u | sceneAmb %.3f %.3f %.3f matEm %.3f %.3f %.3f"
