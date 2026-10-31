@@ -4605,8 +4605,81 @@ void nv2a_set_picture(int pic, float screen, int apply)
 }
 static int g_wide_squeeze;   /* this draw's 2D squeeze, set in do_draw */
 static float g_wide_shift;   /* this draw's framed-3D move, title pixels, ditto */
+static float g_wide_anchor;  /* this draw's move to a screen edge, NDC (see wide_hud_sheet) */
 static Nv2aRenderState g_draw_rs;   /* the state this draw was given */
 static float g_wide_ext[4];  /* its x and y extent, for the draw log */
+
+/* ---- the HUD at the screen's edges, in widescreen ---------------------------
+ *
+ * The squeeze above keeps every overlay its shape by drawing it into the
+ * middle 4:3 of the wide screen. For menus and dialogue that is right -- they
+ * are compositions centred on the screen -- but the in-game HUD is pinned to
+ * the 4:3 screen's corners: the health bar, the spray cans and a race's rival
+ * at the top right, the gauge at the bottom right (the timer is at the top
+ * centre). Kept in the middle 4:3 they ended 82% of the way across a 16:9
+ * screen and 74% across 21:9.
+ *
+ * The HUD draws its pieces from one texture, a 256x256 DXT3 sheet of them --
+ * the bars, the digits, the can, the icons -- while the dialogue box, the
+ * menus and their text have sheets of their own. So a flat piece of that
+ * sheet drawn wholly in the right part of the 4:3 screen (from 0.1 of the
+ * half-width right of centre) goes with the right edge, one wholly in the
+ * left part with the left edge, and the rest -- the timer -- stays centred.
+ * Moved by the width the squeeze took away, 1 - s of the half-width (a
+ * quarter at 16:9), a piece is as far from its edge as on the console, in
+ * the screen's height. The HUD's few pieces drawn in 3D (the can, the icon of
+ * the rival in a race) come right after the flat ones and go with them.
+ *
+ * The sheet is told by its content, not by where it is in memory.
+ * RECOMP_WIDE_HUD=0: the HUD in the middle 4:3, as before. */
+static int wide_hud_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *v = getenv("RECOMP_WIDE_HUD"); on = !(v && v[0] == '0'); }
+    return on;
+}
+/* The content hash (tex_content) of the texture a stage is bound to, from
+ * the texture cache: 0 if it has not been made yet. */
+static uint32_t tcache_content_of(const TexStage *t)
+{
+    uint32_t key = (t->offset ^ (t->width << 16) ^ (t->height << 4) ^ t->color) * 2246822519u, i;
+    for (i = 0; i < TEX_CACHE; i++) {
+        uint32_t k = (key + i) % TEX_CACHE;
+        if (!g_tcache[k].used) break;
+        if (g_tcache[k].tex && g_tcache[k].offset == t->offset && g_tcache[k].format == t->color
+            && g_tcache[k].w == t->width && g_tcache[k].h == t->height)
+            return g_tcache[k].content;
+    }
+    return 0;
+}
+/* The sheet's tex_content: the same in every mission measured (City Rush,
+ * Dogenzaka Hill, the Fortified Residential Zone), wherever it is loaded. */
+#ifndef WIDE_HUD_SHEET
+#define WIDE_HUD_SHEET 0x35732389u
+#endif
+static int wide_hud_sheet(const TexStage *t)
+{
+    static uint32_t said[8]; static int nsaid;
+    static int mode = -1; static uint32_t want;
+    uint32_t c;
+    int i, hit;
+    if (!t->enabled || t->width != 256 || t->height != 256 || t->color != 0x0E) return 0;
+    if (mode < 0) {
+        /* RECOMP_WIDE_HUD_SHEET (test only): another hash, or @address. */
+        const char *v = getenv("RECOMP_WIDE_HUD_SHEET");
+        mode = (v && v[0] == '@') ? 1 : 0;
+        want = v ? (uint32_t)strtoul(v + mode, NULL, 16) : WIDE_HUD_SHEET;
+    }
+    c = tcache_content_of(t);
+    hit = mode ? t->offset == want : (c != 0 && c == want);
+    for (i = 0; i < nsaid; i++) if (said[i] == (t->offset ^ c)) break;
+    if (i == nsaid && nsaid < 8) {
+        said[nsaid++] = t->offset ^ c;
+        fprintf(stderr, "[WIDEHUD] 256x256 DXT3 at %08X, content %08X: %s\n", t->offset, c,
+                hit ? "the HUD's sheet" : "not the HUD's");
+    }
+    return hit;
+}
 
 /* One attribute array a draw reads, resolved once per draw: see do_draw. */
 typedef struct {
@@ -5861,6 +5934,36 @@ static void do_draw_body(void)
           if (nosq < 0) nosq = getenv("RECOMP_WIDE_NOSQUEEZE") ? 1 : 0;
           if (nosq) g_wide_squeeze = 0; }
     }
+    /* The HUD's pieces to the screen's edges (see wide_hud_sheet): a flat one
+     * by where it is; a 3D one, drawn right after a flat one that moved (or
+     * after a 3D one that did), with it. The pause screen draws its banners
+     * from the same sheet in 3D, with no flat piece of it before them, and
+     * they stay where they are. */
+    g_wide_anchor = 0.0f;
+    { static uint32_t hud_next = 0xFFFFFFFFu; static int hud_side;
+      if (nv2a_wide_scene() && wide_hud_on() && S.clip_w == 640 && S.clip_h == 480
+          && g_wide_s < 0.999f && S.tex[0].enabled) {
+          int flat = S.xf_mode != NV2A_XF_MODE_FIXED && g_pcache[slot].inputs == 0x1F9B;
+          if (flat && g_wide_squeeze && wide_hud_sheet(&S.tex[0])) {
+              hud_side = g_wide_ext[0] >= 0.1f ? 1 : g_wide_ext[1] <= -0.1f ? -1 : 0;
+              g_wide_anchor = (float)hud_side * (1.0f - g_wide_s);
+              hud_next = hud_side ? S.draws + 1 : 0xFFFFFFFFu;
+          } else if (!flat && out_n <= 32 && hud_side && S.draws == hud_next
+                     && wide_hud_sheet(&S.tex[0])) {
+              g_wide_anchor = (float)hud_side * (1.0f - g_wide_s);
+              hud_next = S.draws + 1;
+          }
+          if (g_wide_anchor != 0.0f) {
+              static int said;
+              if (said < 24) {
+                  said++;
+                  fprintf(stderr, "[WIDEHUD] flip %u draw %u: %s, %u vertices, x %.2f..%.2f y %.2f..%.2f "
+                          "-> %s edge (%+.3f)\n", S.flips, S.since_present, flat ? "flat" : "3D", out_n,
+                          g_wide_ext[0], g_wide_ext[1], g_wide_ext[2], g_wide_ext[3],
+                          g_wide_anchor > 0.0f ? "the right" : "the left", (double)g_wide_anchor);
+              }
+          }
+      } }
     /*
      * A 3D view inside a 2D frame -- the character select's two windows onto
      * the stage, a split screen. The title points it at a part of the screen
@@ -6319,11 +6422,24 @@ static void do_draw_body(void)
      * (x - vpOff.x) / vpScale.x, so 1/s more scale is s the width (at 16:9,
      * 4/3 more scale and 3/4 the width). */
     float vp_scale_eff[4];
+    float wshift = g_wide_shift;
     memcpy(vp_scale_eff, S.u.vp_scale, sizeof vp_scale_eff);
     if (g_wide_squeeze) vp_scale_eff[0] *= 1.0f / g_wide_s;
+    /* A HUD piece's move to the edge (g_wide_anchor, NDC) in the shift's
+     * title pixels: the fixed-function epilogue divides by half the surface,
+     * a program's by its viewport scale -- squeezed or not -- and then maps
+     * the viewport onto the surface (vpRect). */
+    if (g_wide_anchor != 0.0f) {
+        float half = 0.5f * (float)g_fbo_w;
+        if (S.xf_mode == NV2A_XF_MODE_FIXED) wshift -= g_wide_anchor * half;
+        else {
+            float rz = fabsf(S.u.vp_scale[0]) > 1e-6f ? fabsf(S.u.vp_scale[0]) : half;
+            wshift -= g_wide_anchor * vp_scale_eff[0] * half / rz;
+        }
+    }
     if (memcmp(g_last.vp_scale, vp_scale_eff, sizeof vp_scale_eff)
      || memcmp(g_last.vp_off, S.u.vp_off, sizeof S.u.vp_off)
-     || g_last.wide_shift != g_wide_shift
+     || g_last.wide_shift != wshift
      || g_last.fbo_w != g_fbo_w || g_last.fbo_h != g_fbo_h) {
         /* The viewport, whenever it or the surface it is on changes: vpSurface
          * and vpRect hold the surface's size, and a title can draw to a
@@ -6364,10 +6480,10 @@ static void do_draw_body(void)
             }
             G->uniform_f(NV2A_U_VPRECT, r, 1);
         }
-        uni1f(NV2A_U_WIDESHIFT, g_wide_shift);
+        uni1f(NV2A_U_WIDESHIFT, wshift);
         memcpy(g_last.vp_scale, vp_scale_eff, sizeof vp_scale_eff);
         memcpy(g_last.vp_off, S.u.vp_off, sizeof S.u.vp_off);
-        g_last.wide_shift = g_wide_shift;
+        g_last.wide_shift = wshift;
         g_last.fbo_w = g_fbo_w; g_last.fbo_h = g_fbo_h;
     }
 
@@ -6673,6 +6789,10 @@ static void do_draw_body(void)
           if (g_wide_squeeze || g_wide_shift != 0.0f) {
               float c = 0.5f * (float)g_fbo_w;
               float a = c + g_wide_s * ((float)cx0 - c), b = c + g_wide_s * ((float)cx1 - c);
+              /* A HUD piece moved to an edge takes its 4:3 screen with it:
+               * what the title parks past that screen's edge stays out of
+               * sight, past the wide screen's. */
+              if (g_wide_squeeze) { a += g_wide_anchor * c; b += g_wide_anchor * c; }
               cx0 = a > 0.0f ? (uint32_t)floorf(a) : 0u;
               cx1 = b > 0.0f ? (uint32_t)ceilf(b) : 0u;
               clip = 1;
@@ -9418,7 +9538,7 @@ static void do_draw_body(void)
                 "blend %d %04X/%04X depth %d/%d ctl %08X final %08X/%08X "
                 "| xf%u a9 off=%08X t%u s%u st%u u[%.3f..%.3f] v[%.3f..%.3f] "
                 "in%04X | sten %u f%X r%X m%X w%X op%X/%X/%X dfunc %X cm %08X | cull %d %X %X zc %X"
-                " | a0 off=%08X st%u p0 %.3f %.3f %.3f box %.3f..%.3f %.3f..%.3f %.3f..%.3f%s%s\n",
+                " | a0 off=%08X st%u p0 %.3f %.3f %.3f box %.3f..%.3f %.3f..%.3f %.3f..%.3f%s%s%s\n",
                 (long)S.flips, S.since_present, out_n, S.prim, slot,
                 S.u.vp_off[0] > 100.0f ? "3D" : "2D",
                 S.tex[0].offset, S.tex[0].width, S.tex[0].height,
@@ -9437,7 +9557,8 @@ static void do_draw_body(void)
                 S.attr[0].offset, S.attr[0].stride, p0[0], p0[1], p0[2],
                 plo[0], phi[0], plo[1], phi[1], plo[2], phi[2],
                 g_imm_drawing ? " | IMMEDIATE" : "",
-                g_wide_squeeze ? " | WIDE-SQUEEZED" : "");
+                g_wide_squeeze ? " | WIDE-SQUEEZED" : "",
+                g_wide_anchor > 0.0f ? " | HUD-RIGHT" : g_wide_anchor < 0.0f ? " | HUD-LEFT" : "");
         if (nv2a_wide_scene() && g_pcache[slot].inputs == 0x1F9B)
             fprintf(stderr, "[DRAW] f%ld %4u   2D ndc x[%.2f..%.2f] y[%.2f..%.2f]%s\n",
                     (long)S.flips, S.since_present, g_wide_ext[0], g_wide_ext[1],
