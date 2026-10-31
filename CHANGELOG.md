@@ -10,6 +10,44 @@ its version. Downloads are on the
 [Releases](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases)
 page.
 
+## 0.6.1 — 31 October 2026
+
+Widescreen: a 21:9 picture for ultrawide screens on Mac, Windows and Linux,
+the HUD at the edges of the screen, and the boost's heat haze over the whole
+picture. Every platform is new in 0.6.1.
+
+- **21:9 on Mac, Windows and Linux.** The Video menu has three pictures now:
+  **4:3**, **Widescreen (16:9)** and **Ultrawide (21:9)** — ⇧ ⌘ W and ⇧ ⌘ U on
+  the Mac, **Video › Picture** on Windows, and **F10** goes round the three on
+  Windows and Linux. On an ultrawide screen 21:9 is the screen's own shape
+  (2560×1080 and 5120×2160 are 2.37:1, 3440×1440 2.39:1, up to 2.4:1), so in
+  full screen the picture fills it; on any other screen it shows 21:9 between
+  bars above and below. As with 16:9 it is a wider view, not a stretch: the
+  camera sees more of the city at the sides and the game culls against it. The
+  choice is remembered (`widescreen=` and `ultrawide=` in the settings on
+  Windows and Linux).
+- **The HUD at the screen's edges.** In widescreen the HUD stayed where it
+  was on a 4:3 screen, in the middle of the wider one: the health bar ended
+  82% of the way across a 16:9 screen and 74% across 21:9. The health bar,
+  the spray cans, a race's rival and the gauge now sit at the right edge, as
+  far from it as on the console; the timer stays at the top centre, and
+  menus, dialogue and their text stay in the middle. On every widescreen
+  picture: the iPhone's Fill the screen and Android's 16:9 too.
+  `RECOMP_WIDE_HUD=0` puts the HUD back in the middle.
+- **The boost's heat haze over the whole picture.** The boost dash bends the
+  scene behind you through a quad sized to fill a 4:3 view; in widescreen it
+  covered only the middle 4:3, and its edges showed as two vertical lines. It
+  now fills the screen, on every platform.
+- Tested on a Mac, against 0.6.0: City Rush with the boost at 16:9 and 21:9
+  on Metal and on OpenGL (the haze's edges gone, the HUD at the right edge,
+  60 frames a second throughout) and in 4:3 (unchanged), the Fortified
+  Residential Zone with the timer and a dialogue box (whole, in the middle),
+  Dogenzaka Hill, the pause screen (unchanged), and the picture switched
+  while playing, 16:9 → 21:9 → 4:3 → 16:9. Linux, and Windows under Wine, on
+  a 2560×1080 screen: the window opens at 21:9 from the stored choice, F10
+  goes round the three, full screen. The Android and iPhone builds were
+  built and checked, not run.
+
 ## 0.6.0 — 30 October 2026
 
 Faster where the game used to stall: the textures and shaders made while you
