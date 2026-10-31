@@ -2152,9 +2152,11 @@ static int voice_log_on(void)
     return on;
 }
 static uint32_t s_sndmgr;   /* the sound manager (task 5), seen by its update */
+static void jsrf_mixer_tick(void);
 extern void sub_00116E30_gen(void);
 void sub_00116E30(void)
 {
+    jsrf_mixer_tick();
     /* two voice slots: +0x6C with its state at +0xC4, +0x70 with +0xC0 */
     static const uint32_t hoff[2] = { 0x6C, 0x70 }, soff[2] = { 0xC4, 0xC0 };
     static uint32_t last[2][4];
@@ -4510,3 +4512,12 @@ static void jsrf_cam_counts(void)
             len += snprintf(line + len, sizeof line - len, " %05X:%lu", jsrf_camva[i], jsrf_camcnt[i]);
     fprintf(stderr, "%s\n", line); fflush(stderr);
 }
+
+/* Keep wrapper declarations/definitions in this file: manual_scan.py reads
+ * it directly when regenerating code and does not expand C includes. */
+extern void sub_0013AEB0_gen(void);
+extern void sub_0013EB30_gen(void);
+#include "jsrf_mixer_hooks.inc"
+void sub_0013AEB0(void) { jm_adxt_start(); }
+/* No CRI setter scaling: preserve the original game fades. */
+void sub_0013EB30(void) { sub_0013EB30_gen(); }

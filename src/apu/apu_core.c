@@ -20,6 +20,7 @@
  */
 
 #include "apu_state.h"
+#include "jsrf_mixer.h"
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -455,6 +456,7 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
               }
           } }
 
+        xbox_JsrfMixer_Master((int16_t *)d->monitor.frame_buf,chunk);
         xa2_submit_samples((const int16_t *)d->monitor.frame_buf, chunk);
         return;
     }
@@ -499,6 +501,7 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         if (!g_audio_muted)
             mixer_render(d->monitor.frame_buf, chunk);
 
+        xbox_JsrfMixer_Master((int16_t *)d->monitor.frame_buf,chunk);
         /* Copy to waveOut buffer */
         memcpy(out + out_offset * 2, d->monitor.frame_buf, chunk * 2 * sizeof(int16_t));
         out_offset += chunk;
@@ -1267,7 +1270,7 @@ static void mixer_render(int16_t frame_buf[][2], int num_samples)
         uint64_t inc = ((uint64_t)voice->sample_rate << 16) / 48000;
         uint64_t pos = voice->play_offset;
         uint64_t end = (uint64_t)total_frames << 16;
-        float vol = voice->volume;
+        float vol = voice->volume * xbox_JsrfMixer_SoftwareGain();
 
         for (int i = 0; i < num_samples; i++) {
             uint32_t src_frame = pos >> 16;
