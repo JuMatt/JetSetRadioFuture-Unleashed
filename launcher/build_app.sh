@@ -49,6 +49,15 @@ cat > "$app/Contents/Info.plist" <<PLIST
   <key>LSMinimumSystemVersion</key>    <string>12.0</string>
   <key>NSHighResolutionCapable</key>   <true/>
   <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
+  <!-- Game Mode: the app is a game, so while its window is in the system's
+       full screen macOS gives it priority on the CPU and GPU and a
+       low-latency Bluetooth mode, and takes them back when it leaves. The
+       window already is the full-screen kind Game Mode needs (the green
+       button, Video > Enter Full Screen); these are the keys macOS 14
+       matches and the one macOS 26 added. -->
+  <key>LSApplicationCategoryType</key>  <string>public.app-category.games</string>
+  <key>GCSupportsGameMode</key>         <true/>
+  <key>LSSupportsGameMode</key>         <true/>
   <!-- A disc image or the game's folder can be dropped on the app (or opened
        with it). Never the default app for either: double-clicking an .iso
        still mounts it. -->
