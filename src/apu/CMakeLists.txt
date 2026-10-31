@@ -10,6 +10,7 @@ set(XBOX_APU_SOURCES
     apu_vp.c
     apu_dsp.c
     apu_mmio_hook.c
+    jsrf_mixer.c
 )
 if(APPLE)
     # CoreAudio, which is in the system on macOS and iOS alike. The XAudio2
