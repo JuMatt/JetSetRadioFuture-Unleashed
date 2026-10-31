@@ -72,9 +72,10 @@ years has; on a laptop with two GPUs it asks for the dedicated one (NVIDIA or
 AMD). The **Video** menu at the top of the window sets the resolution, from
 1× to 6× the Xbox's 640×480 (2× by default; 6×, 3840×2880, is for a 4K
 screen; the game restarts to apply it), the anti-aliasing (SMAA, MSAA 2× to
-8×, or both), widescreen 16:9 and full screen, all of them remembered: the
-game starts the way it was left, in full screen or in a window
-(`--fullscreen` and `--windowed` choose for one start). The same are on
+8×, or both), the picture (4:3, 16:9, or 21:9 for an ultrawide screen) and
+full screen, all of them remembered: the game starts the way it was left, in
+full screen or in a window (`--fullscreen` and `--windowed` choose for one
+start). The same are on
 **F9**, **F8**, **F10** and **F11** (or Alt+Enter), which also work in full
 screen, where the menu is hidden. **Controls › Camera on the Right Stick**,
 or **F7**, turns the right-stick camera (below) off and on.
@@ -206,7 +207,7 @@ OpenGL 3.3 drivers and an X11 or Wayland desktop; SDL2 is bundled. The
 and where settings, saves and logs are kept.
 
 On Linux the keyboard layout is the same as below; **F11** (or Alt+Return)
-toggles full screen, **F10** widescreen, **F9** sets the resolution (1× to
+toggles full screen, **F10** the picture (4:3, 16:9, 21:9), **F9** sets the resolution (1× to
 6×; the game restarts to apply it), **F8** the anti-aliasing (SMAA, MSAA,
 or both) and **F7** turns the right-stick camera (below) off and on.
 
@@ -260,9 +261,12 @@ iPhone and on Android.
   apply it. Both are off by default.
 - **Renderer** — Metal (the default) or OpenGL. The game restarts to apply it.
 - **Full Screen** — Ctrl ⌘ F.
-- **Widescreen (16:9)** — ⇧ ⌘ W. The game is shown at 16:9 with a wider
-  field of view, not stretched; the HUD and text keep their shape. The title
-  screen stays 4:3.
+- **4:3**, **Widescreen (16:9)** — ⇧ ⌘ W, **Ultrawide (21:9)** — ⇧ ⌘ U. The
+  game is shown at that shape with a wider field of view, not stretched. On
+  an ultrawide screen 21:9 is the screen's own shape (2560×1080, 3440×1440,
+  up to 2.4:1), so the picture fills it; on any other screen it shows between
+  bars. The HUD keeps its shape and sits at the screen's edges; menus and
+  dialogue stay in the middle. The title screen stays 4:3.
 
 ## Status
 
@@ -274,7 +278,7 @@ Playable, early, and not yet played from start to finish.
 | New Game through the tutorial, the DJ K scene and Dogenzaka Hill | works — the part played and tested most |
 | Skating, grinding, tricks, graffiti, the pause map | works |
 | Music, sound effects, voices | works |
-| Widescreen 16:9 (and the whole screen, on iPhone) | works in game; the title screen stays 4:3 |
+| Widescreen 16:9 and 21:9 (and the whole screen, on iPhone) | works in game; the title screen stays 4:3 |
 | Linux build | boots, menus, starting a new game; far less played than the Mac build |
 | Windows build | tested under Wine |
 | iPhone / iPad build | plays on iPhone; less tested on iPads |

@@ -297,6 +297,10 @@ void nv_window_use_gl(void)
     });
 }
 
+static int   nv_window_picture_now(void);       /* the picture: 4:3, 16:9, 21:9 (below) */
+static float nv_window_screen_aspect(void);
+static void  nv_window_shape_for_mode(void);
+
 @interface NvWindowDelegate : NSObject <NSWindowDelegate>
 @end
 /* Whether any of the window can be seen: the Metal renderer does not ask
@@ -338,6 +342,14 @@ static void nv_window_note_refresh(void)
 {
     (void)n;
     nv_window_note_refresh();
+    /* 21:9 is the screen's own shape: on another screen, that one's. */
+    if (nv_window_picture_now() == 2 && !getenv("RECOMP_WIDE_ASPECT")) {
+        extern void nv2a_set_picture(int pic, float screen, int apply);
+        extern float nv2a_wide_aspect(void);
+        nv2a_set_picture(2, nv_window_screen_aspect(), 0);
+        fprintf(stderr, "[WIN] another screen: picture 21:9 at %.3f:1\n", (double)nv2a_wide_aspect());
+        nv_window_shape_for_mode();
+    }
 }
 @end
 
@@ -477,15 +489,42 @@ int nv_window_pref_scale(void)
     }
 }
 
-/* Video > Widescreen (16:9), stored as the "widescreen" default; applied at
- * once (nv2a_set_widescreen). RECOMP_WIDESCREEN in the environment wins
- * (nv2a_widescreen in nv2a_gl.c reads it first). */
+/* Video > 4:3, Widescreen (16:9), Ultrawide (21:9): the "widescreen" default
+ * as before, and "ultrawide" for 21:9 (nv2a_set_picture in nv2a_gl.c);
+ * applied at once. RECOMP_WIDESCREEN in the environment wins (nv2a_widescreen
+ * in nv2a_gl.c reads it first), and RECOMP_WIDE_ASPECT keeps its shape. */
 int nv_window_pref_widescreen(void);
 int nv_window_pref_widescreen(void)
 {
     @autoreleasepool {
         return [[NSUserDefaults standardUserDefaults] boolForKey:@"widescreen"] ? 1 : 0;
     }
+}
+static int nv_window_pref_picture(void)
+{
+    @autoreleasepool {
+        NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+        if (![d boolForKey:@"widescreen"]) return 0;
+        return [d boolForKey:@"ultrawide"] ? 2 : 1;
+    }
+}
+/* The picture shown now: 0 4:3, 1 16:9, 2 wider. */
+static int nv_window_picture_now(void)
+{
+    extern int nv2a_widescreen(void);
+    extern float nv2a_wide_aspect(void);
+    if (!nv2a_widescreen()) return 0;
+    return nv2a_wide_aspect() > 16.0f / 9.0f + 0.01f ? 2 : 1;
+}
+/* The shape of the screen the window is on (before there is a window, the
+ * main screen's). Main thread. */
+static float nv_window_screen_aspect(void)
+{
+    NSScreen *scr = (g_window && [g_window screen]) ? [g_window screen] : [NSScreen mainScreen];
+    NSRect f;
+    if (!scr) return 0.0f;
+    f = [scr frame];
+    return f.size.height > 0.0 ? (float)(f.size.width / f.size.height) : 0.0f;
 }
 
 /* Video > Renderer: Metal or OpenGL, stored as the "renderer" default
@@ -531,13 +570,14 @@ extern void nv2a_set_msaa(int n);
 extern int  nv2a_msaa_max(void);
 extern int  nv2a_msaa_live(void);
 
-/* The window in the picture's shape: 16:9 or 4:3, keeping its height (and
- * fitting the screen). Not while full screen -- the frame is letterboxed
- * there anyway. */
+/* The window in the picture's shape: 4:3, 16:9 or 21:9, keeping its height
+ * (and fitting the screen). Not while full screen -- the frame is
+ * letterboxed there anyway. */
 static void nv_window_shape_for_mode(void)
 {
     extern int nv2a_widescreen(void);
-    double aw = nv2a_widescreen() ? 16.0 : 4.0, ah = nv2a_widescreen() ? 9.0 : 3.0;
+    extern float nv2a_wide_aspect(void);
+    double aw = nv2a_widescreen() ? (double)nv2a_wide_aspect() * 9.0 : 4.0, ah = nv2a_widescreen() ? 9.0 : 3.0;
     NSRect content;
     if (!g_window) return;
     [g_window setContentAspectRatio:NSMakeSize(aw, ah)];
@@ -578,7 +618,7 @@ int nv_window_pref_rstick_camera(void)
 @interface NvMenuTarget : NSObject
 - (void)pickScale:(id)sender;
 - (void)pickRenderer:(id)sender;
-- (void)toggleWidescreen:(id)sender;
+- (void)pickPicture:(id)sender;
 - (void)toggleSmaa:(id)sender;
 - (void)pickMsaa:(id)sender;
 - (void)toggleRstickCamera:(id)sender;
@@ -724,17 +764,28 @@ int nv_window_pref_rstick_camera(void)
     [(NSMenuItem *)sender setState:on ? NSControlStateValueOn : NSControlStateValueOff];
     fprintf(stderr, "[WIN] camera on the right stick %s\n", on ? "on" : "off");
 }
-- (void)toggleWidescreen:(id)sender
+/* Video > 4:3, Widescreen (16:9), Ultrawide (21:9): the item's tag is the
+ * picture. */
+- (void)pickPicture:(id)sender
 {
-    extern int nv2a_widescreen(void);
-    extern void nv2a_set_widescreen(int on);
-    int on = !nv2a_widescreen();
-    nv2a_set_widescreen(on);
-    [[NSUserDefaults standardUserDefaults] setBool:(on ? YES : NO) forKey:@"widescreen"];
+    extern void nv2a_set_picture(int pic, float screen, int apply);
+    extern float nv2a_wide_aspect(void);
+    int pic = (int)[(NSMenuItem *)sender tag];
+    NSMenu *menu = [(NSMenuItem *)sender menu];
+    NSInteger i;
+    if (pic < 0 || pic > 2) return;
+    nv2a_set_picture(pic, nv_window_screen_aspect(), 1);
+    [[NSUserDefaults standardUserDefaults] setBool:(pic != 0 ? YES : NO) forKey:@"widescreen"];
+    [[NSUserDefaults standardUserDefaults] setBool:(pic == 2 ? YES : NO) forKey:@"ultrawide"];
     [[NSUserDefaults standardUserDefaults] synchronize];
-    [(NSMenuItem *)sender setState:on ? NSControlStateValueOn : NSControlStateValueOff];
+    for (i = 0; i < [menu numberOfItems]; i++) {
+        NSMenuItem *it = [menu itemAtIndex:i];
+        if ([it action] == @selector(pickPicture:))
+            [it setState:([it tag] == pic) ? NSControlStateValueOn : NSControlStateValueOff];
+    }
     nv_window_shape_for_mode();
-    fprintf(stderr, "[WIN] widescreen %s\n", on ? "on (16:9)" : "off (4:3)");
+    if (pic) fprintf(stderr, "[WIN] picture %s (%.3f:1)\n", pic == 2 ? "21:9" : "16:9", (double)nv2a_wide_aspect());
+    else     fprintf(stderr, "[WIN] picture 4:3\n");
 }
 - (void)showPad:(id)sender
 {
@@ -931,16 +982,23 @@ static void build_menu(void)
         [video addItem:fs];
     }
     {
-        /* Cmd+Shift+W: Cmd+W alone closes windows everywhere else. */
-        extern int nv2a_widescreen(void);
-        NSMenuItem *ws = [[NSMenuItem alloc] initWithTitle:@"Widescreen (16:9)"
-                                                   action:@selector(toggleWidescreen:)
-                                            keyEquivalent:@"W"];
-        [ws setKeyEquivalentModifierMask:(NSEventModifierFlagCommand |
-                                          NSEventModifierFlagShift)];
-        [ws setTarget:g_menu_target];
-        [ws setState:nv2a_widescreen() ? NSControlStateValueOn : NSControlStateValueOff];
-        [video addItem:ws];
+        /* The picture: 4:3, 16:9 (Cmd+Shift+W: Cmd+W alone closes windows
+         * everywhere else), 21:9 (Cmd+Shift+U). */
+        NSString *names[3] = { @"4:3", @"Widescreen (16:9)", @"Ultrawide (21:9)" };
+        NSString *keys[3] = { @"", @"W", @"U" };
+        int p, now = nv_window_picture_now();
+        [video addItem:[NSMenuItem separatorItem]];
+        for (p = 0; p < 3; p++) {
+            NSMenuItem *it = [[NSMenuItem alloc] initWithTitle:names[p]
+                                                       action:@selector(pickPicture:)
+                                                keyEquivalent:keys[p]];
+            if (p) [it setKeyEquivalentModifierMask:(NSEventModifierFlagCommand |
+                                                     NSEventModifierFlagShift)];
+            [it setTag:p];
+            [it setTarget:g_menu_target];
+            [it setState:(p == now) ? NSControlStateValueOn : NSControlStateValueOff];
+            [video addItem:it];
+        }
     }
     [videoItem setSubmenu:video];
     [bar addItem:videoItem];
@@ -1052,10 +1110,15 @@ int nv_window_prepare(int width, int height, const char *title)
          * on a Retina screen, about a pixel-for-pixel picture in a window
          * that fits). RECOMP_WINDOW_FIT=0: the size as asked.
          */
-        /* Widescreen: the same height, 16:9 wide. */
+        /* Widescreen: the same height, at the picture's shape (16:9, or
+         * 21:9 -- the stored choice's, unless the environment says). */
         { extern int nv2a_widescreen(void);
+          extern float nv2a_wide_aspect(void);
+          extern void nv2a_set_picture(int pic, float screen, int apply);
+          if (!getenv("RECOMP_WIDESCREEN") && !getenv("RECOMP_WIDE_ASPECT"))
+              nv2a_set_picture(nv_window_pref_picture(), nv_window_screen_aspect(), 0);
           if (nv2a_widescreen() && (long)height * 4 == (long)width * 3)
-              width = height * 16 / 9; }
+              width = (int)((float)height * nv2a_wide_aspect() + 0.5f); }
         { const char *e = getenv("RECOMP_WINDOW_FIT");
           NSScreen *scr = [NSScreen mainScreen];
           if (scr && !(e && e[0] == '0')) {
@@ -1071,8 +1134,8 @@ int nv_window_prepare(int width, int height, const char *title)
               }
               if (k < 1.0) {
                   int w2 = (int)(width * k), h2 = (int)(height * k);
-                  if ((long)height * 4 == (long)width * 3) h2 = w2 * 3 / 4;
-                  if ((long)height * 16 == (long)width * 9) h2 = w2 * 9 / 16;
+                  /* The shape kept exactly: from the width. */
+                  h2 = (int)((double)w2 * (double)height / (double)width + 0.5);
                   fprintf(stderr, "[WIN] %dx%d does not fit the screen (%.0fx%.0f "
                           "points free, %.0fx backing): %dx%d\n", width, height,
                           vis.size.width, vis.size.height,
@@ -1092,7 +1155,8 @@ int nv_window_prepare(int width, int height, const char *title)
         /* Resizable, in the picture's shape; and it can go full screen (the
          * green button, or Video > Enter Full Screen, Ctrl+Cmd+F). */
         { extern int nv2a_widescreen(void);
-          [g_window setContentAspectRatio:nv2a_widescreen() ? NSMakeSize(16.0, 9.0)
+          extern float nv2a_wide_aspect(void);
+          [g_window setContentAspectRatio:nv2a_widescreen() ? NSMakeSize((double)nv2a_wide_aspect() * 9.0, 9.0)
                                                             : NSMakeSize(4.0, 3.0)]; }
         [g_window setContentMinSize:NSMakeSize(320.0, 240.0)];
         [g_window setCollectionBehavior:NSWindowCollectionBehaviorFullScreenPrimary];
@@ -1279,9 +1343,8 @@ static void win_script_step(void)
         else if (!strcmp(a, "min")) [g_window miniaturize:nil];
         else if (!strcmp(a, "restore")) [g_window deminiaturize:nil];
         else if (!strcmp(a, "wide")) {
-            extern int nv2a_widescreen(void);
-            extern void nv2a_set_widescreen(int on);
-            nv2a_set_widescreen(!nv2a_widescreen());
+            extern void nv2a_set_picture(int pic, float screen, int apply);
+            nv2a_set_picture((nv_window_picture_now() + 1) % 3, nv_window_screen_aspect(), 1);
             nv_window_shape_for_mode();
         } else if (sscanf(a, "size %dx%d", &w, &h) == 2)
             [g_window setContentSize:NSMakeSize(w, h)];

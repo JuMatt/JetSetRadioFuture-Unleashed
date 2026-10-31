@@ -60,8 +60,11 @@ Keyboard (by key position, so W A S D on QWERTY is Z Q S D on AZERTY):
   C / V        left / right stick click
 
   F11 or Alt+Return   full screen
-  F10                 widescreen 16:9 (a wider view, not a stretch; the HUD
-                      keeps its shape, the title screen stays 4:3); remembered
+  F10                 the picture, in turn: 4:3, 16:9 (widescreen) and 21:9
+                      (ultrawide) -- a wider view, not a stretch; the HUD keeps
+                      its shape and sits at the screen's edges, the title
+                      screen stays 4:3; remembered. On an ultrawide screen
+                      21:9 is the screen's own shape (up to 2.4:1).
   F9                  resolution: the game is drawn at 1x to 6x the Xbox's
                       640x480 (2x by default), up to 3840x2880 -- 6x is for a
                       4K screen; remembered. The game restarts to apply it,

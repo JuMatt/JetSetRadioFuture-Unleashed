@@ -20,8 +20,8 @@
  * Settings, the cache, logs and unpacked disc images live in
  * %LOCALAPPDATA%\JSRF Unleashed -- or, portable, in the launcher's own folder
  * (see "portable" below). In game: F11 (or Alt+Enter) full screen, F10
- * widescreen 16:9. The game starts the way it was left, in full screen or in
- * a window; --fullscreen and --windowed choose for one start.
+ * the picture (4:3, 16:9, 21:9). The game starts the way it was left, in full
+ * screen or in a window; --fullscreen and --windowed choose for one start.
  */
 #define WIN32_LEAN_AND_MEAN
 #ifndef UNICODE

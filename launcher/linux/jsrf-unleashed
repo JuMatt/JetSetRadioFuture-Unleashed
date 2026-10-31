@@ -17,7 +17,7 @@
 #   ./jsrf-unleashed --version        which version this is
 #
 # A disc image (.iso) is unpacked once, by the game itself: nothing else to install.
-# In game: F11 (or Alt+Return) full screen, F10 widescreen 16:9, F9 resolution.
+# In game: F11 (or Alt+Return) full screen, F10 the picture (4:3, 16:9, 21:9), F9 resolution.
 #
 set -u
 HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"

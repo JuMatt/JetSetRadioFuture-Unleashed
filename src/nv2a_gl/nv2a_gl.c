@@ -1233,6 +1233,11 @@ static void pres_start(void);        /* the presenter, below */
 static void sdl_menu_init(void);     /* the menu bar, below */
 static int  sdl_cfg_get(const char *key, int def);   /* the settings file, below */
 #endif
+static int   sdl_pref_picture(void);     /* the picture (4:3, 16:9, 21:9), below */
+static int   sdl_picture_now(void);
+static float sdl_screen_aspect(void);
+float nv2a_wide_aspect(void);
+void  nv2a_set_picture(int pic, float screen, int apply);
 
 static int gl_init(uint32_t w, uint32_t h)
 {
@@ -1267,15 +1272,18 @@ static int gl_init(uint32_t w, uint32_t h)
     /* The window is not the game's resolution: the game draws 640x480, the
      * renderer works at a multiple of that (RECOMP_GL_SCALE), and the window
      * is whatever size the player makes it -- each frame is fitted into it
-     * (sdl_present). It opens at 1280x960, or 16:9 at that height when
-     * widescreen is on, shrunk to fit the screen. */
+     * (sdl_present). It opens at 1280x960, or at the picture's shape at that
+     * height in widescreen (16:9, or 21:9), shrunk to fit the screen. */
     {
         int ww = 1280, wh = 960;
         Uint32 flags = SDL_WINDOW_OPENGL | SDL_WINDOW_ALLOW_HIGHDPI | SDL_WINDOW_RESIZABLE;
         SDL_Rect usable;
         const char *e;
         (void)w; (void)h;
-        if (nv2a_widescreen()) ww = wh * 16 / 9;
+        /* The stored picture's shape, unless the environment says (tests). */
+        if (!getenv("RECOMP_WIDESCREEN") && !getenv("RECOMP_WIDE_ASPECT"))
+            nv2a_set_picture(sdl_pref_picture(), sdl_screen_aspect(), 0);
+        if (nv2a_widescreen()) ww = (int)((float)wh * nv2a_wide_aspect() + 0.5f);
         if (SDL_GetDisplayUsableBounds(0, &usable) == 0 && usable.h > 0 && usable.w > 0) {
             int maxh = usable.h * 9 / 10, maxw = usable.w * 9 / 10;
             if (wh > maxh) { ww = ww * maxh / wh; wh = maxh; }
@@ -1327,8 +1335,9 @@ static int gl_init(uint32_t w, uint32_t h)
 #if defined(_WIN32)
     sdl_menu_init();
 #endif
-    fprintf(stderr, "  [WIN] SDL window (%s video), %s\n", SDL_GetCurrentVideoDriver(),
-            nv2a_widescreen() ? "16:9" : "4:3");
+    fprintf(stderr, "  [WIN] SDL window (%s video), %s (%.3f:1; the screen %.3f:1)\n", SDL_GetCurrentVideoDriver(),
+            nv2a_widescreen() ? (sdl_picture_now() == 2 ? "21:9" : "16:9") : "4:3",
+            nv2a_widescreen() ? (double)nv2a_wide_aspect() : 4.0 / 3.0, (double)sdl_screen_aspect());
 
     fprintf(stderr, "  [GL] %s | %s | GLSL %s\n",
             (const char *)glGetString(GL_VERSION),
@@ -1349,6 +1358,7 @@ int  nv2a_widescreen(void);
 void nv2a_set_widescreen(int on);
 int  nv2a_wide_scene(void);
 float nv2a_wide_aspect(void);
+void nv2a_set_picture(int pic, float screen, int apply);
 
 /* $XDG_CONFIG_HOME/jsrf-unleashed/settings (or JSRF_SETTINGS_FILE): lines of
  * key=value, shared with the launcher script, which keeps game_dir and
@@ -1562,20 +1572,57 @@ static volatile int g_sdl_want_wide = -1;
 void nv_window_request_widescreen(int on);
 void nv_window_request_widescreen(int on) { g_sdl_want_wide = on ? 1 : 0; }
 
-static void sdl_toggle_widescreen(void)
+/* The picture -- 0 4:3, 1 16:9, 2 21:9 (nv2a_set_picture) -- kept as
+ * widescreen= and ultrawide= in the settings, the first as before, so the
+ * Android app's switch and an older version's choice still read right. */
+static int sdl_pref_picture(void)
 {
-    int on = !nv2a_widescreen();
-    nv2a_set_widescreen(on);
-    sdl_cfg_set("widescreen", on);
+    if (!sdl_cfg_get("widescreen", 0)) return 0;
+    return sdl_cfg_get("ultrawide", 0) ? 2 : 1;
+}
+/* The one shown now (RECOMP_WIDESCREEN and RECOMP_WIDE_ASPECT included). */
+static int sdl_picture_now(void)
+{
+    if (!nv2a_widescreen()) return 0;
+    return nv2a_wide_aspect() > 16.0f / 9.0f + 0.01f ? 2 : 1;
+}
+/* The shape of the screen the window is on (before there is a window, the
+ * first screen's); 0 if SDL cannot say. */
+static float sdl_screen_aspect(void)
+{
+    SDL_DisplayMode dm;
+    int d = g_window ? SDL_GetWindowDisplayIndex(g_window) : 0;
+    if (d < 0) d = 0;
+    if (SDL_GetDesktopDisplayMode(d, &dm) != 0 || dm.w <= 0 || dm.h <= 0) return 0.0f;
+    return (float)dm.w / (float)dm.h;
+}
+
+/* F10 (round 4:3, 16:9, 21:9), Video > Picture on Windows, and the Android
+ * app's widescreen switch (16:9 or 4:3). */
+static void sdl_set_picture(int pic)
+{
+    nv2a_set_picture(pic, sdl_screen_aspect(), 1);
+    sdl_cfg_set("widescreen", pic != 0);
+    sdl_cfg_set("ultrawide", pic == 2);
     /* A window (not full screen, not maximised) takes the new shape at the
-     * same height, as the Mac's does. */
+     * same height, as the Mac's does -- narrower if that would not fit. */
     if (!(SDL_GetWindowFlags(g_window) & (SDL_WINDOW_FULLSCREEN_DESKTOP | SDL_WINDOW_MAXIMIZED))) {
-        int ww, wh;
+        int ww, wh, nw;
+        SDL_Rect usable;
+        int d = SDL_GetWindowDisplayIndex(g_window);
         SDL_GetWindowSize(g_window, &ww, &wh);
-        SDL_SetWindowSize(g_window, on ? wh * 16 / 9 : wh * 4 / 3, wh);
+        nw = (int)((float)wh * (pic ? nv2a_wide_aspect() : 4.0f / 3.0f) + 0.5f);
+        if (SDL_GetDisplayUsableBounds(d < 0 ? 0 : d, &usable) == 0 && usable.w > 320
+            && nw > usable.w * 19 / 20) {
+            wh = wh * (usable.w * 19 / 20) / nw;
+            nw = usable.w * 19 / 20;
+        }
+        SDL_SetWindowSize(g_window, nw, wh);
     }
     sdl_menu_update();
-    fprintf(stderr, "[WIN] widescreen %s\n", on ? "on (16:9)" : "off (4:3)");
+    if (pic) fprintf(stderr, "[WIN] picture %s (%.3f:1)\n", pic == 2 ? "21:9" : "16:9",
+                     (double)nv2a_wide_aspect());
+    else     fprintf(stderr, "[WIN] picture 4:3\n");
 }
 
 /* F9: the internal resolution, 1x to 6x the Xbox's 640x480 (4x on Android,
@@ -1755,20 +1802,21 @@ static void sdl_toggle_rstick_camera(void)
 #if defined(_WIN32)
 /*
  * The window's menu bar (Windows): Video -- the resolution, anti-aliasing,
- * widescreen and full screen, which is what the Mac's Video menu has and what
- * F9, F8, F10 and F11 do. Not in full screen, where it would sit across the
- * top of the picture; the keys work there, and leaving full screen brings it
- * back. SDL hands the menu's WM_COMMAND over as a system event (sdl_pump).
+ * the picture (4:3, 16:9, 21:9) and full screen, which is what the Mac's
+ * Video menu has and what F9, F8, F10 and F11 do. Not in full screen, where
+ * it would sit across the top of the picture; the keys work there, and
+ * leaving full screen brings it back. SDL hands the menu's WM_COMMAND over
+ * as a system event (sdl_pump).
  *
  * Holding a menu open holds the thread that owns the window, which is the
  * one that runs the GPU, so the game waits while it is open -- as a pause
  * menu would. Choosing a resolution asks before it restarts.
  */
 #include <SDL2/SDL_syswm.h>
-enum { MENU_RES1 = 101, MENU_WIDE = 110, MENU_FULL = 111, MENU_SMAA = 120, MENU_MSAA1 = 121,
+enum { MENU_RES1 = 101, MENU_FULL = 111, MENU_PIC1 = 112, MENU_SMAA = 120, MENU_MSAA1 = 121,
        MENU_RCAM = 130 };
 static HWND  g_menu_hwnd;
-static HMENU g_menu_bar, g_menu_video, g_menu_res, g_menu_aa, g_menu_controls;
+static HMENU g_menu_bar, g_menu_video, g_menu_res, g_menu_aa, g_menu_pic, g_menu_controls;
 
 static void sdl_menu_update(void)
 {
@@ -1777,8 +1825,8 @@ static void sdl_menu_update(void)
     for (i = 1; i <= NV2A_SCALE_MAX; i++)
         CheckMenuItem(g_menu_res, MENU_RES1 + i - 1,
                       MF_BYCOMMAND | (i == cur ? MF_CHECKED : MF_UNCHECKED));
-    CheckMenuItem(g_menu_video, MENU_WIDE,
-                  MF_BYCOMMAND | (nv2a_widescreen() ? MF_CHECKED : MF_UNCHECKED));
+    if (g_menu_pic)
+        CheckMenuRadioItem(g_menu_pic, MENU_PIC1, MENU_PIC1 + 2, MENU_PIC1 + sdl_picture_now(), MF_BYCOMMAND);
     /* Anti-aliasing: what is asked for, and only what the device can do. */
     CheckMenuItem(g_menu_aa, MENU_SMAA, MF_BYCOMMAND | (g_smaa_want ? MF_CHECKED : MF_UNCHECKED));
     EnableMenuItem(g_menu_aa, MENU_SMAA,
@@ -1817,7 +1865,8 @@ static void sdl_menu_init(void)
     g_menu_video = CreatePopupMenu();
     g_menu_res   = CreatePopupMenu();
     g_menu_aa    = CreatePopupMenu();
-    if (!g_menu_bar || !g_menu_video || !g_menu_res || !g_menu_aa) { g_menu_bar = NULL; return; }
+    g_menu_pic   = CreatePopupMenu();
+    if (!g_menu_bar || !g_menu_video || !g_menu_res || !g_menu_aa || !g_menu_pic) { g_menu_bar = NULL; return; }
     AppendMenuW(g_menu_res, MF_STRING, MENU_RES1 + 0, L"1x  (640 x 480)");
     AppendMenuW(g_menu_res, MF_STRING, MENU_RES1 + 1, L"2x  (1280 x 960)");
     AppendMenuW(g_menu_res, MF_STRING, MENU_RES1 + 2, L"3x  (1920 x 1440)");
@@ -1831,8 +1880,11 @@ static void sdl_menu_init(void)
     AppendMenuW(g_menu_aa, MF_STRING, MENU_MSAA1 + 2, L"MSAA &4x");
     AppendMenuW(g_menu_aa, MF_STRING, MENU_MSAA1 + 3, L"MSAA &8x");
     AppendMenuW(g_menu_video, MF_POPUP, (UINT_PTR)g_menu_res, L"&Resolution\tF9");
+    AppendMenuW(g_menu_pic, MF_STRING, MENU_PIC1 + 0, L"&4:3");
+    AppendMenuW(g_menu_pic, MF_STRING, MENU_PIC1 + 1, L"16:9  (&widescreen)");
+    AppendMenuW(g_menu_pic, MF_STRING, MENU_PIC1 + 2, L"21:9  (&ultrawide)");
     AppendMenuW(g_menu_video, MF_POPUP, (UINT_PTR)g_menu_aa, L"&Anti-aliasing\tF8");
-    AppendMenuW(g_menu_video, MF_STRING, MENU_WIDE, L"&Widescreen\tF10");
+    AppendMenuW(g_menu_video, MF_POPUP, (UINT_PTR)g_menu_pic, L"&Picture\tF10");
     AppendMenuW(g_menu_video, MF_STRING, MENU_FULL, L"&Full screen\tF11");
     AppendMenuW(g_menu_bar, MF_POPUP, (UINT_PTR)g_menu_video, L"&Video");
     if ((g_menu_controls = CreatePopupMenu()) != NULL) {
@@ -1867,8 +1919,8 @@ static void sdl_menu_command(unsigned id)
         box.buttons = b;
         if (SDL_ShowMessageBox(&box, &ans) == 0 && ans == 1) sdl_restart_at(pick, 0);
         sdl_keys_release();
-    } else if (id == MENU_WIDE) {
-        sdl_toggle_widescreen();
+    } else if (id >= MENU_PIC1 && id < MENU_PIC1 + 3) {
+        sdl_set_picture((int)(id - MENU_PIC1));
     } else if (id == MENU_FULL) {
         sdl_fullscreen_by_player();
     } else if (id == MENU_SMAA) {
@@ -2309,7 +2361,7 @@ static void sdl_pump(void)
     if (g_sdl_want_wide >= 0) {
         int want = g_sdl_want_wide;
         g_sdl_want_wide = -1;
-        if (want != nv2a_widescreen()) sdl_toggle_widescreen();
+        if (want != nv2a_widescreen()) sdl_set_picture(want ? 1 : 0);
     }
     if (g_sdl_want_rcam >= 0) {
         int want = g_sdl_want_rcam;
@@ -2331,7 +2383,7 @@ static void sdl_pump(void)
                     sdl_fullscreen_by_player();
                     break;
                 }
-                if (k == SDL_SCANCODE_F10) { sdl_toggle_widescreen(); break; }
+                if (k == SDL_SCANCODE_F10) { sdl_set_picture((sdl_picture_now() + 1) % 3); break; }
                 if (k == SDL_SCANCODE_F9)  { sdl_choose_scale(); break; }
                 if (k == SDL_SCANCODE_F8)  { sdl_choose_aa(); break; }
                 if (k == SDL_SCANCODE_F7)  { sdl_toggle_rstick_camera(); break; }
@@ -2348,6 +2400,15 @@ static void sdl_pump(void)
                 g_sdl_kb_buttons = 0;
                 for (i = 0; i < 8; i++) g_sdl_kb_analog[i] = 0;
             }
+#if SDL_VERSION_ATLEAST(2, 0, 18)
+            /* 21:9 is the screen's own shape: moved to another screen, the
+             * window takes that one's. */
+            if (ev.window.event == SDL_WINDOWEVENT_DISPLAY_CHANGED && sdl_picture_now() == 2
+                && !getenv("RECOMP_WIDE_ASPECT")) {
+                nv2a_set_picture(2, sdl_screen_aspect(), 0);
+                fprintf(stderr, "[WIN] another screen: picture 21:9 at %.3f:1\n", (double)nv2a_wide_aspect());
+            }
+#endif
             break;
 #if defined(_WIN32)
         case SDL_SYSWMEVENT:
@@ -4518,6 +4579,30 @@ void nv2a_set_wide_aspect(float a)
 }
 float nv2a_wide_aspect(void) { return g_wide_aspect; }
 float nv2a_wide_squeeze(void) { return g_wide_s; }
+/* The windows' Video menus (Mac, Windows, Linux) offer three pictures: 4:3,
+ * 16:9 and 21:9. "21:9" is an ultrawide screen's own shape when the window
+ * is on one -- 2560x1080 is 2.370:1, 3440x1440 2.389:1, 3840x1600 2.4:1 --
+ * so the picture fills it exactly; on any other screen it is 64:27, the
+ * 2.370:1 that "21:9" is sold as, between bars above and below. */
+float nv2a_ultrawide_aspect(float screen);
+float nv2a_ultrawide_aspect(float screen)
+{
+    if (screen >= 2.2f) return screen < 2.4f ? screen : 2.4f;
+    return 64.0f / 27.0f;
+}
+/* A window's picture: 0 4:3, 1 16:9, 2 21:9, on a screen of shape `screen`
+ * (width over height). `apply` switches widescreen too -- a choice made in
+ * the menu; at start-up, whether it is on is nv2a_widescreen's to read, from
+ * RECOMP_WIDESCREEN or the stored choice. RECOMP_WIDE_ASPECT, a test's, keeps
+ * its shape. */
+void nv2a_set_picture(int pic, float screen, int apply);
+void nv2a_set_picture(int pic, float screen, int apply)
+{
+    const char *v = getenv("RECOMP_WIDE_ASPECT");
+    if (apply) nv2a_set_widescreen(pic != 0);
+    if (!(v && atof(v) > 0.0))
+        nv2a_set_wide_aspect(pic == 2 ? nv2a_ultrawide_aspect(screen) : 16.0f / 9.0f);
+}
 static int g_wide_squeeze;   /* this draw's 2D squeeze, set in do_draw */
 static float g_wide_shift;   /* this draw's framed-3D move, title pixels, ditto */
 static Nv2aRenderState g_draw_rs;   /* the state this draw was given */
