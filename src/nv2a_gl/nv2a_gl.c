@@ -1766,9 +1766,12 @@ static void sdl_toggle_rstick_camera(void)
  */
 #include <SDL2/SDL_syswm.h>
 enum { MENU_RES1 = 101, MENU_WIDE = 110, MENU_FULL = 111, MENU_SMAA = 120, MENU_MSAA1 = 121,
-       MENU_RCAM = 130 };
+       MENU_RCAM = 130, MENU_AUDIO = 140 };
 static HWND  g_menu_hwnd;
 static HMENU g_menu_bar, g_menu_video, g_menu_res, g_menu_aa, g_menu_controls;
+
+
+#include "windows_menu_theme.inc"
 
 static void sdl_menu_update(void)
 {
@@ -1839,6 +1842,14 @@ static void sdl_menu_init(void)
         AppendMenuW(g_menu_controls, MF_STRING, MENU_RCAM, L"Camera on the &Right Stick\tF7");
         AppendMenuW(g_menu_bar, MF_POPUP, (UINT_PTR)g_menu_controls, L"&Controls");
     }
+    jm_audio_menu = CreatePopupMenu();
+    if (jm_audio_menu) {
+        AppendMenuW(jm_audio_menu, MF_STRING, MENU_AUDIO, L"Audio &mixer...\tF6");
+        AppendMenuW(g_menu_bar, MF_POPUP, (UINT_PTR)jm_audio_menu, L"&Audio");
+    }
+    jm_theme_menu(g_menu_bar, 1);
+    jm_original_wndproc = (WNDPROC)SetWindowLongPtrW(g_menu_hwnd, GWLP_WNDPROC, (LONG_PTR)jm_menu_wndproc);
+    jm_theme_refresh();
     SDL_EventState(SDL_SYSWMEVENT, SDL_ENABLE);
     sdl_menu_update();
     sdl_menu_show(!(SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN_DESKTOP));
@@ -1875,6 +1886,8 @@ static void sdl_menu_command(unsigned id)
         sdl_pick_smaa(!g_smaa_want);
     } else if (id >= MENU_MSAA1 && id < MENU_MSAA1 + 4) {
         sdl_pick_msaa(1 << (id - MENU_MSAA1));
+    } else if (id == MENU_AUDIO) {
+        jm_open_mixer();
     } else if (id == MENU_RCAM) {
         sdl_toggle_rstick_camera();
     }

@@ -20,6 +20,7 @@
  */
 
 #include "apu_state.h"
+#include "jsrf_mixer.h"
 #include <string.h>
 #include "fpconv.h"
 
@@ -1531,6 +1532,9 @@ static void voice_process(MCPXAPUState *d,
             }
         }
     }
+
+    /* Per-source gain before summing; never apply again to multipass voices. */
+    xbox_JsrfMixer_Voice(v,samples,NUM_SAMPLES_PER_FRAME,multipass);
 
     /* Mix into bins */
     for (int b = 0; b < 8; b++) {
