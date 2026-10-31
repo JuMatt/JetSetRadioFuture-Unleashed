@@ -4606,6 +4606,7 @@ void nv2a_set_picture(int pic, float screen, int apply)
 static int g_wide_squeeze;   /* this draw's 2D squeeze, set in do_draw */
 static float g_wide_shift;   /* this draw's framed-3D move, title pixels, ditto */
 static float g_wide_anchor;  /* this draw's move to a screen edge, NDC (see wide_hud_sheet) */
+static int g_wide_fill;      /* this draw is a quad filling the 4:3 view, widened (do_draw) */
 static Nv2aRenderState g_draw_rs;   /* the state this draw was given */
 static float g_wide_ext[4];  /* its x and y extent, for the draw log */
 
@@ -5964,6 +5965,50 @@ static void do_draw_body(void)
               }
           }
       } }
+    /* A quad that fills the screen from in front of the camera -- the boost
+     * dash's heat haze, which bends the scene drawn again small (a bump-
+     * mapped quad over a 128x128 copy of it). The title sizes it to fill its
+     * 4:3 view; through the widened camera it covered the middle 4:3 of the
+     * wide screen, with the edges of the haze in plain view at 12.5% and
+     * 87.5% of the width. A fixed-function draw of eight vertices or fewer
+     * whose corners land on that middle 4:3 -- the squeezed 4:3 screen, to a
+     * few pixels -- is widened to fill the screen (see the matrix it is
+     * drawn with, NV2A_U_FFMAT), the copy it samples with it. RECOMP_WIDE_FILL=0:
+     * as before. */
+    g_wide_fill = 0;
+    { static int on = -1;
+      if (on < 0) { const char *v = getenv("RECOMP_WIDE_FILL"); on = !(v && v[0] == '0'); }
+      if (on && nv2a_wide_scene() && S.xf_mode == NV2A_XF_MODE_FIXED && !vc_vb && attr_at[0] >= 0
+          && out_n >= 3 && out_n <= 8 && S.clip_w == 640 && S.clip_h == 480 && g_wide_s < 0.999f) {
+          const float (*mm)[4] = S.u.ff_mat;
+          float xlo = 1e30f, xhi = -1e30f, ylo = 1e30f, yhi = -1e30f, c = 0.5f * (float)g_fbo_w;
+          float tol = 0.008f * (float)g_fbo_w;
+          uint32_t q;
+          int ok = 1;
+          for (q = 0; q < out_n && ok; q++) {
+              const float *v = &vbuf[(size_t)q * stride_floats + (size_t)attr_at[0]];
+              float X = v[0] * mm[0][0] + v[1] * mm[0][1] + v[2] * mm[0][2] + v[3] * mm[0][3];
+              float Y = v[0] * mm[1][0] + v[1] * mm[1][1] + v[2] * mm[1][2] + v[3] * mm[1][3];
+              float W = v[0] * mm[3][0] + v[1] * mm[3][1] + v[2] * mm[3][2] + v[3] * mm[3][3];
+              if (!(W > 1e-6f)) { ok = 0; break; }
+              X /= W; Y /= W;
+              if (X < xlo) xlo = X;
+              if (X > xhi) xhi = X;
+              if (Y < ylo) ylo = Y;
+              if (Y > yhi) yhi = Y;
+          }
+          if (ok && fabsf(xlo - (c - g_wide_s * c)) < tol && fabsf(xhi - (c + g_wide_s * c)) < tol
+              && fabsf(ylo) < tol && fabsf(yhi - (float)g_fbo_h) < tol) {
+              static int said;
+              g_wide_fill = 1;
+              if (said < 6) {
+                  said++;
+                  fprintf(stderr, "[WIDEFILL] flip %u draw %u: %u vertices on %.1f..%.1f x %.1f..%.1f "
+                          "(the squeezed 4:3 screen) -- widened to fill it\n",
+                          S.flips, S.since_present, out_n, xlo, xhi, ylo, yhi);
+              }
+          }
+      } }
     /*
      * A 3D view inside a 2D frame -- the character select's two windows onto
      * the stage, a split screen. The title points it at a part of the screen
@@ -6342,7 +6387,16 @@ static void do_draw_body(void)
         G->uniform_f(NV2A_U_ZREV, r, 1);
     }
     if (uses(slot, NV2A_U_FFMAT)) {
-        G->uniform_f(NV2A_U_FFMAT, &S.u.ff_mat[0][0], 4);
+        if (g_wide_fill) {
+            /* Widened about the screen's centre c: x' = c + (x - c) / s, in
+             * the pixels the matrix lands in -- X' = X/s + c(1 - 1/s) W. */
+            float wm[4][4], c = 0.5f * (float)g_fbo_w, k = 1.0f / g_wide_s;
+            int j;
+            memcpy(wm, S.u.ff_mat, sizeof wm);
+            for (j = 0; j < 4; j++) wm[0][j] = wm[0][j] * k + c * (1.0f - k) * wm[3][j];
+            G->uniform_f(NV2A_U_FFMAT, &wm[0][0], 4);
+        } else
+            G->uniform_f(NV2A_U_FFMAT, &S.u.ff_mat[0][0], 4);
         if (uses(slot, NV2A_U_FFVPOFF)) {
             /* The viewport offset register less the driver's 0.53125 nudge,
              * as the programmable path takes it off (vpRect): the nudge
@@ -9538,7 +9592,7 @@ static void do_draw_body(void)
                 "blend %d %04X/%04X depth %d/%d ctl %08X final %08X/%08X "
                 "| xf%u a9 off=%08X t%u s%u st%u u[%.3f..%.3f] v[%.3f..%.3f] "
                 "in%04X | sten %u f%X r%X m%X w%X op%X/%X/%X dfunc %X cm %08X | cull %d %X %X zc %X"
-                " | a0 off=%08X st%u p0 %.3f %.3f %.3f box %.3f..%.3f %.3f..%.3f %.3f..%.3f%s%s%s\n",
+                " | a0 off=%08X st%u p0 %.3f %.3f %.3f box %.3f..%.3f %.3f..%.3f %.3f..%.3f%s%s%s%s\n",
                 (long)S.flips, S.since_present, out_n, S.prim, slot,
                 S.u.vp_off[0] > 100.0f ? "3D" : "2D",
                 S.tex[0].offset, S.tex[0].width, S.tex[0].height,
@@ -9558,7 +9612,8 @@ static void do_draw_body(void)
                 plo[0], phi[0], plo[1], phi[1], plo[2], phi[2],
                 g_imm_drawing ? " | IMMEDIATE" : "",
                 g_wide_squeeze ? " | WIDE-SQUEEZED" : "",
-                g_wide_anchor > 0.0f ? " | HUD-RIGHT" : g_wide_anchor < 0.0f ? " | HUD-LEFT" : "");
+                g_wide_anchor > 0.0f ? " | HUD-RIGHT" : g_wide_anchor < 0.0f ? " | HUD-LEFT" : "",
+                g_wide_fill ? " | WIDE-FILL" : "");
         if (nv2a_wide_scene() && g_pcache[slot].inputs == 0x1F9B)
             fprintf(stderr, "[DRAW] f%ld %4u   2D ndc x[%.2f..%.2f] y[%.2f..%.2f]%s\n",
                     (long)S.flips, S.since_present, g_wide_ext[0], g_wide_ext[1],
