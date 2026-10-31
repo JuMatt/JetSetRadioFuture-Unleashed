@@ -27,6 +27,15 @@
       },
       "versions": [
         {
+          "version": "0.6.1",
+          "buildVersion": "0.6.1",
+          "date": "2026-10-31T23:02:36Z",
+          "localizedDescription": "Widescreen: the HUD at the edges of the screen (16:9 and Fill the screen), and the boost's heat haze over the whole picture.",
+          "downloadURL": "https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/download/v0.6.1/JSRF-Unleashed-iOS.ipa",
+          "size": 13387159,
+          "minOSVersion": "15.0"
+        },
+        {
           "version": "0.6.0",
           "buildVersion": "0.6.0",
           "date": "2026-10-30T22:37:20Z",
