@@ -27,6 +27,15 @@
       },
       "versions": [
         {
+          "version": "0.6.2",
+          "buildVersion": "0.6.2",
+          "date": "2026-11-01T20:56:17Z",
+          "localizedDescription": "The camera on the right stick can now be set to tracking (in the settings): the right stick looks around while you keep going.",
+          "downloadURL": "https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/download/v0.6.2/JSRF-Unleashed-iOS.ipa",
+          "size": 13388699,
+          "minOSVersion": "15.0"
+        },
+        {
           "version": "0.6.1",
           "buildVersion": "0.6.1",
           "date": "2026-10-31T23:02:36Z",
