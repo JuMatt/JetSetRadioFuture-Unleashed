@@ -4122,11 +4122,19 @@ void sub_00042EE0(void)
  * If something else moved the eye in between (an event placing the camera),
  * that is left as it is and the turn dropped.
  *
- * Not in a conversation (mode 12) or the first-person look (14). On unless
- * the player turns it off, nv_window_pref_rstick_camera: the Mac's Controls
- * menu, the iPhone's and the Android app's settings, and on Windows and Linux
- * F7 (and Controls in the Windows window's menu bar); RECOMP_RSTICK_CAMERA=1
- * or 0 overrides.
+ * Tracking, the second way to have it (issue #44, players' feedback): the
+ * view turns as above but the heading is left alone, so the skater keeps the
+ * way he was going -- "up" on the left stick is still straight ahead of him,
+ * as the game's own camera behind him has it -- and the right stick only
+ * looks around. With the turn on the heading, panning the camera to look at
+ * something steered the skater towards it.
+ *
+ * Not in a conversation (mode 12) or the first-person look (14).
+ * nv_window_pref_rstick_camera says which: 0 off (the game's camera), 1 the
+ * camera (the default), 2 tracking -- the Mac's Controls menu, the iPhone's
+ * and the Android app's settings, and on Windows and Linux F7 (and Controls
+ * in the Windows window's menu bar); RECOMP_RSTICK_CAMERA=0, 1 or 2
+ * overrides.
  * The turn goes by the game's frames, a sixtieth of a second each, as its own
  * camera and its first-person look do: by the clock, it came out in uneven
  * steps from one picture to the next whenever the frames were not evenly
@@ -4193,15 +4201,18 @@ static void rcam_note_pad(XBOX_INPUT_STATE *s)
     }
 }
 
-static int rcam_enabled(void)
+/* 0 off, 1 the camera, 2 tracking (see above). */
+static int rcam_mode(void)
 {
     static int env = -2;
+    int v;
     if (env == -2) {
         const char *e = getenv("RECOMP_RSTICK_CAMERA");
-        env = (e && *e) ? (atoi(e) != 0) : -1;
+        env = (e && *e) ? (atoi(e) == 2 ? 2 : atoi(e) != 0) : -1;
     }
     if (env >= 0) return env;
-    return nv_window_pref_rstick_camera() > 0;
+    v = nv_window_pref_rstick_camera();
+    return v == 2 ? 2 : v > 0;
 }
 
 static int rcam_log_on(void)
@@ -4244,7 +4255,7 @@ static void rcam_apply(uint8_t *m, uint32_t cam)
     static double next_log, dump_at = -2.0;
     static int by_clock = -1;
     uint32_t mode, frames;
-    int ok, i;
+    int ok, i, how;
     if (by_clock < 0) by_clock = getenv("JSRF_RCAM_CLOCK") ? 1 : 0;
     /* The game's frames since the last turn (one, as a rule), a sixtieth of a
      * second each; up to six, after a pause. */
@@ -4278,7 +4289,8 @@ static void rcam_apply(uint8_t *m, uint32_t cam)
         fixed = f ? atof(f) * 3.14159265358979 / 180.0 : -1.0e8;
     }
     mode = c[0x208 / 4];
-    ok = rcam_enabled() && mode != 12 && mode != 14;
+    how = rcam_mode();
+    ok = how > 0 && mode != 12 && mode != 14;
     s_rcam.active_until = ok ? now + 0.25 : 0.0;
     if (!ok) {
         s_rcam.yaw = s_rcam.pitch = 0.0f;
@@ -4339,9 +4351,10 @@ static void rcam_apply(uint8_t *m, uint32_t cam)
         e[0] = t[0] + v[0]; e[1] = t[1] + v[1]; e[2] = t[2] + v[2];
         memcpy(s_rcam.our_eye, e, sizeof s_rcam.our_eye);
         /* The heading turned with it, in the game's range (-0x8000..0x8000,
-         * as sub_0004A7A0 gives it). */
+         * as sub_0004A7A0 gives it) -- or, tracking, left as it is. */
         s_rcam.game_hd = *hd;
-        *hd = (int32_t)(int16_t)(uint16_t)(s_rcam.game_hd + (int32_t)lrintf(s_rcam.yaw * (65536.0f / 6.28318531f)));
+        if (how != 2)
+            *hd = (int32_t)(int16_t)(uint16_t)(s_rcam.game_hd + (int32_t)lrintf(s_rcam.yaw * (65536.0f / 6.28318531f)));
         s_rcam.our_hd = *hd;
         s_rcam.cam = cam;
         s_rcam.applied = 1;
@@ -4353,10 +4366,10 @@ static void rcam_apply(uint8_t *m, uint32_t cam)
                 s_rcam.yaw * 57.29578f, s_rcam.pitch * 57.29578f);
     } else if (rcam_log_on() && now >= next_log) {
         next_log = now + 0.1;
-        fprintf(stderr, "[RCAM] t=%.2f flip %u mode %u on %d | stick %.2f %.2f lt %d | yaw %.1f pitch %.1f | "
+        fprintf(stderr, "[RCAM] t=%.2f flip %u mode %u on %d how %d | stick %.2f %.2f lt %d | yaw %.1f pitch %.1f | "
                 "eye (%.2f %.2f %.2f) game (%.2f %.2f %.2f) tgt (%.2f %.2f %.2f) | hd %d game %d | "
                 "player (%.2f %.2f %.2f)\n",
-                now, nv2a_gl_flips(), mode, ok, s_rcam.rx, s_rcam.ry, s_rcam.lt,
+                now, nv2a_gl_flips(), mode, ok, how, s_rcam.rx, s_rcam.ry, s_rcam.lt,
                 s_rcam.yaw * 57.29578f, s_rcam.pitch * 57.29578f, e[0], e[1], e[2],
                 s_rcam.applied ? s_rcam.game_eye[0] : e[0], s_rcam.applied ? s_rcam.game_eye[1] : e[1],
                 s_rcam.applied ? s_rcam.game_eye[2] : e[2], t[0], t[1], t[2],

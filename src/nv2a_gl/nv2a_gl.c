@@ -1436,28 +1436,32 @@ static void sdl_cfg_set(const char *key, int val)
 /* nv2a_widescreen() asks this when RECOMP_WIDESCREEN is not set. */
 int nv_window_pref_widescreen(void) { return sdl_cfg_get("widescreen", 0) != 0; }
 
-/* The camera on the right stick (port/recomp_manual.c): on unless turned off --
- * Controls in the window's menu bar on Windows, F7 anywhere (and the Android
- * app's settings), kept as rstick_camera= (0 for off). Asked every frame, so
- * the file is read once. */
+/* The camera on the right stick (port/recomp_manual.c): 1 the camera (the
+ * default), 2 tracking -- the view turns and the skater keeps his heading --
+ * or 0 off. Controls in the window's menu bar on Windows, F7 anywhere (and
+ * the Android app's settings), kept as rstick_camera= (0 for off) and
+ * rstick_tracking=. Asked every frame, so the file is read once. */
 static volatile int g_rstick_cam = -1;
 int nv_window_pref_rstick_camera(void);
 int nv_window_pref_rstick_camera(void)
 {
-    if (g_rstick_cam < 0) g_rstick_cam = sdl_cfg_get("rstick_camera", 1) != 0;
+    if (g_rstick_cam < 0)
+        g_rstick_cam = sdl_cfg_get("rstick_camera", 1) ? (sdl_cfg_get("rstick_tracking", 0) ? 2 : 1) : 0;
     return g_rstick_cam;
 }
-static void nv_window_set_rstick_camera(int on)
+static void nv_window_set_rstick_camera(int mode)
 {
-    g_rstick_cam = on ? 1 : 0;
-    sdl_cfg_set("rstick_camera", g_rstick_cam);
-    fprintf(stderr, "[WIN] the camera on the right stick: %s\n", on ? "on" : "off");
+    g_rstick_cam = mode == 2 ? 2 : mode ? 1 : 0;
+    sdl_cfg_set("rstick_camera", g_rstick_cam != 0);
+    sdl_cfg_set("rstick_tracking", g_rstick_cam == 2);
+    fprintf(stderr, "[WIN] the right stick: %s\n", g_rstick_cam == 2 ? "the camera, tracking"
+                    : g_rstick_cam ? "the camera" : "the game's (camera off)");
 }
 /* Asked for from another thread (the Android app's settings): done at the
  * next sdl_pump, by the thread that owns the window and the settings file. */
 static volatile int g_sdl_want_rcam = -1;
-void nv_window_request_rstick_camera(int on);
-void nv_window_request_rstick_camera(int on) { g_sdl_want_rcam = on ? 1 : 0; }
+void nv_window_request_rstick_camera(int mode);
+void nv_window_request_rstick_camera(int mode) { g_sdl_want_rcam = mode == 2 ? 2 : mode ? 1 : 0; }
 
 /* The keyboard as a gamepad -- the same layout as the Mac's, by key POSITION
  * (scancodes), so W A S D on QWERTY is Z Q S D on AZERTY:
@@ -1467,8 +1471,8 @@ void nv_window_request_rstick_camera(int on) { g_sdl_want_rcam = on ? 1 : 0; }
  *   R          Black                    F  White
  *   Return     Start                    Esc  Back (and Android's Back)
  *   C / V      left / right stick click
- * F11 or Alt+Return: full screen. F10: widescreen. F9: resolution. F8:
- * anti-aliasing. F7: the camera on the right stick. */
+ * F11 or Alt+Return: full screen. F10: the picture. F9: resolution. F8:
+ * anti-aliasing. F7: the camera on the right stick (on, tracking, off). */
 static volatile unsigned short g_sdl_kb_buttons;
 static volatile unsigned char  g_sdl_kb_analog[8];
 
@@ -1792,10 +1796,11 @@ static void sdl_choose_aa(void)
     sdl_keys_release();
 }
 
-/* F7 and Controls > Camera on the Right Stick: on or off, kept. */
-static void sdl_toggle_rstick_camera(void)
+/* F7 (round the camera, tracking and off) and Controls > Camera on the Right
+ * Stick, (Tracking): kept. */
+static void sdl_set_rstick_camera(int mode)
 {
-    nv_window_set_rstick_camera(!nv_window_pref_rstick_camera());
+    nv_window_set_rstick_camera(mode);
     sdl_menu_update();
 }
 
@@ -1814,7 +1819,7 @@ static void sdl_toggle_rstick_camera(void)
  */
 #include <SDL2/SDL_syswm.h>
 enum { MENU_RES1 = 101, MENU_FULL = 111, MENU_PIC1 = 112, MENU_SMAA = 120, MENU_MSAA1 = 121,
-       MENU_RCAM = 130 };
+       MENU_RCAM = 130, MENU_RCAMT = 131 };
 static HWND  g_menu_hwnd;
 static HMENU g_menu_bar, g_menu_video, g_menu_res, g_menu_aa, g_menu_pic, g_menu_controls;
 
@@ -1838,9 +1843,12 @@ static void sdl_menu_update(void)
         EnableMenuItem(g_menu_aa, MENU_MSAA1 + i,
                        MF_BYCOMMAND | (!g_msaa_max || n <= g_msaa_max ? MF_ENABLED : MF_GRAYED));
     }
-    if (g_menu_controls)
+    if (g_menu_controls) {
         CheckMenuItem(g_menu_controls, MENU_RCAM,
-                      MF_BYCOMMAND | (nv_window_pref_rstick_camera() ? MF_CHECKED : MF_UNCHECKED));
+                      MF_BYCOMMAND | (nv_window_pref_rstick_camera() == 1 ? MF_CHECKED : MF_UNCHECKED));
+        CheckMenuItem(g_menu_controls, MENU_RCAMT,
+                      MF_BYCOMMAND | (nv_window_pref_rstick_camera() == 2 ? MF_CHECKED : MF_UNCHECKED));
+    }
 }
 
 /* The menu takes its height from the window, not from the picture: the
@@ -1889,6 +1897,7 @@ static void sdl_menu_init(void)
     AppendMenuW(g_menu_bar, MF_POPUP, (UINT_PTR)g_menu_video, L"&Video");
     if ((g_menu_controls = CreatePopupMenu()) != NULL) {
         AppendMenuW(g_menu_controls, MF_STRING, MENU_RCAM, L"Camera on the &Right Stick\tF7");
+        AppendMenuW(g_menu_controls, MF_STRING, MENU_RCAMT, L"Camera on the Right Stick (&Tracking)");
         AppendMenuW(g_menu_bar, MF_POPUP, (UINT_PTR)g_menu_controls, L"&Controls");
     }
     SDL_EventState(SDL_SYSWMEVENT, SDL_ENABLE);
@@ -1927,8 +1936,10 @@ static void sdl_menu_command(unsigned id)
         sdl_pick_smaa(!g_smaa_want);
     } else if (id >= MENU_MSAA1 && id < MENU_MSAA1 + 4) {
         sdl_pick_msaa(1 << (id - MENU_MSAA1));
-    } else if (id == MENU_RCAM) {
-        sdl_toggle_rstick_camera();
+    } else if (id == MENU_RCAM || id == MENU_RCAMT) {
+        /* The one that is on, chosen again, turns it off. */
+        int want = id == MENU_RCAMT ? 2 : 1;
+        sdl_set_rstick_camera(nv_window_pref_rstick_camera() == want ? 0 : want);
     }
 }
 #endif
@@ -2366,7 +2377,7 @@ static void sdl_pump(void)
     if (g_sdl_want_rcam >= 0) {
         int want = g_sdl_want_rcam;
         g_sdl_want_rcam = -1;
-        if (want != nv_window_pref_rstick_camera()) sdl_toggle_rstick_camera();
+        if (want != nv_window_pref_rstick_camera()) sdl_set_rstick_camera(want);
     }
     while (SDL_PollEvent(&ev)) {
         switch (ev.type) {
@@ -2386,7 +2397,11 @@ static void sdl_pump(void)
                 if (k == SDL_SCANCODE_F10) { sdl_set_picture((sdl_picture_now() + 1) % 3); break; }
                 if (k == SDL_SCANCODE_F9)  { sdl_choose_scale(); break; }
                 if (k == SDL_SCANCODE_F8)  { sdl_choose_aa(); break; }
-                if (k == SDL_SCANCODE_F7)  { sdl_toggle_rstick_camera(); break; }
+                if (k == SDL_SCANCODE_F7)  {   /* the camera -> tracking -> off -> the camera */
+                    int m = nv_window_pref_rstick_camera();
+                    sdl_set_rstick_camera(m == 1 ? 2 : m == 2 ? 0 : 1);
+                    break;
+                }
             }
             sdl_key(ev.key.keysym.scancode, 1);
             break;

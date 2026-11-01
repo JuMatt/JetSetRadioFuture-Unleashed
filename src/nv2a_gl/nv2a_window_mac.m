@@ -598,18 +598,22 @@ static void nv_window_shape_for_mode(void)
     }
 }
 
-/* Controls > Camera on the Right Stick, stored as the "rstickCamera" default:
- * on unless turned off. The right stick turns the camera around the skater
- * (recomp_manual.c, rcam_apply), which asks this every frame, so a change
- * applies at once. RECOMP_RSTICK_CAMERA in the environment wins there. */
+/* Controls > Camera on the Right Stick, and Camera on the Right Stick
+ * (Tracking): 1 or 2, 0 with neither -- the "rstickCamera" default, on unless
+ * turned off, and "rstickTracking". The right stick turns the camera around
+ * the skater (recomp_manual.c, rcam_apply); tracking, it turns only the view
+ * and the skater keeps his heading. Asked every frame, so a change applies at
+ * once. RECOMP_RSTICK_CAMERA in the environment wins there. */
 static volatile int g_rstick_cam = -1;
 int nv_window_pref_rstick_camera(void);
 int nv_window_pref_rstick_camera(void)
 {
     if (g_rstick_cam < 0) {
         @autoreleasepool {
-            id v = [[NSUserDefaults standardUserDefaults] objectForKey:@"rstickCamera"];
-            g_rstick_cam = v ? ([v boolValue] ? 1 : 0) : 1;
+            NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+            id v = [d objectForKey:@"rstickCamera"];
+            int on = v ? ([v boolValue] ? 1 : 0) : 1;
+            g_rstick_cam = on ? ([d boolForKey:@"rstickTracking"] ? 2 : 1) : 0;
         }
     }
     return g_rstick_cam;
@@ -621,7 +625,7 @@ int nv_window_pref_rstick_camera(void)
 - (void)pickPicture:(id)sender;
 - (void)toggleSmaa:(id)sender;
 - (void)pickMsaa:(id)sender;
-- (void)toggleRstickCamera:(id)sender;
+- (void)pickRstickCamera:(id)sender;
 - (void)showKeys:(id)sender;
 - (void)showPad:(id)sender;
 @end
@@ -738,8 +742,8 @@ int nv_window_pref_rstick_camera(void)
  * it applies), and no more samples than the device offers. */
 - (BOOL)validateMenuItem:(NSMenuItem *)item
 {
-    if ([item action] == @selector(toggleRstickCamera:)) {
-        [item setState:nv_window_pref_rstick_camera() ? NSControlStateValueOn : NSControlStateValueOff];
+    if ([item action] == @selector(pickRstickCamera:)) {
+        [item setState:[item tag] == nv_window_pref_rstick_camera() ? NSControlStateValueOn : NSControlStateValueOff];
         return YES;
     }
     if ([item action] == @selector(toggleSmaa:)) {
@@ -755,14 +759,19 @@ int nv_window_pref_rstick_camera(void)
     }
     return YES;
 }
-- (void)toggleRstickCamera:(id)sender
+/* The two items' tags are their modes: the one that is on, chosen again,
+ * turns the camera on the right stick off. */
+- (void)pickRstickCamera:(id)sender
 {
-    int on = !nv_window_pref_rstick_camera();
-    g_rstick_cam = on;
-    [[NSUserDefaults standardUserDefaults] setBool:(on ? YES : NO) forKey:@"rstickCamera"];
-    [[NSUserDefaults standardUserDefaults] synchronize];
-    [(NSMenuItem *)sender setState:on ? NSControlStateValueOn : NSControlStateValueOff];
-    fprintf(stderr, "[WIN] camera on the right stick %s\n", on ? "on" : "off");
+    int want = (int)[(NSMenuItem *)sender tag];
+    int mode = want == nv_window_pref_rstick_camera() ? 0 : want;
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    g_rstick_cam = mode;
+    [d setBool:(mode ? YES : NO) forKey:@"rstickCamera"];
+    [d setBool:(mode == 2 ? YES : NO) forKey:@"rstickTracking"];
+    [d synchronize];
+    fprintf(stderr, "[WIN] the right stick: %s\n",
+            mode == 2 ? "the camera, tracking" : mode ? "the camera" : "the game's (camera off)");
 }
 /* Video > 4:3, Widescreen (16:9), Ultrawide (21:9): the item's tag is the
  * picture. */
@@ -811,7 +820,9 @@ int nv_window_pref_rstick_camera(void)
          "Sticks, stick clicks\tthe same\n\n"
          "The right stick turns the camera around your skater (not in the "
          "original game; Controls > Camera on the Right Stick turns it off). "
-         "Let go and it drifts back behind; the L trigger puts it back at once.\n\n"
+         "Let go and it drifts back behind; the L trigger puts it back at once. "
+         "With Camera on the Right Stick (Tracking) it only looks around: the "
+         "skater keeps going the way he was.\n\n"
          "The keyboard keeps working alongside it. No vibration yet.";
     [a runModal];
 }
@@ -1020,13 +1031,18 @@ static void build_menu(void)
         }
         {
             /* Not in the original game: see nv_window_pref_rstick_camera. */
-            NSMenuItem *rc = [[NSMenuItem alloc] initWithTitle:@"Camera on the Right Stick"
-                                                       action:@selector(toggleRstickCamera:)
-                                                keyEquivalent:@""];
-            [rc setTarget:g_menu_target];
-            [rc setState:nv_window_pref_rstick_camera() ? NSControlStateValueOn : NSControlStateValueOff];
+            NSString *names[2] = { @"Camera on the Right Stick", @"Camera on the Right Stick (Tracking)" };
+            int k;
             [ctl addItem:[NSMenuItem separatorItem]];
-            [ctl addItem:rc];
+            for (k = 0; k < 2; k++) {
+                NSMenuItem *rc = [[NSMenuItem alloc] initWithTitle:names[k]
+                                                           action:@selector(pickRstickCamera:)
+                                                    keyEquivalent:@""];
+                [rc setTag:k + 1];
+                [rc setTarget:g_menu_target];
+                [rc setState:nv_window_pref_rstick_camera() == k + 1 ? NSControlStateValueOn : NSControlStateValueOff];
+                [ctl addItem:rc];
+            }
         }
         [ctlItem setSubmenu:ctl];
         [bar addItem:ctlItem];

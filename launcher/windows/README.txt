@@ -78,11 +78,14 @@ Keyboard (by key position, so W A S D on QWERTY is Z Q S D on AZERTY):
   F8                 anti-aliasing: SMAA (a quick pass over each finished
                      frame) and MSAA 2x, 4x or 8x (every edge drawn with
                      that many samples a pixel), either or both; remembered
-  F7                 the camera on the right stick, on (the default) or off:
-                     the right stick (or the arrow keys) turns the camera
-                     around you and tilts it, and it eases back behind you
-                     when let go; L trigger puts it straight behind at once.
-                     Off, the camera is the original game's. Remembered
+  F7                 the camera on the right stick, in turn: on (the
+                     default), tracking, off. On, the right stick (or the
+                     arrow keys) turns the camera around you and tilts it,
+                     it eases back behind you when let go, L trigger puts it
+                     straight behind at once, and you go where it looks.
+                     Tracking, it only looks around: you keep going the way
+                     you were. Off, the camera is the original game's.
+                     Remembered
 
 The Video menu at the top of the window has the same four, and the Controls
 menu the camera. They are hidden in full screen, where the keys still work.

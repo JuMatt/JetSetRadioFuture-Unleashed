@@ -77,8 +77,9 @@ full screen, all of them remembered: the game starts the way it was left, in
 full screen or in a window (`--fullscreen` and `--windowed` choose for one
 start). The same are on
 **F9**, **F8**, **F10** and **F11** (or Alt+Enter), which also work in full
-screen, where the menu is hidden. **Controls › Camera on the Right Stick**,
-or **F7**, turns the right-stick camera (below) off and on.
+screen, where the menu is hidden. **Controls › Camera on the Right Stick**
+and **Camera on the Right Stick (Tracking)**, or **F7** (on, tracking, off),
+choose how the right stick works (below).
 Controllers work through SDL: Xbox, PlayStation, Switch Pro and many more.
 Saves are kept in the game folder, in `UDATA`, as on the Mac. The
 `README.txt` inside lists the options and where the settings and logs
@@ -246,10 +247,14 @@ knows.
 **The camera on the right stick** (on by default, on every platform): the
 right stick — or the arrow keys — turns the camera around the skater and
 tilts it, and it eases back behind them when you let go; the L trigger still
-puts it straight behind at once, as in the original game. Turn it off for the
-original camera: **Controls › Camera on the Right Stick** on the Mac, **F7**
-(or the Controls menu) on Windows, **F7** on Linux, and the settings on the
-iPhone and on Android.
+puts it straight behind at once, as in the original game. The skater goes
+where the camera looks. **Tracking**, the other way to have it, only looks
+around: the skater keeps going the way they were, and up on the left stick
+is still straight ahead of them. Or turn it off for the original camera. On
+the Mac: **Controls › Camera on the Right Stick** or **Camera on the Right
+Stick (Tracking)** (choose the one that is on again to turn it off); **F7**
+on Windows (or the Controls menu) and Linux goes round on, tracking and off;
+and the settings on the iPhone and on Android.
 
 **Video menu:**
 - **Resolution** — the internal resolution, 1× to 6× (2× by default; 6×,

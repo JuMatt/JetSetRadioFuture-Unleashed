@@ -169,21 +169,25 @@ int nv_window_pref_widescreen(void) { return picture_pref() != 0; }
 int nv_window_pref_metal(void);
 int nv_window_pref_metal(void) { return 1; }
 
-/* The camera on the right stick (port/recomp_manual.c): on unless turned off
- * in the settings, as the "rstickCamera" default -- the Mac's key. Asked
- * every frame, so kept here once read. */
+/* The camera on the right stick (port/recomp_manual.c): 1 on (the default),
+ * 2 tracking -- it only looks around, the skater keeps his heading -- or 0
+ * off, in the settings, as the "rstickCamera" and "rstickTracking" defaults --
+ * the Mac's keys. Asked every frame, so kept here once read. */
 static volatile int g_rstick_cam = -1;
 int nv_window_pref_rstick_camera(void);
 int nv_window_pref_rstick_camera(void)
 {
     if (g_rstick_cam < 0) {
         @autoreleasepool {
-            id v = [[NSUserDefaults standardUserDefaults] objectForKey:@"rstickCamera"];
-            g_rstick_cam = v ? ([v boolValue] ? 1 : 0) : 1;
+            NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+            id v = [d objectForKey:@"rstickCamera"];
+            int on = v ? ([v boolValue] ? 1 : 0) : 1;
+            g_rstick_cam = on ? ([d boolForKey:@"rstickTracking"] ? 2 : 1) : 0;
         }
     }
     return g_rstick_cam;
 }
+static NSString *const k_rcam[3] = { @"off", @"on", @"tracking" };
 
 /* Anti-aliasing (aa_start in nv2a_gl.c asks): SMAA on or off ("smaa"),
  * applied at once, and multisampling's samples a pixel ("msaa", 0 none),
@@ -1014,14 +1018,9 @@ static BOOL touch_pref(void)
     [a addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"Anti-aliasing: %@",
                                                  [self aaName]]
         style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) { (void)x; [self pickAA]; }]];
-    [a addAction:[UIAlertAction actionWithTitle:nv_window_pref_rstick_camera() ? @"Camera on the right stick: on"
-                                                                              : @"Camera on the right stick: off"
-        style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) { (void)x;
-            int on = !nv_window_pref_rstick_camera();
-            g_rstick_cam = on;
-            [d setBool:(on ? YES : NO) forKey:@"rstickCamera"];
-            fprintf(stderr, "[IOS] the camera on the right stick: %s\n", on ? "on" : "off");
-            fflush(stderr); }]];
+    [a addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"Camera on the right stick: %@",
+                                                 k_rcam[nv_window_pref_rstick_camera()]]
+        style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) { (void)x; [self pickRstickCamera]; }]];
     [a addAction:[UIAlertAction actionWithTitle:@"Controls" style:UIAlertActionStyleDefault
         handler:^(UIAlertAction *x) { (void)x;
             [self alert:@"Controls" text:
@@ -1032,7 +1031,8 @@ static BOOL touch_pref(void)
               "at the top.\n\n"
               "With the camera on the right stick (the settings), a controller's right stick turns the "
               "camera around you and it eases back behind you when let go; L trigger puts it straight "
-              "behind at once.\n\n"
+              "behind at once. Set to tracking, it only looks around: you keep going the way you "
+              "were.\n\n"
               "A keyboard: WASD (by position) moves, arrows the camera, Space jump, E spray, "
               "Return Start, Esc Back."]; }]];
     [a addAction:[UIAlertAction actionWithTitle:@"Close" style:UIAlertActionStyleCancel handler:nil]];
@@ -1055,6 +1055,34 @@ static BOOL touch_pref(void)
                 apply_wide_shape(self.view.bounds.size);
                 fprintf(stderr, "[IOS] picture: %s\n", m == 0 ? "4:3" : m == 1 ? "16:9" : "fill the screen");
                 fflush(stderr); }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+/* The camera on the right stick: on (the skater goes where it looks),
+ * tracking (it only looks around, the skater keeps his heading), or off (the
+ * game's own camera). */
+- (void)pickRstickCamera
+{
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Camera on the right stick"
+        message:@"On: the skater goes where the camera looks. Tracking: the camera only looks around, "
+                 "the skater keeps going the way he was."
+        preferredStyle:UIAlertControllerStyleAlert];
+    int cur = nv_window_pref_rstick_camera();
+    static const int order[3] = { 1, 2, 0 };
+    for (int i = 0; i < 3; i++) {
+        int m = order[i];
+        [a addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"%@%@",
+                                                     m == 0 ? @"Off (the game's camera)" : m == 1 ? @"On" : @"Tracking",
+                                                     m == cur ? @"  ✓" : @""]
+            style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) { (void)x;
+                NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+                g_rstick_cam = m;
+                [d setBool:(m ? YES : NO) forKey:@"rstickCamera"];
+                [d setBool:(m == 2 ? YES : NO) forKey:@"rstickTracking"];
+                fprintf(stderr, "[IOS] the camera on the right stick: %s\n", m == 2 ? "tracking" : m ? "on" : "off");
+                fflush(stderr); }]];
+    }
     [a addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:a animated:YES completion:nil];
 }
