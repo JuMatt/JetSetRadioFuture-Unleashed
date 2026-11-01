@@ -10,6 +10,36 @@ its version. Downloads are on the
 [Releases](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases)
 page.
 
+## 0.6.2 — 1 November 2026
+
+A second way to have the camera on the right stick, from players' feedback,
+and Game Mode on the Mac. Every platform is new in 0.6.2.
+
+- **The camera on the right stick, tracking** ([#44](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/issues/44)).
+  The camera on the right stick turns the view around the skater, and until
+  now the skater turned with it: up on the left stick goes where the camera
+  looks, so panning to look at something steered you towards it. Tracking
+  only looks around: the skater keeps going the way they were, and up on the
+  left stick is still straight ahead of them. Let go and the view eases back
+  behind, as before. On the Mac **Controls › Camera on the Right Stick
+  (Tracking)**, beside **Camera on the Right Stick** (choose the one that is
+  on again to turn the camera off); on Windows the same in the **Controls**
+  menu; **F7** on Windows and Linux goes round on, tracking and off; and the
+  iPhone's and the Android app's settings have the three. The camera on the
+  right stick stays on by default; `RECOMP_RSTICK_CAMERA=2` for tracking.
+- **Mac: Game Mode in full screen** ([#54](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/pull/54),
+  thank you, danielgpinheiro). The app now says it is a game, so macOS puts it
+  in Game Mode while it is in full screen — the CPU and GPU first, and
+  lower-latency Bluetooth for controllers — and takes it back when it leaves.
+- Tested on a Mac: in Shibuya Terminal the right stick turned the view about
+  half a turn, with the camera on and with tracking; on, the skater's heading
+  turned with it, and tracking left it as the game had it. Off, the game's own
+  camera stayed (Dogenzaka Hill). The title ran at 60 fps on Metal and OpenGL,
+  and macOS put the game in Game Mode in full screen. Windows (under Wine) and
+  Linux: F7, and on Windows the Controls menu, go round on, tracking and off
+  and keep the choice; the Android and iPhone builds were built and checked,
+  not run.
+
 ## 0.6.1 — 31 October 2026
 
 Widescreen: a 21:9 picture for ultrawide screens on Mac, Windows and Linux,
