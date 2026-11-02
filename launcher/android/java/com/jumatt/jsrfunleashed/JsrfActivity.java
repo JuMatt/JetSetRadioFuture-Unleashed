@@ -1,9 +1,14 @@
 package com.jumatt.jsrfunleashed;
 
 import android.app.AlertDialog;
+import android.content.Context;
 import android.content.pm.ActivityInfo;
 import android.hardware.input.InputManager;
+import android.os.Build;
 import android.os.Bundle;
+import android.os.VibrationEffect;
+import android.os.Vibrator;
+import android.os.VibratorManager;
 import android.util.Log;
 import android.view.InputDevice;
 import android.view.MotionEvent;
@@ -34,6 +39,7 @@ public class JsrfActivity extends SDLActivity
     static native void nativePhotoMode();
     static native String[] nativeMapNames();          /* the map selector (jsrf_maps.h) */
     static native void nativeGoToMap(int index);
+    static native void nativeSetVibration(boolean on);
     static native String nativeVersion();
     static native void nativeLog(String line);
 
@@ -173,6 +179,7 @@ public class JsrfActivity extends SDLActivity
         final boolean touch = touchPref();
         final int rcam = nativeRstickCamera();
         final int scale = Settings.get(this, "scale", 2);
+        final boolean vib = Settings.get(this, "vibration", 1) != 0;
         String[] items = {
             "Widescreen: " + (wide ? "on" : "off"),
             "On-screen controls: " + (touch ? "shown" : "hidden"),
@@ -180,6 +187,7 @@ public class JsrfActivity extends SDLActivity
             "Camera on the right stick: " + (rcam == 2 ? "tracking" : rcam != 0 ? "on" : "off"),
             "Photo mode",
             "Go to a map",
+            "Vibration: " + (vib ? "on" : "off"),
             "Controls",
         };
         mPad.reset();
@@ -205,6 +213,11 @@ public class JsrfActivity extends SDLActivity
                 case 5:
                     pickMap();
                     break;
+                case 6:
+                    Settings.set(this, "vibration", vib ? 0 : 1);
+                    nativeSetVibration(!vib);
+                    if (vib) rumble(0);
+                    break;
                 default:
                     showControls();
                     break;
@@ -212,6 +225,30 @@ public class JsrfActivity extends SDLActivity
             })
             .setNegativeButton("Close", null)
             .show();
+    }
+
+    /* The phone's own vibration, for the game's rumble while the on-screen
+     * controls are in use (port/android/jsrf_android.c, from the engine's
+     * thread): a long one-shot at that amplitude (1-255), or 0 to stop. */
+    static void rumble(int amplitude) {
+        try {
+            Context ctx = org.libsdl.app.SDL.getContext();
+            if (ctx == null) return;
+            Vibrator v;
+            if (Build.VERSION.SDK_INT >= 31) {
+                VibratorManager vm = (VibratorManager) ctx.getSystemService(Context.VIBRATOR_MANAGER_SERVICE);
+                v = vm != null ? vm.getDefaultVibrator() : null;
+            } else {
+                v = (Vibrator) ctx.getSystemService(Context.VIBRATOR_SERVICE);
+            }
+            if (v == null || !v.hasVibrator()) return;
+            if (amplitude <= 0) { v.cancel(); return; }
+            int a = Math.min(255, amplitude);
+            v.vibrate(VibrationEffect.createOneShot(10000,
+                      v.hasAmplitudeControl() ? a : VibrationEffect.DEFAULT_AMPLITUDE));
+        } catch (Throwable t) {
+            // no vibration then
+        }
     }
 
     /* The map selector: straight to a map, to skate it freely. */

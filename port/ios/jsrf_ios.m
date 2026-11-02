@@ -125,6 +125,11 @@ int nv_window_keys(unsigned short *buttons, unsigned char *analog)
     return any;
 }
 
+/* The on-screen controls are shown (no controller): the phone itself may
+ * vibrate for the game (src/input/xinput_device.c). */
+int nv_window_touch_active(void);
+int nv_window_touch_active(void) { return g_touch_on; }
+
 /* The on-screen stick, for xinput_device.c's kb_merge: analog, while held. */
 int nv_window_touch_stick(short *x, short *y);
 int nv_window_touch_stick(short *x, short *y)
@@ -322,6 +327,19 @@ void nv_window_request_photo(void);
 void nv_window_request_photo(void) { g_photo_request = 1; }
 int nv_window_take_photo_request(void);
 int nv_window_take_photo_request(void) { int r = g_photo_request; g_photo_request = 0; return r; }
+/* Vibration (port/recomp_manual.c): a controller's haptics, or the phone's
+ * own with the on-screen controls (src/input/xinput_gc.m); on by default,
+ * the settings' Vibration, kept as the "vibration" default. */
+static volatile int g_vibration = -1;
+int nv_window_pref_vibration(void);
+int nv_window_pref_vibration(void)
+{
+    if (g_vibration < 0) {
+        id v = [[NSUserDefaults standardUserDefaults] objectForKey:@"vibration"];
+        g_vibration = v ? ([v boolValue] ? 1 : 0) : 1;
+    }
+    return g_vibration;
+}
 /* The map selector (port/recomp_manual.c, the maps in jsrf_maps.h): a map from
  * the settings, or -1, its panel. */
 #include "../../src/nv2a_gl/jsrf_maps.h"
@@ -1078,6 +1096,12 @@ static BOOL touch_pref(void)
         handler:^(UIAlertAction *x) { (void)x; nv_window_request_photo(); }]];
     [a addAction:[UIAlertAction actionWithTitle:@"Go to a map" style:UIAlertActionStyleDefault
         handler:^(UIAlertAction *x) { (void)x; [self pickMap]; }]];
+    [a addAction:[UIAlertAction actionWithTitle:nv_window_pref_vibration() ? @"Vibration: on" : @"Vibration: off"
+        style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) { (void)x;
+            g_vibration = !nv_window_pref_vibration();
+            [d setBool:(g_vibration ? YES : NO) forKey:@"vibration"];
+            fprintf(stderr, "[IOS] vibration: %s\n", g_vibration ? "on" : "off");
+            fflush(stderr); }]];
     [a addAction:[UIAlertAction actionWithTitle:@"Controls" style:UIAlertActionStyleDefault
         handler:^(UIAlertAction *x) { (void)x;
             [self alert:@"Controls" text:

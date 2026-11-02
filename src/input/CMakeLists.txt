@@ -6,6 +6,8 @@ if(APPLE)
     # speaks to a Bluetooth DualSense with nothing installed, which SDL2
     # cannot do here -- Homebrew only ships an x86_64 build of it.
     list(APPEND XBOX_INPUT_SOURCES xinput_gc.m)
+    # The vibration (Core Haptics) holds its engines and players across calls.
+    set_source_files_properties(xinput_gc.m PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 endif()
 
 add_library(xbox_input STATIC ${XBOX_INPUT_SOURCES})
@@ -16,7 +18,7 @@ if(WIN32 AND NOT XBOXRECOMP_WIN_GL)
     target_link_libraries(xbox_input PUBLIC platform xinput)
 elseif(APPLE)
     target_link_libraries(xbox_input PUBLIC platform
-        "-framework GameController" "-framework Foundation")
+        "-framework GameController" "-framework CoreHaptics" "-framework Foundation")
 else()
     find_package(SDL2 REQUIRED)
     target_link_libraries(xbox_input PUBLIC platform SDL2::SDL2)

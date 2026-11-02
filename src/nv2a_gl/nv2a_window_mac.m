@@ -619,6 +619,27 @@ int nv_window_pref_rstick_camera(void)
     return g_rstick_cam;
 }
 
+/* No on-screen controls on a Mac: the Mac itself never vibrates for the
+ * game (src/input/xinput_device.c asks). */
+int nv_window_touch_active(void);
+int nv_window_touch_active(void) { return 0; }
+
+/* ---- Vibration (port/recomp_manual.c): a controller's haptics as the game
+ * asks (src/input/xinput_gc.m), on by default; Controls > Vibration, kept as
+ * the "vibration" default. */
+static volatile int g_vibration = -1;
+int nv_window_pref_vibration(void);
+int nv_window_pref_vibration(void)
+{
+    if (g_vibration < 0) {
+        @autoreleasepool {
+            id v = [[NSUserDefaults standardUserDefaults] objectForKey:@"vibration"];
+            g_vibration = v ? ([v boolValue] ? 1 : 0) : 1;
+        }
+    }
+    return g_vibration;
+}
+
 /* ---- Photo mode (port/recomp_manual.c): the request from the menu, and the
  * help panel -- a small borderless window of its own over the game's, at its
  * bottom-left corner, which moves with it and takes no clicks. */
@@ -693,6 +714,7 @@ void nv_window_photo_help(const char *text)
 - (void)pickMsaa:(id)sender;
 - (void)pickRstickCamera:(id)sender;
 - (void)photoMode:(id)sender;
+- (void)toggleVibration:(id)sender;
 - (void)pickMap:(id)sender;
 - (void)showKeys:(id)sender;
 - (void)showPad:(id)sender;
@@ -810,6 +832,10 @@ void nv_window_photo_help(const char *text)
  * it applies), and no more samples than the device offers. */
 - (BOOL)validateMenuItem:(NSMenuItem *)item
 {
+    if ([item action] == @selector(toggleVibration:)) {
+        [item setState:nv_window_pref_vibration() ? NSControlStateValueOn : NSControlStateValueOff];
+        return YES;
+    }
     if ([item action] == @selector(pickRstickCamera:)) {
         [item setState:[item tag] == nv_window_pref_rstick_camera() ? NSControlStateValueOn : NSControlStateValueOff];
         return YES;
@@ -831,6 +857,15 @@ void nv_window_photo_help(const char *text)
 - (void)pickMap:(id)sender
 {
     g_map_request = (int)[sender tag];
+}
+/* Controls > Vibration: on and off, remembered. */
+- (void)toggleVibration:(id)sender
+{
+    int on = !nv_window_pref_vibration();
+    (void)sender;
+    g_vibration = on;
+    [[NSUserDefaults standardUserDefaults] setBool:(on ? YES : NO) forKey:@"vibration"];
+    fprintf(stderr, "[WIN] vibration: %s\n", on ? "on" : "off");
 }
 /* Controls > Photo Mode: starts at the next frame of play (port/recomp_manual.c). */
 - (void)photoMode:(id)sender
@@ -1129,6 +1164,14 @@ static void build_menu(void)
                                                      keyEquivalent:@"p"];
                 [ph setTarget:g_menu_target];
                 [ctl addItem:ph];
+            }
+            [ctl addItem:[NSMenuItem separatorItem]];
+            {
+                NSMenuItem *vb = [[NSMenuItem alloc] initWithTitle:@"Vibration"
+                                                            action:@selector(toggleVibration:)
+                                                     keyEquivalent:@""];
+                [vb setTarget:g_menu_target];
+                [ctl addItem:vb];
             }
         }
         [ctlItem setSubmenu:ctl];

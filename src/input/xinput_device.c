@@ -384,14 +384,19 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     return ERROR_SUCCESS;
 }
 
+/* The vibration goes through Core Haptics (xinput_gc.m): the controller's,
+ * or, on an iPhone played with the on-screen controls, the phone's own. */
+int nv_gc_rumble(unsigned port, float lo, float hi, int allow_device);
+int nv_window_touch_active(void);   /* the iPhone app's on-screen controls (0 on the Mac) */
+
 DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
 {
-    /* Rumble goes through CoreHaptics here, which wants a haptic engine per
-     * controller and a running pattern rather than a motor speed. The game
-     * polls this every frame; reporting success and doing nothing keeps it
-     * happy until that engine exists. */
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pVibration)
         return ERROR_DEVICE_NOT_CONNECTED;
+    if (!host_pad_off())
+        nv_gc_rumble((unsigned)dwPort, pVibration->wLeftMotorSpeed / 65535.0f,
+                     pVibration->wRightMotorSpeed / 65535.0f,
+                     dwPort == 0 && nv_window_touch_active());
     return g_connected[dwPort] ? ERROR_SUCCESS : ERROR_DEVICE_NOT_CONNECTED;
 }
 
@@ -423,6 +428,15 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags,
 #include <SDL.h>
 
 static SDL_GameController *g_pads[XBOX_MAX_CONTROLLERS];
+/* The motors as the game last set them, and when SDL was last told. */
+static WORD   g_rumble_lo[XBOX_MAX_CONTROLLERS], g_rumble_hi[XBOX_MAX_CONTROLLERS];
+static double g_rumble_sent[XBOX_MAX_CONTROLLERS];
+static void rumble_refresh(DWORD port, SDL_GameController *c, double now)
+{
+    if (!(g_rumble_lo[port] | g_rumble_hi[port]) || now - g_rumble_sent[port] < 0.5) return;
+    SDL_GameControllerRumble(c, g_rumble_lo[port], g_rumble_hi[port], 1000);
+    g_rumble_sent[port] = now;
+}
 static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS];
 static DWORD g_packet[XBOX_MAX_CONTROLLERS];
 
@@ -497,6 +511,16 @@ void xbox_InputInit(void)
          */
         SDL_SetHint(SDL_HINT_JOYSTICK_THREAD, "1");
 #endif
+        /* A DualSense or DualShock 4 over Bluetooth only vibrates with its
+         * extended reports on, which SDL leaves off by default (they stay on
+         * until the controller is switched off, and DirectInput games that
+         * do not use SDL read it wrongly meanwhile -- as with Steam).
+         * JSRF_PS_RUMBLE=0 leaves them off. */
+        { const char *e = getenv("JSRF_PS_RUMBLE");
+          if (!(e && e[0] == '0')) {
+              SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS4_RUMBLE, "1");
+              SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE, "1");
+          } }
         if (SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) != 0)
             fprintf(stderr, "[PAD] no controller support: %s\n", SDL_GetError());
     }
@@ -528,6 +552,7 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
         if (c && SDL_GameControllerGetAttached(c)) {
             SDL_GameControllerUpdate();
             have_pad = 1;
+            rumble_refresh(dwPort, c, input_now());
             if (SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_DPAD_UP))    out |= XBOX_GAMEPAD_DPAD_UP;
             if (SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_DPAD_DOWN))  out |= XBOX_GAMEPAD_DPAD_DOWN;
             if (SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_DPAD_LEFT))  out |= XBOX_GAMEPAD_DPAD_LEFT;
@@ -589,11 +614,23 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pVibration)
         return ERROR_DEVICE_NOT_CONNECTED;
     c = g_pads[dwPort];
+#if defined(__ANDROID__)
+    /* No controller: the phone itself, while its on-screen controls are in
+     * use (port/android/jsrf_android.c); a controller's motors otherwise. */
+    {
+        extern void nv_android_rumble(unsigned lo, unsigned hi);
+        if (dwPort == 0) nv_android_rumble(c ? 0 : pVibration->wLeftMotorSpeed, c ? 0 : pVibration->wRightMotorSpeed);
+    }
+#endif
+    g_rumble_lo[dwPort] = pVibration->wLeftMotorSpeed;
+    g_rumble_hi[dwPort] = pVibration->wRightMotorSpeed;
     if (!c) return g_controller_connected[dwPort] ? ERROR_SUCCESS : ERROR_DEVICE_NOT_CONNECTED;
-    /* SDL rumble needs a duration; refresh for ~1s on each call (the game
-     * polls vibration continuously). */
+    /* SDL rumble needs a duration: a second at a time, sent again while it
+     * lasts (rumble_refresh, from each poll) -- the game sets the motors
+     * when they change, not every frame. */
     SDL_GameControllerRumble(c, pVibration->wLeftMotorSpeed,
                              pVibration->wRightMotorSpeed, 1000);
+    g_rumble_sent[dwPort] = input_now();
     return ERROR_SUCCESS;
 }
 

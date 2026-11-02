@@ -2770,6 +2770,7 @@ void sub_001C3E14(void)
     g_eax = 0; g_esp += 4 + 8;
 }
 /* XInputSetState(h, feedback) */
+int nv_window_pref_vibration(void);   /* the window or the app: on by default */
 void sub_001C3E85(void)
 {
     uint32_t fb = GARG(2); uint8_t *m = (uint8_t *)g_xbox_mem_offset;
@@ -2777,6 +2778,15 @@ void sub_001C3E85(void)
         uint32_t ev = *(uint32_t *)(m + fb + 4);
         *(uint32_t *)(m + fb) = 0;                    /* Header.dwStatus = ERROR_SUCCESS */
         XBOX_VIBRATION v = { *(uint16_t *)(m + fb + 0x40), *(uint16_t *)(m + fb + 0x42) };
+        /* Vibration off in the settings or the menu: the motors are asked
+         * to stop, whatever the game says. JSRF_RUMBLE_LOG=1: each change. */
+        if (!nv_window_pref_vibration()) v.wLeftMotorSpeed = v.wRightMotorSpeed = 0;
+        { static int log = -1; static uint16_t l0, h0;
+          if (log < 0) log = getenv("JSRF_RUMBLE_LOG") ? 1 : 0;
+          if (log && (v.wLeftMotorSpeed != l0 || v.wRightMotorSpeed != h0)) {
+              l0 = v.wLeftMotorSpeed; h0 = v.wRightMotorSpeed;
+              fprintf(stderr, "[RUMBLE] t=%.2f port %u: left %u right %u\n", jsrf_now(), GARG(1) & 3, l0, h0);
+          } }
         xbox_InputSetState(GARG(1) & 3, &v);
         if (ev) { static int once; if (!once++) fprintf(stderr, "[PAD] XInputSetState with hEvent=%08X (not signalled)\n", ev); }
     }

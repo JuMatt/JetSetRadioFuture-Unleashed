@@ -16,6 +16,7 @@
 #import <Foundation/Foundation.h>
 #import <GameController/GameController.h>
 #include <stdio.h>
+#include <math.h>
 
 /* Button bits, in this file's own order; xinput_device.c translates them. */
 enum {
@@ -150,4 +151,169 @@ int nv_gc_poll(unsigned port, unsigned short *buttons,
         axes[3] = axis16(g.rightThumbstick.yAxis);
         return 1;
     }
+}
+
+/* ---- vibration ---------------------------------------------------------
+ * The game sets two motor speeds, as on the Xbox pad: the left motor slow
+ * and heavy, the right one fast and light. Core Haptics has no motors: it
+ * plays patterns. So each controller gets an engine of its own (its
+ * GCDeviceHaptics: a DualSense, a DualShock 4, an Xbox Series pad -- macOS 11
+ * and iOS 14 on) playing one long continuous event, looped, whose strength
+ * and sharpness are then turned up and down as the game asks: strength the
+ * stronger of the two motors, sharpness how much of it is the light one.
+ * With no controller, an iPhone's own Taptic Engine does the same while the
+ * on-screen controls are in use. Built at the first call that needs it, torn
+ * down when its controller goes; a failure is said once and not retried for
+ * that controller. */
+#import <CoreHaptics/CoreHaptics.h>
+#include <TargetConditionals.h>
+
+#define RUMBLE_SLOTS 5                  /* 4 controller ports, then the phone */
+static CHHapticEngine *g_rb_engine[RUMBLE_SLOTS] API_AVAILABLE(macos(10.15), ios(13.0));
+static id g_rb_player[RUMBLE_SLOTS];
+static const void *g_rb_owner[RUMBLE_SLOTS];
+static int   g_rb_failed[RUMBLE_SLOTS], g_rb_running[RUMBLE_SLOTS];
+static float g_rb_level[RUMBLE_SLOTS], g_rb_sharp[RUMBLE_SLOTS];
+
+static GCController *controller_for(unsigned port)
+{
+    NSUInteger slot = 0;
+    for (GCController *c in [GCController controllers]) {
+        if (!c.extendedGamepad) continue;
+        if (slot == (NSUInteger)port) return c;
+        slot++;
+    }
+    return nil;
+}
+
+static void rumble_drop(int s) API_AVAILABLE(macos(10.15), ios(13.0))
+{
+    if (g_rb_player[s]) [(id<CHHapticAdvancedPatternPlayer>)g_rb_player[s] stopAtTime:CHHapticTimeImmediate error:nil];
+    if (g_rb_engine[s]) [g_rb_engine[s] stopWithCompletionHandler:nil];
+    g_rb_player[s] = nil;
+    g_rb_engine[s] = nil;
+    g_rb_running[s] = 0;
+    g_rb_level[s] = g_rb_sharp[s] = -1.0f;
+}
+
+/* The engine and its looping player, for slot s: c's, or the device's. */
+static int rumble_ready(int s, GCController *c) API_AVAILABLE(macos(10.15), ios(13.0))
+{
+    NSError *err = nil;
+    CHHapticEngine *e;
+    if (g_rb_player[s]) return 1;
+    if (g_rb_failed[s]) return 0;
+    e = nil;
+    if (c) {
+        if (@available(macOS 11.0, iOS 14.0, *)) {
+            GCDeviceHaptics *h = c.haptics;
+            if (h) e = [h createEngineWithLocality:GCHapticsLocalityDefault];
+        }
+    } else {
+        if (CHHapticEngine.capabilitiesForHardware.supportsHaptics)
+            e = [[CHHapticEngine alloc] initAndReturnError:&err];
+    }
+    if (!e) {
+        g_rb_failed[s] = 1;
+        fprintf(stderr, "[RUMBLE] %s: no haptics%s%s\n", c ? (c.vendorName ? [c.vendorName UTF8String] : "the controller") : "this device",
+                err ? " -- " : "", err ? [[err localizedDescription] UTF8String] : "");
+        fflush(stderr);
+        return 0;
+    }
+    e.playsHapticsOnly = YES;
+    {
+        int slot = s;
+        e.resetHandler = ^{ g_rb_player[slot] = nil; g_rb_running[slot] = 0; g_rb_level[slot] = -1.0f; };
+        e.stoppedHandler = ^(CHHapticEngineStoppedReason r) { (void)r; g_rb_running[slot] = 0; g_rb_level[slot] = -1.0f; };
+    }
+    if (![e startAndReturnError:&err]) {
+        g_rb_failed[s] = 1;
+        fprintf(stderr, "[RUMBLE] the haptic engine did not start: %s\n", err ? [[err localizedDescription] UTF8String] : "?");
+        fflush(stderr);
+        return 0;
+    }
+    {
+        CHHapticEventParameter *in = [[CHHapticEventParameter alloc] initWithParameterID:CHHapticEventParameterIDHapticIntensity value:1.0f];
+        CHHapticEventParameter *sh = [[CHHapticEventParameter alloc] initWithParameterID:CHHapticEventParameterIDHapticSharpness value:0.5f];
+        CHHapticEvent *ev = [[CHHapticEvent alloc] initWithEventType:CHHapticEventTypeHapticContinuous
+                                                         parameters:@[in, sh] relativeTime:0 duration:30.0];
+        CHHapticPattern *p = [[CHHapticPattern alloc] initWithEvents:@[ev] parameters:@[] error:&err];
+        id<CHHapticAdvancedPatternPlayer> pl = p ? [e createAdvancedPlayerWithPattern:p error:&err] : nil;
+        if (!pl) {
+            g_rb_failed[s] = 1;
+            fprintf(stderr, "[RUMBLE] no pattern player: %s\n", err ? [[err localizedDescription] UTF8String] : "?");
+            fflush(stderr);
+            [e stopWithCompletionHandler:nil];
+            return 0;
+        }
+        pl.loopEnabled = YES;
+        g_rb_engine[s] = e;
+        g_rb_player[s] = pl;
+    }
+    fprintf(stderr, "[RUMBLE] %s: haptics ready\n", c ? (c.vendorName ? [c.vendorName UTF8String] : "the controller") : "this device");
+    fflush(stderr);
+    return 1;
+}
+
+/* The game's two motors (0..1) for this port. allow_device: no controller
+ * there and the on-screen controls in use, so the device itself may shake.
+ * Returns 1 when something played (or stopped) it. */
+int nv_gc_rumble(unsigned port, float lo, float hi, int allow_device)
+{
+    if (port >= 4) return 0;
+    if (@available(macOS 10.15, iOS 13.0, *)) {
+        @autoreleasepool {
+            GCController *c = controller_for(port);
+            int s = c ? (int)port : (allow_device && port == 0 ? 4 : -1);
+            const void *owner = (__bridge const void *)c;
+            float level = lo > hi ? lo : hi, sharp;
+            id<CHHapticAdvancedPatternPlayer> pl;
+            NSError *err = nil;
+#if !TARGET_OS_IPHONE
+            if (s == 4) s = -1;                          /* a Mac does not shake */
+#endif
+            if (c && g_rb_owner[port] != owner) {        /* another controller on this port */
+                rumble_drop((int)port);
+                g_rb_owner[port] = owner;
+                g_rb_failed[port] = 0;
+            }
+            if (!c && g_rb_engine[port]) { rumble_drop((int)port); g_rb_owner[port] = NULL; }
+            if (s != 4 && g_rb_engine[4] && g_rb_running[4]) {   /* a controller took over from the device */
+                [(id<CHHapticAdvancedPatternPlayer>)g_rb_player[4] stopAtTime:CHHapticTimeImmediate error:nil];
+                g_rb_running[4] = 0;
+            }
+            if (s < 0) return 0;
+            if (level < 0.02f) {
+                if (g_rb_running[s]) {
+                    [(id<CHHapticAdvancedPatternPlayer>)g_rb_player[s] stopAtTime:CHHapticTimeImmediate error:nil];
+                    g_rb_running[s] = 0;
+                }
+                return 1;
+            }
+            if (!rumble_ready(s, c)) return 0;
+            pl = g_rb_player[s];
+            if (level > 1.0f) level = 1.0f;
+            sharp = (lo + hi) > 0.0f ? hi / (lo + hi) : 0.5f;   /* 0: all the heavy motor, 1: all the light one */
+            if (!g_rb_running[s]) {
+                if (![pl startAtTime:CHHapticTimeImmediate error:&err]) {
+                    /* the engine may have stopped (the app in the background): start it again once */
+                    [g_rb_engine[s] startAndReturnError:nil];
+                    if (![pl startAtTime:CHHapticTimeImmediate error:&err]) { g_rb_player[s] = nil; return 0; }
+                }
+                g_rb_running[s] = 1;
+                g_rb_level[s] = g_rb_sharp[s] = -1.0f;
+            }
+            if (fabsf(level - g_rb_level[s]) > 0.03f || fabsf(sharp - g_rb_sharp[s]) > 0.05f) {
+                CHHapticDynamicParameter *pi = [[CHHapticDynamicParameter alloc]
+                    initWithParameterID:CHHapticDynamicParameterIDHapticIntensityControl value:level relativeTime:0];
+                CHHapticDynamicParameter *ps = [[CHHapticDynamicParameter alloc]
+                    initWithParameterID:CHHapticDynamicParameterIDHapticSharpnessControl value:(sharp - 0.5f) * 0.8f relativeTime:0];
+                [pl sendParameters:@[pi, ps] atTime:CHHapticTimeImmediate error:nil];
+                g_rb_level[s] = level;
+                g_rb_sharp[s] = sharp;
+            }
+            return 1;
+        }
+    }
+    return 0;
 }

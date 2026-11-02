@@ -41,6 +41,10 @@ The same game, made for today's screens and devices:
 - **Photo mode.** Hold Back (or Esc) while skating and the whole city stops —
   skaters, people, cars, spray cans — while the camera is yours: fly it
   around, hide the HUD, frame the shot. An on-screen panel shows the controls.
+- **Vibration, as on the console**, on every platform: Xbox, PlayStation and
+  other controllers (a DualSense or DualShock 4 over Bluetooth too), and on
+  iPhone and Android the phone itself when you play with the on-screen
+  controls. It can be turned off.
 - **A map selector.** Go straight to any of the 14 maps and skate it freely,
   as after the story — nothing to race or chase. Explore Skyscraper District
   on day one.
@@ -320,6 +324,13 @@ the HUD, **A** the help panel, and **B** or **Back** goes back to the game.
 The whole world holds still while you do — the skaters, the people, the cars,
 the spray cans — and goes on where it was when you go back. On a phone it
 needs a controller, for the right stick.
+
+**Vibration:** the controller vibrates as on the Xbox — an Xbox,
+PlayStation (DualSense, DualShock 4, by cable or Bluetooth) or other
+controller; on iPhone and Android with the on-screen controls, the phone
+itself. Turn it off with **Controls › Vibration** on the Mac and Windows,
+**Vibration** in the settings on iPhone and Android, or `vibration=0` in the
+settings file on Linux.
 
 **Map selector:** go straight to any map and skate it freely — the free
 skating that comes after the story, with nothing to race or chase. Choose it

@@ -25,6 +25,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <android/log.h>
 #include "xiso.h"
@@ -300,6 +301,61 @@ JNIEXPORT void JNICALL Java_com_jumatt_jsrfunleashed_JsrfActivity_nativeGoToMap(
 {
     (void)env; (void)cls;
     if (index >= 0 && index < JSRF_MAP_COUNT) nv_window_request_map(k_jsrf_maps[index].mission);
+}
+
+/* ---- vibration: the phone's own, with the on-screen controls ------------
+ * The game's two motors (src/input/xinput_device.c, with no controller on
+ * the first port) as one strength for JsrfActivity.rumble: a long one-shot at
+ * that amplitude, sent again when it changes much or is about to run out,
+ * cancelled at 0. At most ten calls a second. Off with the settings'
+ * Vibration (port/recomp_manual.c sends nothing then). */
+void *SDL_AndroidGetJNIEnv(void);
+void *SDL_AndroidGetActivity(void);
+void nv_android_rumble(unsigned lo, unsigned hi);
+void nv_android_rumble(unsigned lo, unsigned hi)
+{
+    static int amp_now;
+    static double sent;
+    static jclass cls;
+    static jmethodID mid;
+    static int broken;
+    struct timespec ts;
+    double now;
+    int amp = (int)((lo > hi ? lo : hi) / 257u);
+    JNIEnv *env;
+    if (!g_touch_shown || amp < 8) amp = 0;
+    if (amp > 255) amp = 255;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    now = ts.tv_sec + ts.tv_nsec * 1e-9;
+    if (broken) return;
+    if (amp == 0 && amp_now == 0) return;
+    if (amp && amp_now && abs(amp - amp_now) < 20 && now - sent < 8.0) return;
+    if (amp && now - sent < 0.1) return;
+    env = (JNIEnv *)SDL_AndroidGetJNIEnv();
+    if (!env) return;
+    if (!mid) {
+        jobject act = (jobject)SDL_AndroidGetActivity();
+        jclass c;
+        if (!act) return;
+        c = (*env)->GetObjectClass(env, act);
+        cls = (jclass)(*env)->NewGlobalRef(env, c);
+        mid = (*env)->GetStaticMethodID(env, cls, "rumble", "(I)V");
+        (*env)->DeleteLocalRef(env, c);
+        (*env)->DeleteLocalRef(env, act);
+        if (!mid) { (*env)->ExceptionClear(env); broken = 1; return; }
+    }
+    (*env)->CallStaticVoidMethod(env, cls, mid, (jint)amp);
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    amp_now = amp;
+    sent = now;
+}
+
+/* The settings' Vibration (the file is written by the Java side). */
+void nv_window_note_vibration(int on);
+JNIEXPORT void JNICALL Java_com_jumatt_jsrfunleashed_JsrfActivity_nativeSetVibration(JNIEnv *env, jclass cls, jboolean on)
+{
+    (void)env; (void)cls;
+    nv_window_note_vibration(on ? 1 : 0);
 }
 
 /* A line for the log, from the Java side. */

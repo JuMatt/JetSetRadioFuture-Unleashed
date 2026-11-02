@@ -1438,6 +1438,20 @@ static void sdl_cfg_set(const char *key, int val)
 /* nv2a_widescreen() asks this when RECOMP_WIDESCREEN is not set. */
 int nv_window_pref_widescreen(void) { return sdl_cfg_get("widescreen", 0) != 0; }
 
+/* Vibration (port/recomp_manual.c): the controller's motors as the game
+ * asks, on by default; vibration=0 in the settings turns it off (Windows:
+ * Controls > Vibration; the Android app's settings write the file and tell
+ * the engine through nv_window_note_vibration). */
+static volatile int g_vibration = -1;
+int nv_window_pref_vibration(void);
+int nv_window_pref_vibration(void)
+{
+    if (g_vibration < 0) g_vibration = sdl_cfg_get("vibration", 1) != 0;
+    return g_vibration;
+}
+void nv_window_note_vibration(int on);
+void nv_window_note_vibration(int on) { g_vibration = on ? 1 : 0; }
+
 /* The camera on the right stick (port/recomp_manual.c): 1 the camera (the
  * default), 2 tracking -- the view turns and the skater keeps his heading --
  * or 0 off. Controls in the window's menu bar on Windows, F7 anywhere (and
@@ -1823,7 +1837,7 @@ static void sdl_set_rstick_camera(int mode)
  */
 #include <SDL2/SDL_syswm.h>
 enum { MENU_RES1 = 101, MENU_FULL = 111, MENU_PIC1 = 112, MENU_SMAA = 120, MENU_MSAA1 = 121,
-       MENU_RCAM = 130, MENU_RCAMT = 131, MENU_PHOTO = 132, MENU_MAPS = 139, MENU_MAP0 = 140 };
+       MENU_RCAM = 130, MENU_RCAMT = 131, MENU_PHOTO = 132, MENU_VIB = 133, MENU_MAPS = 139, MENU_MAP0 = 140 };
 static HWND  g_menu_hwnd;
 static HMENU g_menu_bar, g_menu_video, g_menu_res, g_menu_aa, g_menu_pic, g_menu_controls;
 
@@ -1852,6 +1866,8 @@ static void sdl_menu_update(void)
                       MF_BYCOMMAND | (nv_window_pref_rstick_camera() == 1 ? MF_CHECKED : MF_UNCHECKED));
         CheckMenuItem(g_menu_controls, MENU_RCAMT,
                       MF_BYCOMMAND | (nv_window_pref_rstick_camera() == 2 ? MF_CHECKED : MF_UNCHECKED));
+        CheckMenuItem(g_menu_controls, MENU_VIB,
+                      MF_BYCOMMAND | (nv_window_pref_vibration() ? MF_CHECKED : MF_UNCHECKED));
     }
 }
 
@@ -1904,6 +1920,8 @@ static void sdl_menu_init(void)
         AppendMenuW(g_menu_controls, MF_STRING, MENU_RCAMT, L"Camera on the Right Stick (&Tracking)");
         AppendMenuW(g_menu_controls, MF_SEPARATOR, 0, NULL);
         AppendMenuW(g_menu_controls, MF_STRING, MENU_PHOTO, L"&Photo Mode\t(hold Back / Esc)");
+        AppendMenuW(g_menu_controls, MF_SEPARATOR, 0, NULL);
+        AppendMenuW(g_menu_controls, MF_STRING, MENU_VIB, L"&Vibration");
         AppendMenuW(g_menu_bar, MF_POPUP, (UINT_PTR)g_menu_controls, L"&Controls");
     }
     {   /* Maps: each map, by district (jsrf_maps.h); F6 the same list on screen. */
@@ -1961,6 +1979,12 @@ static void sdl_menu_command(unsigned id)
         sdl_pick_msaa(1 << (id - MENU_MSAA1));
     } else if (id == MENU_PHOTO) {
         nv_window_request_photo();
+    } else if (id == MENU_VIB) {
+        int on = !nv_window_pref_vibration();
+        nv_window_note_vibration(on);
+        sdl_cfg_set("vibration", on);
+        fprintf(stderr, "[WIN] vibration: %s\n", on ? "on" : "off");
+        sdl_menu_update();
     } else if (id == MENU_MAPS) {
         nv_window_request_map(-1);
     } else if (id >= MENU_MAP0 && id < MENU_MAP0 + (unsigned)JSRF_MAP_COUNT) {
