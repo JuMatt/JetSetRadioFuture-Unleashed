@@ -10,6 +10,35 @@ its version. Downloads are on the
 [Releases](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases)
 page.
 
+## 0.6.4 — 2 November 2026
+
+Photo mode, and further draw distance in Skyscraper District. Every platform
+is new in 0.6.4.
+
+- **Photo mode.** Hold **Back** (Esc on a keyboard) for about a second while
+  skating, or choose **Controls › Photo Mode** (⌘ P on the Mac, the Controls
+  menu on Windows, the settings on iPhone and Android). The camera leaves the
+  skater: the left stick moves it, the right stick turns it, the triggers
+  lower and raise it; **Y** hides the HUD, **A** the help, and **B** or
+  **Back** goes back to the game. A panel at the bottom left of the screen
+  lists the controls, with the keyboard's keys. The game keeps running around
+  you while the skater waits; on a phone it needs a controller, for the right
+  stick.
+- **Skyscraper District: no more towers popping in.** The game draws a map
+  area by area, only those it judges visible from where you are, so the
+  towers and satellite dishes on the way to 99th Street appeared as you came
+  close — on the Xbox too. In Skyscraper District the areas drawn now reach
+  two steps further, as Miggas worked out in his
+  [JSRF-Recomp](https://github.com/Miggas/JSRF-Recomp) (thank you). Only the
+  drawing changes; the game's own areas still decide everything else. It
+  costs a few frames a second there (about 6 on a Mac); elsewhere nothing
+  changes. `RECOMP_DRAW_AREAS=game`: as on the Xbox.
+- Tested on a Mac in Skyscraper District: photo mode started by holding Back,
+  flew the camera over the rooftops, hid the HUD and went back to the game;
+  the further draw distance showed the distant light pillars the game leaves
+  out. The help panel on Linux. Windows, the iPhone and Android: built and
+  checked, not run.
+
 ## 0.6.3 — 2 November 2026
 
 The brake sparks and smoke, as on the console. Every platform is new in 0.6.3.
