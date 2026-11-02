@@ -50,3 +50,6 @@ port/recomp/
 # Backups and merge leftovers
 *.bak*
 *.orig
+
+# Derived locally from the game executable; never distribute lifted bodies.
+port/jsrf_camera_native.inc

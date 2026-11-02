@@ -652,6 +652,9 @@ unsigned nv2a_gfx_gl_fbo(uint32_t rt);   /* nv2a_gfx_gl.c */
 static CGLContextObj g_cgl_ctx;
 #elif defined(NV2A_GL_USE_SDL)
 static SDL_Window   *g_window;
+static SDL_atomic_t g_camera_focused = {1}, g_camera_focus_generation;
+int nv_window_camera_focused(void) { return SDL_AtomicGet(&g_camera_focused); }
+uint32_t nv_window_camera_focus_generation(void) { return (uint32_t)SDL_AtomicGet(&g_camera_focus_generation); }
 static SDL_GLContext g_sdl_ctx;
 int  nv2a_widescreen(void);   /* below; the window opens in its shape */
 #elif defined(NV2A_GL_USE_NONE)
@@ -2590,9 +2593,15 @@ static void sdl_pump(void)
         case SDL_WINDOWEVENT:
             /* Losing focus with a key held never delivers its key-up. */
             if (ev.window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
+                SDL_AtomicSet(&g_camera_focused, 0);
+                SDL_AtomicAdd(&g_camera_focus_generation, 1);
                 int i;
                 g_sdl_kb_buttons = 0;
                 for (i = 0; i < 8; i++) g_sdl_kb_analog[i] = 0;
+            }
+            if (ev.window.event == SDL_WINDOWEVENT_FOCUS_GAINED) {
+                SDL_AtomicSet(&g_camera_focused, 1);
+                SDL_AtomicAdd(&g_camera_focus_generation, 1);
             }
 #if SDL_VERSION_ATLEAST(2, 0, 18)
             /* 21:9 is the screen's own shape: moved to another screen, the
