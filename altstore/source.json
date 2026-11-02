@@ -27,6 +27,15 @@
       },
       "versions": [
         {
+          "version": "0.6.3",
+          "buildVersion": "0.6.3",
+          "date": "2026-11-02T09:45:52Z",
+          "localizedDescription": "The brake sparks and smoke now come every time, as on the console (the fix found by Miggas).",
+          "downloadURL": "https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/download/v0.6.3/JSRF-Unleashed-iOS.ipa",
+          "size": 13394629,
+          "minOSVersion": "15.0"
+        },
+        {
           "version": "0.6.2",
           "buildVersion": "0.6.2",
           "date": "2026-11-01T20:56:17Z",
