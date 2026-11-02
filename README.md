@@ -19,6 +19,34 @@ application.
 game files, no textures, no music, no video. It plays the files from a disc
 you own.
 
+## What it adds to the 2002 original
+
+The same game, made for today's screens and devices:
+
+- **On your phone.** Native apps for **iPhone, iPad and Android**, with
+  on-screen touch controls, or any Bluetooth controller — Xbox, DualSense,
+  Switch Pro. And natively on **Mac** (Apple Silicon, Metal), **Windows** and
+  **Linux**.
+- **Up to 4K.** The internal resolution goes from the Xbox's 640×480 up to
+  6× — 3840×2880, for a 4K screen — with **SMAA** and **MSAA** anti-aliasing.
+- **Widescreen 16:9 and ultrawide 21:9.** A wider view of Tokyo-to, not a
+  stretched one; the HUD moves out to the edges of the screen, and the boost's
+  heat haze covers the whole picture. On iPhone, the picture can fill the
+  screen.
+- **The camera on the right stick.** Turn and tilt the camera freely, as in a
+  modern game — the skater goes where you look, or, set to **tracking**, keeps
+  going while you look around. Or keep the original camera.
+- **Smooth 60 fps.** Shaders are built ahead and kept between sessions, so
+  new places don't stutter.
+- **The brake sparks and smoke, as on the console.** They come every time
+  and follow your skates, which they don't in emulation.
+- **Keyboard controls** on computers, by key position (WASD on QWERTY, ZQSD
+  on AZERTY), and **Game Mode** in full screen on the Mac.
+- **Your own copy, your way.** It plays from your game files or a disc image
+  of your disc; on iPhone, updates come through AltStore.
+
+What changed in each version is in the [changelog](CHANGELOG.md).
+
 ---
 
 ## Download
