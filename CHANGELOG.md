@@ -10,6 +10,24 @@ its version. Downloads are on the
 [Releases](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases)
 page.
 
+## 0.6.5 — 2 November 2026
+
+Photo mode now freezes the world. Every platform is new in 0.6.5.
+
+- **Photo mode stops everything.** In 0.6.4 the game kept running while you
+  framed a shot: the skater's idle, the people, the cars, the spray cans
+  turning. Now the whole city holds still the moment photo mode starts, and
+  goes on from where it was when you go back to the game. The game's frame
+  runs the world's update and then a second pass where the poses and the
+  cans' turn are worked out; while photo mode is on both are left out, all
+  but the camera, so the scene is drawn exactly as it stood. Music and sound
+  carry on. `JSRF_PHOTO_FREEZE=0`: the world runs on, as in 0.6.4.
+- Tested on a Mac in Skyscraper District: with the camera still, pictures
+  taken two and four seconds apart in photo mode were the same (about 20
+  pixels in 1.2 million, against about 7,000 before); the camera turned
+  freely; after B the world went on. 60 fps throughout. Windows, Linux, the
+  iPhone and Android: built and checked, not run.
+
 ## 0.6.4 — 2 November 2026
 
 Photo mode, and further draw distance in Skyscraper District. Every platform
