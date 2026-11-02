@@ -27,6 +27,15 @@
       },
       "versions": [
         {
+          "version": "0.6.6",
+          "buildVersion": "0.6.6",
+          "date": "2026-11-02T15:38:42Z",
+          "localizedDescription": "A map selector: Go to a map in the settings takes you straight to any of the 14 maps, to skate it freely.",
+          "downloadURL": "https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/download/v0.6.6/JSRF-Unleashed-iOS.ipa",
+          "size": 13403479,
+          "minOSVersion": "15.0"
+        },
+        {
           "version": "0.6.5",
           "buildVersion": "0.6.5",
           "date": "2026-11-02T12:58:47Z",
