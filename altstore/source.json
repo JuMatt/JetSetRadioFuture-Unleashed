@@ -27,6 +27,15 @@
       },
       "versions": [
         {
+          "version": "0.6.4",
+          "buildVersion": "0.6.4",
+          "date": "2026-11-02T11:16:16Z",
+          "localizedDescription": "Photo mode (the settings, or hold Back with a controller), and no more towers popping in in Skyscraper District.",
+          "downloadURL": "https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/download/v0.6.4/JSRF-Unleashed-iOS.ipa",
+          "size": 13404024,
+          "minOSVersion": "15.0"
+        },
+        {
           "version": "0.6.3",
           "buildVersion": "0.6.3",
           "date": "2026-11-02T09:45:52Z",
