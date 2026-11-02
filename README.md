@@ -256,6 +256,24 @@ the files before starting and says what they are if they are not the right
 ones. Make an image of your own disc (`.iso`), or extract it: you want the
 folder with `default.xbe`, `Media/` and the rest.
 
+### A save from an Xbox, xemu or Cxbx-Reloaded
+
+Copy the save's folder into the game folder's `UDATA/5345000a/` (5345000a is
+JSRF's title ID), next to any save already there — from Cxbx-Reloaded it is
+in `EmuDisk/Partition1/UDATA/5345000a/`; from xemu or an Xbox, copy it out of
+the hard-disk image or the console with a FATX tool. A save is signed by the
+console or emulator that made it, and a save JSRF cannot check is taken for a damaged one,
+so sign it again for JSRF Unleashed with
+[`tools/jsrf_save_resign.py`](tools/jsrf_save_resign.py) (Python 3):
+
+```
+python3 jsrf_save_resign.py "<the game folder>/UDATA/5345000a"
+```
+
+It keeps a copy of each save as it was (`JSRFDATA.SAV.orig`) and leaves saves
+already signed for JSRF Unleashed alone. On iPhone and Android, sign it on a
+computer first, then copy the folder in.
+
 ## Playing
 
 **Controller:** any pad macOS recognises — Xbox, DualSense, DualShock 4 and
