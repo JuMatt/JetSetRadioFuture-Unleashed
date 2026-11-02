@@ -83,6 +83,7 @@ mkdir -p "$W/assets/licences"
 cp "$repo/LICENSE" "$W/assets/licences/LICENSE.txt"
 cp "$repo/NOTICE" "$W/assets/licences/NOTICE.txt"
 cp "$repo/LICENSES/LGPL-2.1.txt" "$W/assets/licences/LGPL-2.1.txt"
+cp "$repo/LICENSES/MIT-JSRF-Recomp.txt" "$W/assets/licences/MIT-JSRF-Recomp.txt"
 cp "$SDLSRC/LICENSE.txt" "$W/assets/licences/SDL2-LICENSE.txt"
 
 mkdir -p "$W/gen" "$W/classes" "$W/dex" "$W/apk/lib/$ABI"

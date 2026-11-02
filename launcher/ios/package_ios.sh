@@ -60,7 +60,7 @@ for spec in "AppIcon60x60@2x 120" "AppIcon60x60@3x 180" "AppIcon76x76@2x~ipad 15
     sips -s format png -z "$2" "$2" "$src" --out "$app/$1.png" >/dev/null
 done
 
-for f in LICENSE NOTICE LICENSES/LGPL-2.1.txt; do
+for f in LICENSE NOTICE LICENSES/LGPL-2.1.txt LICENSES/MIT-JSRF-Recomp.txt; do
     [ -f "$repo/$f" ] && cp "$repo/$f" "$app/$(basename "${f%.txt}").txt"
 done
 

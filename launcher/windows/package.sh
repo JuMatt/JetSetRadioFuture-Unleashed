@@ -55,6 +55,7 @@ printf '%s\n' "$version" > "$dir/VERSION"
 sed 's/$/\r/' "$here/README.txt" > "$dir/README.txt"
 for f in LICENSE NOTICE; do sed 's/$/\r/' "$repo/$f" > "$dir/licences/$f.txt"; done
 sed 's/$/\r/' "$repo/LICENSES/LGPL-2.1.txt" > "$dir/licences/LGPL-2.1.txt"
+sed 's/$/\r/' "$repo/LICENSES/MIT-JSRF-Recomp.txt" > "$dir/licences/MIT-JSRF-Recomp.txt"
 if [ -n "${LICENCES_DIR:-}" ]; then
     for f in SDL2-COPYING.txt libepoxy-COPYING.txt winpthreads-COPYING.txt; do
         [ -f "$LICENCES_DIR/$f" ] && sed 's/$/\r/' "$LICENCES_DIR/$f" > "$dir/licences/$f"

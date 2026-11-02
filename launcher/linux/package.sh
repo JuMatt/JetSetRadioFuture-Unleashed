@@ -45,6 +45,7 @@ install -m 644 "$repo/launcher/icon/AppIcon.iconset/icon_256x256.png" "$dir/shar
 install -m 644 "$repo/LICENSE" "$dir/licences/LICENSE.txt"
 install -m 644 "$repo/NOTICE" "$dir/licences/NOTICE.txt"
 install -m 644 "$repo/LICENSES/LGPL-2.1.txt" "$dir/licences/LGPL-2.1.txt"
+install -m 644 "$repo/LICENSES/MIT-JSRF-Recomp.txt" "$dir/licences/MIT-JSRF-Recomp.txt"
 [ -n "${SDL_LICENSE:-}" ] && install -m 644 "$SDL_LICENSE" "$dir/licences/SDL2-LICENSE.txt"
 
 # What the engine needs from the system, said once at packaging time.

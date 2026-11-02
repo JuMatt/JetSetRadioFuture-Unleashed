@@ -107,7 +107,7 @@ else
 fi
 
 # The licences travel with the binary (MIT; the xemu audio code is LGPL).
-for f in LICENSE NOTICE LICENSES/LGPL-2.1.txt; do
+for f in LICENSE NOTICE LICENSES/LGPL-2.1.txt LICENSES/MIT-JSRF-Recomp.txt; do
   [ -f "$here/../$f" ] && cp "$here/../$f" "$app/Contents/Resources/$(basename "${f%.txt}").txt"
 done
 

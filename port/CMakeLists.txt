@@ -87,6 +87,47 @@ add_subdirectory("${JSRF_REPO}" "${CMAKE_BINARY_DIR}/xboxrecomp")
 
 file(GLOB JSRF_GEN_SOURCES CONFIGURE_DEPENDS "${JSRF_GEN_DIR}/*.c")
 
+# recomp_manual.c wraps some generated functions: it declares the generated
+# body as sub_X_gen ("extern void sub_X_gen(void);") and defines sub_X itself.
+# tools/recomp names such a body sub_X_gen when it generates the code; code
+# generated before a wrap was added still calls it sub_X. A generated file
+# like that is compiled from a copy in the build folder with the body renamed,
+# so older generated code -- the release builds' included -- needs no editing
+# by hand. Files that need nothing are compiled where they are.
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/recomp_manual.c" _jsrf_wrap_lines
+     REGEX "^extern void sub_[0-9A-Fa-f]+_gen\\(void\\);")
+set(_jsrf_wraps "")
+foreach(_l IN LISTS _jsrf_wrap_lines)
+    string(REGEX REPLACE "^extern void (sub_[0-9A-Fa-f]+)_gen\\(void\\);.*$" "\\1" _n "${_l}")
+    list(APPEND _jsrf_wraps "${_n}")
+endforeach()
+set(_jsrf_gen_sources "")
+foreach(_src IN LISTS JSRF_GEN_SOURCES)
+    file(READ "${_src}" _txt)
+    set(_renamed "")
+    foreach(_n IN LISTS _jsrf_wraps)
+        string(FIND "${_txt}" "\nvoid ${_n}(void)\n" _at)
+        if(NOT _at EQUAL -1)
+            string(REPLACE "\nvoid ${_n}(void)\n" "\nvoid ${_n}_gen(void)\n" _txt "${_txt}")
+            list(APPEND _renamed "${_n}")
+        endif()
+    endforeach()
+    if(_renamed)
+        get_filename_component(_name "${_src}" NAME)
+        set(_copy "${CMAKE_CURRENT_BINARY_DIR}/gen_wrapped/${_name}")
+        file(WRITE "${_copy}.new" "${_txt}")
+        execute_process(COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${_copy}.new" "${_copy}")
+        file(REMOVE "${_copy}.new")
+        list(APPEND _jsrf_gen_sources "${_copy}")
+        message(STATUS "Generated code: ${_name} compiled with ${_renamed} renamed _gen (wrapped in recomp_manual.c)")
+    else()
+        list(APPEND _jsrf_gen_sources "${_src}")
+    endif()
+    unset(_txt)
+endforeach()
+set(JSRF_GEN_SOURCES ${_jsrf_gen_sources})
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/recomp_manual.c")
+
 # The release builds' generated code carries two tables of functions an
 # earlier discovery pass missed (recomp_seeded.c, recomp_holes.c; see
 # recomp_manual.c). Code generated with today's tools/recomp has neither:

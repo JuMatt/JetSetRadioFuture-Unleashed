@@ -10,3 +10,9 @@ and remaining the copyright of espes, Jannik Vogel and Matt Borgerson.
 
 Shipping the verbatim text alongside those files is an LGPL requirement, not
 a courtesy.
+
+`MIT-JSRF-Recomp.txt` is the MIT License with Miggas's copyright notice, from
+
+    https://github.com/Miggas/JSRF-Recomp
+
+It applies to `port/sse_p3.h`, taken from that project (see NOTICE).

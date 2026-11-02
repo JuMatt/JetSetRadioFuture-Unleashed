@@ -108,6 +108,22 @@ Derived algorithms — credited, independently implemented
   label.
 
 
+MIT -- from JSRF-Recomp, by Miggas
+-----------------------------------
+
+  https://github.com/Miggas/JSRF-Recomp
+
+    port/sse_p3.h         the Pentium III's rcpss / rsqrtss, bit for bit
+                          (c) 2026 Miggas
+
+  port/recomp_manual.c's sub_0014C410 (the brake sparks and smoke) is this
+  project's own code, after his finding that that one rsqrtss needs the
+  console's value.
+
+  Licensed under the MIT License; the full text, with his copyright notice,
+  is in LICENSES/MIT-JSRF-Recomp.txt.
+
+
 Reference material (no code taken)
 -----------------------------------
 

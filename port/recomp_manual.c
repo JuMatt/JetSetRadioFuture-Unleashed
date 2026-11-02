@@ -4523,3 +4523,65 @@ static void jsrf_cam_counts(void)
             len += snprintf(line + len, sizeof line - len, " %05X:%lu", jsrf_camva[i], jsrf_camcnt[i]);
     fprintf(stderr, "%s\n", line); fflush(stderr);
 }
+
+/* ---- The brake sparks: sub_0014C410 with the console's rsqrtss -----------
+ *
+ * Braking (the stick forward, then back) throws red sparks and smoke from the
+ * skates. Here, as in xemu, they came out only now and then, and stayed at a
+ * fixed spot instead of following the skates; on the console and in
+ * Cxbx-Reloaded they come every time. Miggas found why, in JSRF-Recomp
+ * (https://github.com/Miggas/JSRF-Recomp, its v125-v127): the console's
+ * Pentium III answers rsqrtss with a 12-bit approximation, and the lifter --
+ * like xemu -- computes 1/sqrt(x) exactly. One site needs the console's value:
+ * the rsqrtss in sub_0014C410, which normalises the vector at edx into ecx
+ * (x, y, z each times 1/sqrt(x^2 + y^2 + z^2)). Approximating the other sites
+ * as well broke geometry and shading in his tests, so only this one is.
+ *
+ * The body below is the generated one, statement for statement, but for that
+ * instruction, which gives the Pentium III's result bit for bit on any host
+ * (sse_p3.h, his table). RECOMP_SSE_P3=0: the exact value, as before.
+ */
+#include "sse_p3.h"
+extern void sub_0014C410_gen(void);
+static int sse_p3_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_SSE_P3");
+        on = !(e && *e == '0');
+        fprintf(stderr, "[SSE] the brake sparks' vector normalise (sub_0014C410): %s\n",
+                on ? "the console's rsqrtss" : "exact 1/sqrt (RECOMP_SSE_P3=0)");
+    }
+    return on;
+}
+static float rsqrtss_p3(float x)
+{
+    uint32_t u;
+    memcpy(&u, &x, 4);
+    u = p3_rsq_bits(u);
+    memcpy(&x, &u, 4);
+    return x;
+}
+void sub_0014C410(void)
+{
+    if (!sse_p3_on()) { sub_0014C410_gen(); return; }
+    g_xmm0 = XMM_SCALAR(MEMF(g_edx));                                    /* movss */
+    g_xmm1 = XMM_SCALAR(MEMF(g_edx + 4));                                /* movss */
+    g_xmm2 = XMM_SCALAR(MEMF(g_edx + 8));                                /* movss */
+    g_xmm4.f[0] = g_xmm0.f[0];                                           /* movss */
+    g_xmm0.f[0] = g_xmm0.f[0] * g_xmm0.f[0];                             /* mulss */
+    g_xmm5.f[0] = g_xmm1.f[0];                                           /* movss */
+    g_xmm1.f[0] = g_xmm1.f[0] * g_xmm1.f[0];                             /* mulss */
+    g_xmm6.f[0] = g_xmm2.f[0];                                           /* movss */
+    g_xmm2.f[0] = g_xmm2.f[0] * g_xmm2.f[0];                             /* mulss */
+    g_xmm0.f[0] = g_xmm0.f[0] + g_xmm1.f[0];                             /* addss */
+    g_xmm0.f[0] = g_xmm0.f[0] + g_xmm2.f[0];                             /* addss */
+    g_xmm0.f[0] = rsqrtss_p3(g_xmm0.f[0]);                               /* rsqrtss */
+    g_xmm4.f[0] = g_xmm4.f[0] * g_xmm0.f[0];                             /* mulss */
+    g_xmm5.f[0] = g_xmm5.f[0] * g_xmm0.f[0];                             /* mulss */
+    g_xmm6.f[0] = g_xmm6.f[0] * g_xmm0.f[0];                             /* mulss */
+    MEMWF(g_ecx, g_xmm4.f[0]);                                           /* movss */
+    MEMWF(g_ecx + 4, g_xmm5.f[0]);                                       /* movss */
+    MEMWF(g_ecx + 8, g_xmm6.f[0]);                                       /* movss */
+    g_esp += 4;                                                          /* ret */
+}
