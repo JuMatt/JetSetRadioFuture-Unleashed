@@ -774,6 +774,51 @@ void sub_0013D300(void)
     sub_0013D300_gen();
 }
 
+/* ---- photo mode's freeze: the world's update skipped ------------------------
+ * sub_000123E0 is the game's scene tick, once a frame from the main loop
+ * (sub_00013A80). In play (none of its pause states at +0x40..+0x4C set) it
+ * runs seven systems and then the update walk of the task tree (sub_00011070:
+ * each node's vtable slot 1 -- the skaters, the people, the cars, the
+ * camera...), then the publish walk (sub_00011D00, slot 2) and the draw.
+ * While photo mode is on those eight calls are left out -- found by the
+ * return address each pushed (they are called from there only, the walk also
+ * from itself). The publish walk moves things too (the skaters' poses, the
+ * cans turning are worked out there: a test with the updates left out still
+ * had them going), so it is left out as well, all but the camera's publish,
+ * which is made by itself (sub_00011D00, below): the scene as it stood, drawn
+ * as ever, seen from the photo camera. JSRF_PHOTO_FREEZE=0 (test only) leaves
+ * the world running, as in 0.6.4. */
+static volatile int s_world_frozen;
+static uint32_t s_frozen_cam;   /* the camera, whose publish is still made */
+static int photo_freeze_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("JSRF_PHOTO_FREEZE"); on = !(e && e[0] == '0'); }
+    return on;
+}
+static int frozen_skip(uint32_t ra)
+{
+    if (!s_world_frozen) return 0;
+    if (*(const uint32_t *)((const uint8_t *)g_xbox_mem_offset + g_esp) != ra) return 0;
+    g_esp += 4;                     /* the ret it would have made */
+    return 1;
+}
+/* Each written out (the build finds the wrapped functions by their extern line). */
+extern void sub_0006F8C0_gen(void);
+void sub_0006F8C0(void) { if (frozen_skip(0x0001247Cu)) return; sub_0006F8C0_gen(); }
+extern void sub_0001DF30_gen(void);
+void sub_0001DF30(void) { if (frozen_skip(0x00012486u)) return; sub_0001DF30_gen(); }
+extern void sub_00065800_gen(void);
+void sub_00065800(void) { if (frozen_skip(0x00012490u)) return; sub_00065800_gen(); }
+extern void sub_00066AD0_gen(void);
+void sub_00066AD0(void) { if (frozen_skip(0x0001249Au)) return; sub_00066AD0_gen(); }
+extern void sub_00024AE0_gen(void);
+void sub_00024AE0(void) { if (frozen_skip(0x000124A4u)) return; sub_00024AE0_gen(); }
+extern void sub_00066110_gen(void);
+void sub_00066110(void) { if (frozen_skip(0x000124AEu)) return; sub_00066110_gen(); }
+extern void sub_00015130_gen(void);
+void sub_00015130(void) { if (frozen_skip(0x000124B8u)) return; sub_00015130_gen(); }
+
 /* ---- sub_00011070: scene-graph walk -- validate node pointers first, so
  * the holder of a corrupted link is named before the walk dereferences it. */
 extern void sub_00011070_gen(void);
@@ -833,6 +878,7 @@ void sub_00011070(void)
             e = (*end == ',') ? end + 1 : end;
         }
     }
+    if (depth == 0 && frozen_skip(0x000124C3u)) return;   /* photo mode: the world held */
     if (check && g_ecx) jsrf_check_tree(g_ecx, 0, 0, "root");
     if (depth == 0 && idump < ndump && g_ecx && pad_now() >= dump_t[idump]) {
         idump++;
@@ -4236,6 +4282,7 @@ static void photo_leave(const char *why)
 {
     if (!s_photo.on) return;
     s_photo.on = 0;
+    s_world_frozen = 0;
     if (s_photo.hud_hidden) nv2a_set_hide_hud(0);
     s_photo.hud_hidden = 0;
     photo_show_help();
@@ -4291,6 +4338,8 @@ static int photo_frame(uint8_t *m, uint32_t cam, uint32_t mode, float dt)
         s_photo.want = 0;
         if (mode == 12 || mode == 14) return 0;
         s_photo.on = 1;
+        s_frozen_cam = cam;
+        s_world_frozen = photo_freeze_on();
         s_photo.help = 1;
         s_photo.hud_hidden = 0;
         s_photo.back_was = 1;          /* the Back that started it does not end it */
@@ -4536,6 +4585,7 @@ static void rcam_apply(uint8_t *m, uint32_t cam)
     }
 }
 
+
 /* ---- the camera -------------------------------------------------------------
  * Object 0x4C (class 0x1CD518) is the camera; sub_000A5070 its per-frame
  * update. It picks a mode from its target character's state (+0xE58, with
@@ -4630,9 +4680,28 @@ void sub_000A28B0(void)
     uint8_t *m = (uint8_t *)g_xbox_mem_offset;
     uint32_t cam = g_ecx;
     jsrf_camcnt[0]++;
+    if (s_world_frozen) s_rcam_frames++;   /* its update, which counts the frames, is held */
     rcam_restore(m, cam);
     sub_000A28B0_gen();
     rcam_apply(m, cam);
+}
+/* The publish walk (sub_00011D00, from the scene tick at 0x12547 and from
+ * itself): while the world is frozen it is left out, and only the camera's
+ * publish is made, as the walk makes it -- this pointer, a return address. */
+extern void sub_00011D00_gen(void);
+void sub_001BA8A0(void);
+void sub_00011D00(void)
+{
+    uint8_t *m = (uint8_t *)g_xbox_mem_offset;
+    uint32_t cam = s_frozen_cam;
+    if (!s_world_frozen || *(const uint32_t *)(m + g_esp) != 0x0001254Cu) { sub_00011D00_gen(); return; }
+    g_esp += 4;                                 /* the walk's own ret */
+    if (cam < 0x10000u || cam + 0x240u >= (64u << 20) || *(const uint32_t *)(m + cam) != 0x001CD518u) return;
+    g_esp -= 4; *(uint32_t *)(m + g_esp) = 0x00011D63u;
+    sub_001BA8A0();                             /* the walk's matrix to identity first */
+    g_ecx = cam;
+    g_esp -= 4; *(uint32_t *)(m + g_esp) = 0x00011D6Au;
+    sub_000A28B0();                             /* each pops its return address, as a ret */
 }
 extern void sub_000A2960_gen(void);
 void sub_000A2960(void) { jsrf_camcnt[1]++; sub_000A2960_gen(); }
