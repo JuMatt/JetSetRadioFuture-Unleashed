@@ -10,6 +10,28 @@ its version. Downloads are on the
 [Releases](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases)
 page.
 
+## 0.6.6 — 2 November 2026
+
+A map selector. Every platform is new in 0.6.6.
+
+- **Go straight to any map.** The 14 maps, under the game's own names and
+  grouped by district (Shibuya-cho, Kogane-cho, Benten-cho), each loaded as
+  the free skating that comes after the story: no timer, nothing to race or
+  chase. On the Mac and Windows it is the **Maps** menu; on iPhone and
+  Android, **Go to a map** in the settings; **F6** on Windows and Linux (and
+  **Maps › Map Selector** on the Mac) shows the same list on screen, gone
+  through with the pad or the keyboard (up and down, **A** or Return to go,
+  **B** or Esc to close). Choose a map while skating, or at the title screen: it goes there once you press Start.
+  Each map is reached the way the game itself goes from one mission to the
+  next; a map asked for while another loads waits until it is done. These
+  are the game's last missions: if it offers to save while you explore, say
+  no, or keep a copy of your save.
+- Tested on a Mac: all 14 maps, one after the other, from play; the list
+  on screen opened at the title, Skyscraper District chosen with A and gone
+  to once Start was pressed; out of the garage to Skyscraper District. On
+  Linux: F6, the list drawn on screen, chosen with the arrows and Return.
+  Windows, the iPhone and Android: built and checked, not run.
+
 ## 0.6.5 — 2 November 2026
 
 Photo mode now freezes the world. Every platform is new in 0.6.5.
