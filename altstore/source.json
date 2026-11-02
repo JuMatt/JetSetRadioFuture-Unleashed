@@ -27,6 +27,15 @@
       },
       "versions": [
         {
+          "version": "0.6.5",
+          "buildVersion": "0.6.5",
+          "date": "2026-11-02T12:58:47Z",
+          "localizedDescription": "Photo mode now freezes the whole world: skaters, people, cars and spray cans hold still while you frame the shot.",
+          "downloadURL": "https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/download/v0.6.5/JSRF-Unleashed-iOS.ipa",
+          "size": 13401987,
+          "minOSVersion": "15.0"
+        },
+        {
           "version": "0.6.4",
           "buildVersion": "0.6.4",
           "date": "2026-11-02T11:16:16Z",
