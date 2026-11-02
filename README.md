@@ -41,6 +41,9 @@ The same game, made for today's screens and devices:
 - **Photo mode.** Hold Back (or Esc) while skating and the whole city stops —
   skaters, people, cars, spray cans — while the camera is yours: fly it
   around, hide the HUD, frame the shot. An on-screen panel shows the controls.
+- **A map selector.** Go straight to any of the 14 maps and skate it freely,
+  as after the story — nothing to race or chase. Explore Skyscraper District
+  on day one.
 - **Further draw distance in Skyscraper District**, where the towers used to
   pop in on the way to 99th Street.
 - **The brake sparks and smoke, as on the console.** They come every time
@@ -112,7 +115,8 @@ start). The same are on
 **F9**, **F8**, **F10** and **F11** (or Alt+Enter), which also work in full
 screen, where the menu is hidden. **Controls › Camera on the Right Stick**
 and **Camera on the Right Stick (Tracking)**, or **F7** (on, tracking, off),
-choose how the right stick works (below).
+choose how the right stick works (below). **Maps** goes straight to a map
+(below); **F6** shows the same list on screen.
 Controllers work through SDL: Xbox, PlayStation, Switch Pro and many more.
 Saves are kept in the game folder, in `UDATA`, as on the Mac. The
 `README.txt` inside lists the options and where the settings and logs
@@ -243,7 +247,8 @@ and where settings, saves and logs are kept.
 On Linux the keyboard layout is the same as below; **F11** (or Alt+Return)
 toggles full screen, **F10** the picture (4:3, 16:9, 21:9), **F9** sets the resolution (1× to
 6×; the game restarts to apply it), **F8** the anti-aliasing (SMAA, MSAA,
-or both) and **F7** turns the right-stick camera (below) off and on.
+or both), **F7** turns the right-stick camera (below) off and on, and **F6**
+shows the map selector (below).
 
 ### Your game files
 
@@ -315,6 +320,16 @@ the HUD, **A** the help panel, and **B** or **Back** goes back to the game.
 The whole world holds still while you do — the skaters, the people, the cars,
 the spray cans — and goes on where it was when you go back. On a phone it
 needs a controller, for the right stick.
+
+**Map selector:** go straight to any map and skate it freely — the free
+skating that comes after the story, with nothing to race or chase. Choose it
+from the **Maps** menu on the Mac and on Windows, **Go to a map** in the
+settings on iPhone and Android, or press **F6** on Windows and Linux for a
+list on screen (up and down to choose, **A** or Return to go, **B** or Esc to
+close). Choose a map while you skate, or at the title screen — it goes there
+once you press Start. These are the
+game's last missions, so if the game offers to save while you explore, say
+no — or keep a copy of your save — so your story progress stays where it was.
 
 **Video menu:**
 - **Resolution** — the internal resolution, 1× to 6× (2× by default; 6×,

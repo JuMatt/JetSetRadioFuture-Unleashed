@@ -277,6 +277,31 @@ JNIEXPORT void JNICALL Java_com_jumatt_jsrfunleashed_JsrfActivity_nativePhotoMod
     nv_window_request_photo();
 }
 
+/* The map selector, from the settings (port/recomp_manual.c; the maps are
+ * jsrf_maps.h's, the request nv2a_gl.c's). */
+#include "../../src/nv2a_gl/jsrf_maps.h"
+void nv_window_request_map(int mission);
+JNIEXPORT jobjectArray JNICALL Java_com_jumatt_jsrfunleashed_JsrfActivity_nativeMapNames(JNIEnv *env, jclass cls)
+{
+    jclass str = (*env)->FindClass(env, "java/lang/String");
+    jobjectArray a;
+    int k;
+    (void)cls;
+    if (!str) return NULL;
+    a = (*env)->NewObjectArray(env, JSRF_MAP_COUNT, str, NULL);
+    for (k = 0; a && k < JSRF_MAP_COUNT; k++) {
+        jstring n = (*env)->NewStringUTF(env, k_jsrf_maps[k].name);
+        (*env)->SetObjectArrayElement(env, a, k, n);
+        (*env)->DeleteLocalRef(env, n);
+    }
+    return a;
+}
+JNIEXPORT void JNICALL Java_com_jumatt_jsrfunleashed_JsrfActivity_nativeGoToMap(JNIEnv *env, jclass cls, jint index)
+{
+    (void)env; (void)cls;
+    if (index >= 0 && index < JSRF_MAP_COUNT) nv_window_request_map(k_jsrf_maps[index].mission);
+}
+
 /* A line for the log, from the Java side. */
 JNIEXPORT void JNICALL
 Java_com_jumatt_jsrfunleashed_JsrfActivity_nativeLog(JNIEnv *env, jclass cls, jstring line)

@@ -80,6 +80,9 @@ Keyboard (by key position, so W A S D on QWERTY is Z Q S D on AZERTY):
                       Tracking, it only looks around: you keep going the way
                       you were. Off, the camera is the original game's.
                       Remembered
+  F6                  the map selector: a list of the 14 maps on screen;
+                      up/down to choose, A or Return to go there and skate it
+                      freely (as after the story), B or Esc to close
 
 
 Where things are kept

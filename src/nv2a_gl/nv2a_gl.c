@@ -34,6 +34,7 @@
 #include "nv2a_shader_cache.h"
 #include "nv2a_hash.h"
 #include "nv2a_psh_consts.h"
+#include "jsrf_maps.h"
 
 /*
  * Two ways to get a 3.3 core context.
@@ -1464,6 +1465,7 @@ static volatile int g_sdl_want_rcam = -1;
 void nv_window_request_rstick_camera(int mode);
 void nv_window_request_rstick_camera(int mode) { g_sdl_want_rcam = mode == 2 ? 2 : mode ? 1 : 0; }
 void nv_window_request_photo(void);           /* photo mode's help panel, below */
+void nv_window_request_map(int mission);       /* the map selector, below (-1: its panel) */
 
 /* The keyboard as a gamepad -- the same layout as the Mac's, by key POSITION
  * (scancodes), so W A S D on QWERTY is Z Q S D on AZERTY:
@@ -1821,7 +1823,7 @@ static void sdl_set_rstick_camera(int mode)
  */
 #include <SDL2/SDL_syswm.h>
 enum { MENU_RES1 = 101, MENU_FULL = 111, MENU_PIC1 = 112, MENU_SMAA = 120, MENU_MSAA1 = 121,
-       MENU_RCAM = 130, MENU_RCAMT = 131, MENU_PHOTO = 132 };
+       MENU_RCAM = 130, MENU_RCAMT = 131, MENU_PHOTO = 132, MENU_MAPS = 139, MENU_MAP0 = 140 };
 static HWND  g_menu_hwnd;
 static HMENU g_menu_bar, g_menu_video, g_menu_res, g_menu_aa, g_menu_pic, g_menu_controls;
 
@@ -1904,6 +1906,23 @@ static void sdl_menu_init(void)
         AppendMenuW(g_menu_controls, MF_STRING, MENU_PHOTO, L"&Photo Mode\t(hold Back / Esc)");
         AppendMenuW(g_menu_bar, MF_POPUP, (UINT_PTR)g_menu_controls, L"&Controls");
     }
+    {   /* Maps: each map, by district (jsrf_maps.h); F6 the same list on screen. */
+        HMENU maps = CreatePopupMenu();
+        int k;
+        if (maps) {
+            AppendMenuW(maps, MF_STRING, MENU_MAPS, L"Map &Selector\tF6");
+            for (k = 0; k < JSRF_MAP_COUNT; k++) {
+                wchar_t w[64];
+                int i;
+                if (k == 0 || strcmp(k_jsrf_maps[k].district, k_jsrf_maps[k - 1].district) != 0)
+                    AppendMenuW(maps, MF_SEPARATOR, 0, NULL);
+                for (i = 0; k_jsrf_maps[k].name[i] && i < 63; i++) w[i] = (wchar_t)k_jsrf_maps[k].name[i];
+                w[i] = 0;
+                AppendMenuW(maps, MF_STRING, MENU_MAP0 + k, w);
+            }
+            AppendMenuW(g_menu_bar, MF_POPUP, (UINT_PTR)maps, L"&Maps");
+        }
+    }
     SDL_EventState(SDL_SYSWMEVENT, SDL_ENABLE);
     sdl_menu_update();
     sdl_menu_show(!(SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN_DESKTOP));
@@ -1942,6 +1961,10 @@ static void sdl_menu_command(unsigned id)
         sdl_pick_msaa(1 << (id - MENU_MSAA1));
     } else if (id == MENU_PHOTO) {
         nv_window_request_photo();
+    } else if (id == MENU_MAPS) {
+        nv_window_request_map(-1);
+    } else if (id >= MENU_MAP0 && id < MENU_MAP0 + (unsigned)JSRF_MAP_COUNT) {
+        nv_window_request_map(k_jsrf_maps[id - MENU_MAP0].mission);
     } else if (id == MENU_RCAM || id == MENU_RCAMT) {
         /* The one that is on, chosen again, turns it off. */
         int want = id == MENU_RCAMT ? 2 : 1;
@@ -1975,6 +1998,7 @@ static const struct { char c; unsigned char rows[7]; } k_help_font[] = {
     { '8', { 0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E } },
     { '9', { 0x0E, 0x11, 0x11, 0x0F, 0x01, 0x01, 0x0E } },
     { ':', { 0x00, 0x0C, 0x0C, 0x00, 0x0C, 0x0C, 0x00 } },
+    { '>', { 0x08, 0x04, 0x02, 0x01, 0x02, 0x04, 0x08 } },
     { 'A', { 0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11 } },
     { 'B', { 0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E } },
     { 'C', { 0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E } },
@@ -2020,6 +2044,12 @@ void nv_window_request_photo(void);
 void nv_window_request_photo(void) { g_photo_request = 1; }
 int nv_window_take_photo_request(void);
 int nv_window_take_photo_request(void) { int r = g_photo_request; g_photo_request = 0; return r; }
+/* The map selector (port/recomp_manual.c): a map from a menu (Windows) or the
+ * Android app's settings, or -1, its panel (F6). */
+static volatile int g_map_request;
+void nv_window_request_map(int mission) { g_map_request = mission; }
+int nv_window_take_map_request(void);
+int nv_window_take_map_request(void) { int r = g_map_request; g_map_request = 0; return r; }
 
 typedef struct { GLuint tex, fbo; int serial, w, h, has; } HelpPanel;
 static const unsigned char *help_glyph(char c)
@@ -2545,6 +2575,7 @@ static void sdl_pump(void)
                 if (k == SDL_SCANCODE_F10) { sdl_set_picture((sdl_picture_now() + 1) % 3); break; }
                 if (k == SDL_SCANCODE_F9)  { sdl_choose_scale(); break; }
                 if (k == SDL_SCANCODE_F8)  { sdl_choose_aa(); break; }
+                if (k == SDL_SCANCODE_F6)  { nv_window_request_map(-1); break; }   /* the map selector */
                 if (k == SDL_SCANCODE_F7)  {   /* the camera -> tracking -> off -> the camera */
                     int m = nv_window_pref_rstick_camera();
                     sdl_set_rstick_camera(m == 1 ? 2 : m == 2 ? 0 : 1);

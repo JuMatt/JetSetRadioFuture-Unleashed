@@ -322,6 +322,14 @@ void nv_window_request_photo(void);
 void nv_window_request_photo(void) { g_photo_request = 1; }
 int nv_window_take_photo_request(void);
 int nv_window_take_photo_request(void) { int r = g_photo_request; g_photo_request = 0; return r; }
+/* The map selector (port/recomp_manual.c, the maps in jsrf_maps.h): a map from
+ * the settings, or -1, its panel. */
+#include "../../src/nv2a_gl/jsrf_maps.h"
+static volatile int g_map_request;
+void nv_window_request_map(int mission);
+void nv_window_request_map(int mission) { g_map_request = mission; }
+int nv_window_take_map_request(void);
+int nv_window_take_map_request(void) { int r = g_map_request; g_map_request = 0; return r; }
 static UILabel *g_help_label;
 
 @interface NvGameController : UIViewController
@@ -1068,6 +1076,8 @@ static BOOL touch_pref(void)
         style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) { (void)x; [self pickRstickCamera]; }]];
     [a addAction:[UIAlertAction actionWithTitle:@"Photo mode" style:UIAlertActionStyleDefault
         handler:^(UIAlertAction *x) { (void)x; nv_window_request_photo(); }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"Go to a map" style:UIAlertActionStyleDefault
+        handler:^(UIAlertAction *x) { (void)x; [self pickMap]; }]];
     [a addAction:[UIAlertAction actionWithTitle:@"Controls" style:UIAlertActionStyleDefault
         handler:^(UIAlertAction *x) { (void)x;
             [self alert:@"Controls" text:
@@ -1084,6 +1094,20 @@ static BOOL touch_pref(void)
               "A keyboard: WASD (by position) moves, arrows the camera, Space jump, E spray, "
               "Return Start, Esc Back."]; }]];
     [a addAction:[UIAlertAction actionWithTitle:@"Close" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+/* The map selector: straight to a map, to skate it freely (jsrf_maps.h). */
+- (void)pickMap
+{
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Go to a map"
+        message:@"Free skating, as after the story: nothing to race or chase." preferredStyle:UIAlertControllerStyleAlert];
+    for (int k = 0; k < JSRF_MAP_COUNT; k++) {
+        int mission = k_jsrf_maps[k].mission;
+        [a addAction:[UIAlertAction actionWithTitle:[NSString stringWithUTF8String:k_jsrf_maps[k].name]
+            style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) { (void)x; nv_window_request_map(mission); }]];
+    }
+    [a addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:a animated:YES completion:nil];
 }
 

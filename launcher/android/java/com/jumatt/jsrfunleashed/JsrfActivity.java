@@ -32,6 +32,8 @@ public class JsrfActivity extends SDLActivity
     static native int nativeRstickCamera();            /* 0 off, 1 the camera, 2 tracking */
     static native void nativeSetRstickCamera(int mode);
     static native void nativePhotoMode();
+    static native String[] nativeMapNames();          /* the map selector (jsrf_maps.h) */
+    static native void nativeGoToMap(int index);
     static native String nativeVersion();
     static native void nativeLog(String line);
 
@@ -177,6 +179,7 @@ public class JsrfActivity extends SDLActivity
             "Resolution: " + scale + "x",
             "Camera on the right stick: " + (rcam == 2 ? "tracking" : rcam != 0 ? "on" : "off"),
             "Photo mode",
+            "Go to a map",
             "Controls",
         };
         mPad.reset();
@@ -199,12 +202,25 @@ public class JsrfActivity extends SDLActivity
                 case 4:
                     nativePhotoMode();
                     break;
+                case 5:
+                    pickMap();
+                    break;
                 default:
                     showControls();
                     break;
                 }
             })
             .setNegativeButton("Close", null)
+            .show();
+    }
+
+    /* The map selector: straight to a map, to skate it freely. */
+    private void pickMap() {
+        String[] items = nativeMapNames();
+        if (items == null) return;
+        dialog().setTitle("Go to a map")
+            .setItems(items, (d, which) -> nativeGoToMap(which))
+            .setNegativeButton("Cancel", null)
             .show();
     }
 

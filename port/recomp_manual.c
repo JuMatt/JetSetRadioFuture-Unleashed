@@ -1979,6 +1979,119 @@ __attribute__((constructor)) static void jsrf_wide_boot(void)
     const char *v = getenv("JSRF_WIDE_BOOT");
     nv2a_set_wide_scene(v && v[0] == '0' ? 0 : 1);
 }
+/* ---- the map selector ------------------------------------------------------
+ * Every platform: straight to a map, to skate it freely (the maps, each with
+ * its chapter 9 mission, are src/nv2a_gl/jsrf_maps.h's). A map comes from the
+ * window's menu (Mac, Windows) or the app's settings (iPhone, Android) through
+ * nv_window_take_map_request(), or from the panel: -1 asks for it (F6 on
+ * Windows and Linux, the Maps menu's Map Selector), a list drawn as photo
+ * mode's help is, gone through with the pad (up/down or a stick, A or Start
+ * to go, B or Back to close) while the game sees an idle pad.
+ *
+ * The map asked for is gone to the way a mission ends -- +0x4C/+0x54 the next
+ * chapter and number, state 93 -- at the flow's next frame in play (state 15)
+ * or once Start has been pressed at the title (mission 0x10001, state 31),
+ * the state held for a second (0x10001 passes through 15 on its way to 31:
+ * gone from there, the hand-over never finished). Asked for while a map
+ * loads, or at the title itself (mission 0x5A: the opening and its demo,
+ * whose flow takes its state back and never hands over -- the game hung), it
+ * waits until then. Photo mode is left first.
+ * JSRF_MAP_TOUR="t:id,t:id,..." (test only) asks for each id at its time;
+ * JSRF_MAP_PANEL_TEST="t:downs" opens the panel at t and goes down that many. */
+#include "../src/nv2a_gl/jsrf_maps.h"
+static void photo_leave(const char *why);
+int  nv_window_take_map_request(void);
+void nv_window_photo_help(const char *text);
+static struct {
+    volatile int open, want_open;
+    volatile int pick;                 /* a mission chosen in it, for the flow */
+    int sel, fresh, dir_was;
+    uint8_t go_was, close_was;
+    double next_move;
+} s_picker;
+static void picker_show(void)
+{
+    char text[640];
+    int k, n;
+    n = snprintf(text, sizeof text, "GO TO A MAP\n");
+    for (k = 0; k < JSRF_MAP_COUNT && n < (int)sizeof text - 48; k++)
+        n += snprintf(text + n, sizeof text - n, "%s %s\n", k == s_picker.sel ? ">" : " ", k_jsrf_maps[k].name);
+    snprintf(text + n, sizeof text - n, "UP/DOWN CHOOSE   A GO   B CLOSE");
+    nv_window_photo_help(text);
+}
+static void picker_close(void)
+{
+    s_picker.open = 0;
+    nv_window_photo_help(NULL);
+}
+/* The pad, before the game sees it. Returns 1 when the panel took it. */
+static int picker_note_pad(XBOX_INPUT_STATE *s)
+{
+    double now = jsrf_now();
+    int up, down, dir;
+    uint8_t go, close;
+    if (s_picker.want_open) {
+        s_picker.want_open = 0;
+        photo_leave("the map selector");
+        s_picker.open = 1;
+        s_picker.fresh = 1;
+        picker_show();
+    }
+    if (!s_picker.open) return 0;
+    up = (s->Gamepad.wButtons & XBOX_GAMEPAD_DPAD_UP) || s->Gamepad.sThumbLY > 16000 || s->Gamepad.sThumbRY > 16000;
+    down = (s->Gamepad.wButtons & XBOX_GAMEPAD_DPAD_DOWN) || s->Gamepad.sThumbLY < -16000 || s->Gamepad.sThumbRY < -16000;
+    dir = up ? -1 : down ? 1 : 0;
+    go = s->Gamepad.bAnalogButtons[XBOX_BUTTON_A] > 64 || (s->Gamepad.wButtons & XBOX_GAMEPAD_START);
+    close = s->Gamepad.bAnalogButtons[XBOX_BUTTON_B] > 64 || (s->Gamepad.wButtons & XBOX_GAMEPAD_BACK);
+    if (s_picker.fresh) {              /* what was held as it opened does nothing */
+        s_picker.fresh = 0;
+        s_picker.go_was = go; s_picker.close_was = close; s_picker.dir_was = dir;
+        s_picker.next_move = now + 0.4;
+    }
+    if (dir && (dir != s_picker.dir_was || now >= s_picker.next_move)) {
+        s_picker.sel = (s_picker.sel + dir + JSRF_MAP_COUNT) % JSRF_MAP_COUNT;
+        s_picker.next_move = now + (dir != s_picker.dir_was ? 0.4 : 0.12);
+        picker_show();
+    }
+    s_picker.dir_was = dir;
+    if (go && !s_picker.go_was) {
+        s_picker.pick = k_jsrf_maps[s_picker.sel].mission;
+        fprintf(stderr, "[MAP] the panel: %s\n", k_jsrf_maps[s_picker.sel].name);
+        picker_close();
+    } else if (close && !s_picker.close_was) {
+        picker_close();
+    }
+    s_picker.go_was = go; s_picker.close_was = close;
+    memset(&s->Gamepad, 0, sizeof s->Gamepad);   /* the game sees an idle pad */
+    return 1;
+}
+static uint32_t map_request(void)
+{
+    static int n = -1, i, ptest = -1, pdowns; static double pt;
+    static double at[32]; static uint32_t id[32];
+    int r = nv_window_take_map_request();
+    if (n < 0) {
+        const char *e = getenv("JSRF_MAP_TOUR");
+        n = 0;
+        while (e && *e && n < 32) {
+            char *end; double t = strtod(e, &end);
+            if (end == e || *end != ':') break;
+            at[n] = t; id[n] = (uint32_t)strtoul(end + 1, &end, 0); n++;
+            e = (*end == ',') ? end + 1 : end;
+        }
+        e = getenv("JSRF_MAP_PANEL_TEST");
+        ptest = (e && sscanf(e, "%lf:%d", &pt, &pdowns) == 2) ? 1 : 0;
+    }
+    if (ptest == 1 && pad_now() >= pt) {
+        ptest = 0;
+        s_picker.sel = pdowns % JSRF_MAP_COUNT;
+        r = -1;
+    }
+    if (r == -1) { s_picker.want_open = 1; r = 0; }
+    if (!r && s_picker.pick) { r = s_picker.pick; s_picker.pick = 0; }
+    if (!r && i < n && pad_now() >= at[i]) r = (int)id[i++];
+    return (uint32_t)r;
+}
 extern void sub_00051FC0_gen(void);
 void sub_00051FC0(void)
 {
@@ -2014,6 +2127,22 @@ void sub_00051FC0(void)
                   }
                   p = (*end == ',') ? end + 1 : NULL;
               }
+          } }
+        { static uint32_t want, seen_flow, seen_st = 0xFFFFFFFFu; static double seen_t;
+          uint32_t r = map_request(), st = *(uint32_t *)(m + flow + 0x5C);
+          uint32_t mi = *(uint32_t *)(m + flow + 0x58);
+          if (r) want = r;
+          if (flow != seen_flow || st != seen_st) { seen_flow = flow; seen_st = st; seen_t = pad_now(); }
+          /* in play (15, or 31 just past the title), for a second at least
+           * (a flow can pass through 15 on its way), never the title's own */
+          if (want && (st == 15 || st == 31) && mi != 0x5Au && pad_now() - seen_t >= 1.0) {
+              photo_leave("a map was chosen");
+              fprintf(stderr, "[MAP] t=%.1f flow %08X: state %u mission %08X -> mission %08X\n",
+                      pad_now(), flow, st, *(uint32_t *)(m + flow + 0x58), want);
+              *(uint32_t *)(m + flow + 0x4C) = want >> 16;
+              *(uint32_t *)(m + flow + 0x54) = want & 0xFFFF;
+              *(uint32_t *)(m + flow + 0x5C) = 93;
+              want = 0;
           } }
         if (init == 1 && pad_now() >= t) {
             /* The way a mission ends: +0x4C/+0x54 the next chapter and
@@ -2404,11 +2533,11 @@ void sub_00030690(void) { mission_hook(".dat"); sub_00030690_gen(); }
  * run can photograph the title, the menus and the level. */
 static void trace_at_step(void)
 {
-    static int n = -1, cur; static double t[8]; static int frames[8], shots[8], every[8];
+    static int n = -1, cur; static double t[32]; static int frames[32], shots[32], every[32];
     if (n < 0) {
         const char *e = getenv("JSRF_TRACE_AT");
         n = 0;
-        while (e && *e && n < 8) {
+        while (e && *e && n < 32) {
             shots[n] = 0; every[n] = 1;
             if (sscanf(e, "%lf:%d:%d,%d", &t[n], &frames[n], &shots[n], &every[n]) >= 2) n++;
             e = strchr(e, ';');
@@ -4381,7 +4510,7 @@ static int photo_frame(uint8_t *m, uint32_t cam, uint32_t mode, float dt)
 
 static void rcam_note_pad(XBOX_INPUT_STATE *s)
 {
-    if (photo_note_pad(s)) { s_rcam.rx = s_rcam.ry = 0.0f; s_rcam.lt = 0; return; }
+    if (picker_note_pad(s) || photo_note_pad(s)) { s_rcam.rx = s_rcam.ry = 0.0f; s_rcam.lt = 0; return; }
     float x = (float)s->Gamepad.sThumbRX / 32767.0f, y = (float)s->Gamepad.sThumbRY / 32767.0f;
     float mag = sqrtf(x * x + y * y);
     if (mag < RCAM_DEAD) {

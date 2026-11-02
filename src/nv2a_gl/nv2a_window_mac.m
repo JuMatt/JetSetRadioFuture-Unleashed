@@ -627,6 +627,14 @@ void nv_window_request_photo(void);
 void nv_window_request_photo(void) { g_photo_request = 1; }
 int nv_window_take_photo_request(void);
 int nv_window_take_photo_request(void) { int r = g_photo_request; g_photo_request = 0; return r; }
+/* ---- the map selector (jsrf_maps.h): Maps > a map asks the game flow
+ * (port/recomp_manual.c) to go there. */
+#include "jsrf_maps.h"
+static volatile int g_map_request;
+void nv_window_request_map(int mission);
+void nv_window_request_map(int mission) { g_map_request = mission; }
+int nv_window_take_map_request(void);
+int nv_window_take_map_request(void) { int r = g_map_request; g_map_request = 0; return r; }
 static NSWindow *g_help_win;
 static NSTextField *g_help_field;
 void nv_window_photo_help(const char *text);
@@ -685,6 +693,7 @@ void nv_window_photo_help(const char *text)
 - (void)pickMsaa:(id)sender;
 - (void)pickRstickCamera:(id)sender;
 - (void)photoMode:(id)sender;
+- (void)pickMap:(id)sender;
 - (void)showKeys:(id)sender;
 - (void)showPad:(id)sender;
 @end
@@ -817,6 +826,11 @@ void nv_window_photo_help(const char *text)
         return !max || [item tag] <= max;
     }
     return YES;
+}
+/* Maps > a map: the item's tag is the mission. */
+- (void)pickMap:(id)sender
+{
+    g_map_request = (int)[sender tag];
 }
 /* Controls > Photo Mode: starts at the next frame of play (port/recomp_manual.c). */
 - (void)photoMode:(id)sender
@@ -1119,6 +1133,32 @@ static void build_menu(void)
         }
         [ctlItem setSubmenu:ctl];
         [bar addItem:ctlItem];
+    }
+    {
+        NSMenuItem *mapsItem = [[NSMenuItem alloc] init];
+        NSMenu *maps = [[NSMenu alloc] initWithTitle:@"Maps"];
+        int k;
+        {   /* the same list on screen, gone through with the pad */
+            NSMenuItem *it = [[NSMenuItem alloc] initWithTitle:@"Map Selector (on screen)"
+                                                        action:@selector(pickMap:)
+                                                 keyEquivalent:@""];
+            [it setTag:-1];
+            [it setTarget:g_menu_target];
+            [maps addItem:it];
+        }
+        for (k = 0; k < JSRF_MAP_COUNT; k++) {
+            NSMenuItem *it;
+            if (k == 0 || strcmp(k_jsrf_maps[k].district, k_jsrf_maps[k - 1].district) != 0)
+                [maps addItem:[NSMenuItem separatorItem]];
+            it = [[NSMenuItem alloc] initWithTitle:[NSString stringWithUTF8String:k_jsrf_maps[k].name]
+                                            action:@selector(pickMap:)
+                                     keyEquivalent:@""];
+            [it setTag:k_jsrf_maps[k].mission];
+            [it setTarget:g_menu_target];
+            [maps addItem:it];
+        }
+        [mapsItem setSubmenu:maps];
+        [bar addItem:mapsItem];
     }
 
     [NSApp setMainMenu:bar];
