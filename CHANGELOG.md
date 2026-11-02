@@ -10,6 +10,25 @@ its version. Downloads are on the
 [Releases](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases)
 page.
 
+## 0.6.3 — 2 November 2026
+
+The brake sparks and smoke, as on the console. Every platform is new in 0.6.3.
+
+- **Brake sparks and smoke every time.** Braking — the stick forward, then
+  back — throws red sparks and smoke from the skates. Here, as in xemu, they
+  came out only now and then, and stayed at a fixed spot instead of following
+  the skates. Miggas found why in his JSRF-Recomp
+  ([Miggas/JSRF-Recomp](https://github.com/Miggas/JSRF-Recomp), thank you):
+  the console's Pentium III answers one kind of square-root instruction
+  (`rsqrtss`) with a 12-bit approximation, and the recompiled code computed it
+  exactly. One place needs the console's value — the routine that normalises
+  a vector, which the effect goes through — and now gets it, bit for bit, on
+  every CPU (his table, MIT licensed, credited in NOTICE).
+  `RECOMP_SSE_P3=0`: the exact value, as before.
+- Tested: the Linux build through the title and its demo (the new routine in
+  use, no crash); the Windows build and the Mac, iPhone and Android apps were
+  built and checked, not run.
+
 ## 0.6.2 — 1 November 2026
 
 A second way to have the camera on the right stick, from players' feedback,
