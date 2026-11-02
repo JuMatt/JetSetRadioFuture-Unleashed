@@ -38,6 +38,11 @@ The same game, made for today's screens and devices:
   going while you look around. Or keep the original camera.
 - **Smooth 60 fps.** Shaders are built ahead and kept between sessions, so
   new places don't stutter.
+- **Photo mode.** Hold Back (or Esc) while skating and the camera is yours:
+  fly it around, hide the HUD, frame the shot — an on-screen panel shows the
+  controls.
+- **Further draw distance in Skyscraper District**, where the towers used to
+  pop in on the way to 99th Street.
 - **The brake sparks and smoke, as on the console.** They come every time
   and follow your skates, which they don't in emulation.
 - **Keyboard controls** on computers, by key position (WASD on QWERTY, ZQSD
@@ -283,6 +288,14 @@ the Mac: **Controls › Camera on the Right Stick** or **Camera on the Right
 Stick (Tracking)** (choose the one that is on again to turn it off); **F7**
 on Windows (or the Controls menu) and Linux goes round on, tracking and off;
 and the settings on the iPhone and on Android.
+
+**Photo mode:** hold **Back** (Esc on a keyboard) for about a second while
+skating — or choose **Controls › Photo Mode** (⌘ P on the Mac, the Controls
+menu on Windows, the settings on iPhone and Android). The left stick moves the
+camera, the right stick turns it, the triggers lower and raise it; **Y** hides
+the HUD, **A** the help panel, and **B** or **Back** goes back to the game.
+The game keeps running around you; the skater waits where he was. On a phone
+it needs a controller, for the right stick.
 
 **Video menu:**
 - **Resolution** — the internal resolution, 1× to 6× (2× by default; 6×,

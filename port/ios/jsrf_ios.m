@@ -315,6 +315,14 @@ static unsigned long long free_bytes(NSString *path)
 
 @class NvGameController;
 static NvGameController *g_vc;
+/* ---- Photo mode (port/recomp_manual.c): the settings' request, and the help
+ * panel -- a label over the game, at its bottom-left corner. */
+static volatile int g_photo_request;
+void nv_window_request_photo(void);
+void nv_window_request_photo(void) { g_photo_request = 1; }
+int nv_window_take_photo_request(void);
+int nv_window_take_photo_request(void) { int r = g_photo_request; g_photo_request = 0; return r; }
+static UILabel *g_help_label;
 
 @interface NvGameController : UIViewController
 - (void)engineStopped:(int)rc;
@@ -334,6 +342,43 @@ static void *engine_main(void *arg)
     fflush(stderr);
     dispatch_async(dispatch_get_main_queue(), ^{ [g_vc engineStopped:rc]; });
     return NULL;
+}
+void nv_window_photo_help(const char *text);
+void nv_window_photo_help(const char *text)
+{
+    NSString *str = text ? [NSString stringWithUTF8String:text] : nil;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIView *root = g_vc ? g_vc.view : nil;
+        NSMutableAttributedString *as;
+        NSRange first;
+        CGSize sz;
+        if (!root) return;
+        if (!str) { [g_help_label removeFromSuperview]; return; }
+        if (!g_help_label) {
+            g_help_label = [[UILabel alloc] init];
+            g_help_label.numberOfLines = 0;
+            g_help_label.backgroundColor = [UIColor colorWithWhite:0.05 alpha:0.82];
+            g_help_label.userInteractionEnabled = NO;
+            g_help_label.layer.cornerRadius = 6.0;
+            g_help_label.clipsToBounds = YES;
+        }
+        as = [[NSMutableAttributedString alloc] initWithString:str attributes:@{
+            NSFontAttributeName: [UIFont monospacedSystemFontOfSize:11.0 weight:UIFontWeightMedium],
+            NSForegroundColorAttributeName: [UIColor colorWithWhite:0.93 alpha:1.0] }];
+        first = [str rangeOfString:@"\n"];
+        if (first.location != NSNotFound)
+            [as addAttribute:NSForegroundColorAttributeName
+                       value:[UIColor colorWithRed:0.75 green:0.95 blue:0.16 alpha:1.0]
+                       range:NSMakeRange(0, first.location)];
+        g_help_label.attributedText = as;
+        sz = [g_help_label sizeThatFits:CGSizeMake(root.bounds.size.width, CGFLOAT_MAX)];
+        g_help_label.frame = CGRectMake(root.safeAreaInsets.left + 12,
+                                        root.bounds.size.height - root.safeAreaInsets.bottom - sz.height - 28,
+                                        sz.width + 20, sz.height + 16);
+        g_help_label.textAlignment = NSTextAlignmentCenter;
+        if (g_help_label.superview != root) [root addSubview:g_help_label];
+        [root bringSubviewToFront:g_help_label];
+    });
 }
 
 static int start_engine(NSString *game)
@@ -1021,6 +1066,8 @@ static BOOL touch_pref(void)
     [a addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"Camera on the right stick: %@",
                                                  k_rcam[nv_window_pref_rstick_camera()]]
         style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) { (void)x; [self pickRstickCamera]; }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"Photo mode" style:UIAlertActionStyleDefault
+        handler:^(UIAlertAction *x) { (void)x; nv_window_request_photo(); }]];
     [a addAction:[UIAlertAction actionWithTitle:@"Controls" style:UIAlertActionStyleDefault
         handler:^(UIAlertAction *x) { (void)x;
             [self alert:@"Controls" text:
@@ -1033,6 +1080,7 @@ static BOOL touch_pref(void)
               "camera around you and it eases back behind you when let go; L trigger puts it straight "
               "behind at once. Set to tracking, it only looks around: you keep going the way you "
               "were.\n\n"
+              "Photo mode (the settings, or hold Back with a controller): move the camera freely with the sticks, the triggers lower and raise it, Y hides the HUD, A the help, B goes back to the game. Take the picture with the side and volume-up buttons.\n\n"
               "A keyboard: WASD (by position) moves, arrows the camera, Space jump, E spray, "
               "Return Start, Esc Back."]; }]];
     [a addAction:[UIAlertAction actionWithTitle:@"Close" style:UIAlertActionStyleCancel handler:nil]];

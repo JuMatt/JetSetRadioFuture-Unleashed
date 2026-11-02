@@ -619,6 +619,64 @@ int nv_window_pref_rstick_camera(void)
     return g_rstick_cam;
 }
 
+/* ---- Photo mode (port/recomp_manual.c): the request from the menu, and the
+ * help panel -- a small borderless window of its own over the game's, at its
+ * bottom-left corner, which moves with it and takes no clicks. */
+static volatile int g_photo_request;
+void nv_window_request_photo(void);
+void nv_window_request_photo(void) { g_photo_request = 1; }
+int nv_window_take_photo_request(void);
+int nv_window_take_photo_request(void) { int r = g_photo_request; g_photo_request = 0; return r; }
+static NSWindow *g_help_win;
+static NSTextField *g_help_field;
+void nv_window_photo_help(const char *text);
+void nv_window_photo_help(const char *text)
+{
+    NSString *str = text ? [NSString stringWithUTF8String:text] : nil;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSMutableAttributedString *as;
+        NSFont *font;
+        NSRange first;
+        NSSize sz;
+        NSRect content;
+        if (!g_window) return;
+        if (!str) {
+            if (g_help_win) { [g_window removeChildWindow:g_help_win]; [g_help_win orderOut:nil]; }
+            return;
+        }
+        font = [NSFont monospacedSystemFontOfSize:13.0 weight:NSFontWeightMedium];
+        as = [[NSMutableAttributedString alloc] initWithString:str attributes:@{
+            NSFontAttributeName: font,
+            NSForegroundColorAttributeName: [NSColor colorWithWhite:0.93 alpha:1.0] }];
+        first = [str rangeOfString:@"\n"];
+        if (first.location != NSNotFound)
+            [as addAttribute:NSForegroundColorAttributeName
+                       value:[NSColor colorWithRed:0.75 green:0.95 blue:0.16 alpha:1.0]
+                       range:NSMakeRange(0, first.location)];
+        if (!g_help_win) {
+            g_help_win = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 100, 100)
+                                                    styleMask:NSWindowStyleMaskBorderless
+                                                      backing:NSBackingStoreBuffered defer:NO];
+            [g_help_win setOpaque:NO];
+            [g_help_win setBackgroundColor:[NSColor colorWithWhite:0.05 alpha:0.82]];
+            [g_help_win setIgnoresMouseEvents:YES];
+            [g_help_win setHasShadow:NO];
+            [g_help_win setReleasedWhenClosed:NO];
+            g_help_field = [NSTextField labelWithString:@""];
+            [g_help_field setDrawsBackground:NO];
+            [[g_help_win contentView] addSubview:g_help_field];
+        }
+        [g_help_field setAttributedStringValue:as];
+        sz = [g_help_field fittingSize];
+        [g_help_field setFrame:NSMakeRect(12, 10, sz.width, sz.height)];
+        content = [g_window contentRectForFrameRect:[g_window frame]];
+        [g_help_win setFrame:NSMakeRect(content.origin.x + 14, content.origin.y + 14,
+                                        sz.width + 24, sz.height + 20) display:YES];
+        if (![g_help_win parentWindow]) [g_window addChildWindow:g_help_win ordered:NSWindowAbove];
+        [g_help_win orderFront:nil];
+    });
+}
+
 @interface NvMenuTarget : NSObject
 - (void)pickScale:(id)sender;
 - (void)pickRenderer:(id)sender;
@@ -626,6 +684,7 @@ int nv_window_pref_rstick_camera(void)
 - (void)toggleSmaa:(id)sender;
 - (void)pickMsaa:(id)sender;
 - (void)pickRstickCamera:(id)sender;
+- (void)photoMode:(id)sender;
 - (void)showKeys:(id)sender;
 - (void)showPad:(id)sender;
 @end
@@ -758,6 +817,12 @@ int nv_window_pref_rstick_camera(void)
         return !max || [item tag] <= max;
     }
     return YES;
+}
+/* Controls > Photo Mode: starts at the next frame of play (port/recomp_manual.c). */
+- (void)photoMode:(id)sender
+{
+    (void)sender;
+    nv_window_request_photo();
 }
 /* The two items' tags are their modes: the one that is on, chosen again,
  * turns the camera on the right stick off. */
@@ -1042,6 +1107,14 @@ static void build_menu(void)
                 [rc setTarget:g_menu_target];
                 [rc setState:nv_window_pref_rstick_camera() == k + 1 ? NSControlStateValueOn : NSControlStateValueOff];
                 [ctl addItem:rc];
+            }
+            [ctl addItem:[NSMenuItem separatorItem]];
+            {
+                NSMenuItem *ph = [[NSMenuItem alloc] initWithTitle:@"Photo Mode (hold Back / Esc)"
+                                                            action:@selector(photoMode:)
+                                                     keyEquivalent:@"p"];
+                [ph setTarget:g_menu_target];
+                [ctl addItem:ph];
             }
         }
         [ctlItem setSubmenu:ctl];

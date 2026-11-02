@@ -4175,12 +4175,164 @@ static struct {
     float    our_eye[3];       /* and as this left it */
     int32_t  game_hd, our_hd;  /* the heading, likewise */
     int      applied;
+    int      photo;            /* photo mode moved the point looked at too */
+    float    game_tgt[3], our_tgt[3];
 } s_rcam;
 /* The camera's updates (sub_000A5070): one a game frame. */
 static uint32_t s_rcam_frames;
 
+/* ---- Photo mode -------------------------------------------------------------
+ *
+ * Hold Back (Esc on a keyboard) for most of a second while skating -- or pick
+ * Photo Mode in a menu or the settings -- and the camera leaves the skater:
+ * the left stick moves it, the right stick turns it, the triggers lower and
+ * raise it; Y hides the HUD, A this help, and B or Back goes back to the
+ * game. The game sees no buttons meanwhile, so the skater stands where he
+ * was (the city goes on around him). The camera is the game's own, moved:
+ * its eye (+0x44) and the point it looks at (+0x5C) are set where the photo
+ * camera is after the game publishes them and put back before its next
+ * update (rcam_restore), as the camera on the right stick does with the
+ * eye. A help panel says all that on screen while it is on
+ * (nv_window_photo_help: the window's own on the Mac and the iPhone, drawn
+ * into the picture's window with SDL). */
+void nv_window_photo_help(const char *text);      /* NULL: none */
+void nv2a_set_hide_hud(int hide);
+int  nv_window_take_photo_request(void);          /* a menu's Photo Mode, once */
+#define PHOTO_HOLD   0.8       /* seconds of Back to start it */
+#define PHOTO_SPEED  110.0f    /* units a second at full stick */
+#define PHOTO_RISE   70.0f
+#define PHOTO_YAW    1.8f      /* radians a second */
+#define PHOTO_PITCH  1.3f
+static const char k_photo_help[] =
+    "PHOTO MODE\n"
+    "LEFT STICK     MOVE          (W A S D)\n"
+    "RIGHT STICK    LOOK          (ARROWS)\n"
+    "LT / RT        DOWN / UP     (Q / E)\n"
+    "Y              HUD ON / OFF  (L)\n"
+    "A              HIDE HELP     (SPACE)\n"
+    "B OR BACK      BACK TO GAME  (K / ESC)";
+static struct {
+    volatile int want;          /* asked for: enter at the next gameplay frame */
+    int      on;
+    double   back_since;        /* Back held since (0: not held) */
+    int      back_was;          /* Back down at the last poll, while on */
+    uint16_t btn_was;
+    uint8_t  a_was, b_was, y_was;
+    float    lx, ly, rx, ry, lt, rt;
+    float    pos[3], yaw, pitch;
+    int      help, hud_hidden;
+} s_photo;
+static float photo_axis(int16_t v)
+{
+    float x = (float)v / 32767.0f;
+    if (x > -0.18f && x < 0.18f) return 0.0f;
+    return x > 0 ? (x - 0.18f) / 0.82f : (x + 0.18f) / 0.82f;
+}
+static void photo_show_help(void)
+{
+    nv_window_photo_help(s_photo.on && s_photo.help ? k_photo_help : NULL);
+}
+static void photo_leave(const char *why)
+{
+    if (!s_photo.on) return;
+    s_photo.on = 0;
+    if (s_photo.hud_hidden) nv2a_set_hide_hud(0);
+    s_photo.hud_hidden = 0;
+    photo_show_help();
+    fprintf(stderr, "[PHOTO] off (%s)\n", why);
+}
+/* The pad, before the game sees it. Returns 1 when photo mode took it. */
+static int photo_note_pad(XBOX_INPUT_STATE *s)
+{
+    double now = jsrf_now();
+    { static int test = -1;   /* JSRF_PHOTO_HELP_TEST=1 (test only): the panel shown from the start */
+      if (test < 0) { test = getenv("JSRF_PHOTO_HELP_TEST") ? 1 : 0; if (test) nv_window_photo_help(k_photo_help); } }
+    int back = (s->Gamepad.wButtons & XBOX_GAMEPAD_BACK) != 0;
+    if (!s_photo.on) {
+        if (back) {
+            if (!s_photo.back_since) s_photo.back_since = now;
+            else if (now - s_photo.back_since >= PHOTO_HOLD) { s_photo.want = 1; s_photo.back_since = 0; }
+        } else {
+            s_photo.back_since = 0;
+        }
+        if (nv_window_take_photo_request()) s_photo.want = 1;
+        return 0;
+    }
+    {
+        uint8_t a = s->Gamepad.bAnalogButtons[XBOX_BUTTON_A] > 64;
+        uint8_t b = s->Gamepad.bAnalogButtons[XBOX_BUTTON_B] > 64;
+        uint8_t y = s->Gamepad.bAnalogButtons[XBOX_BUTTON_Y] > 64;
+        s_photo.lx = photo_axis(s->Gamepad.sThumbLX);
+        s_photo.ly = photo_axis(s->Gamepad.sThumbLY);
+        s_photo.rx = photo_axis(s->Gamepad.sThumbRX);
+        s_photo.ry = photo_axis(s->Gamepad.sThumbRY);
+        s_photo.lt = s->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] / 255.0f;
+        s_photo.rt = s->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] / 255.0f;
+        if (a && !s_photo.a_was) { s_photo.help = !s_photo.help; photo_show_help(); }
+        if (y && !s_photo.y_was) {
+            s_photo.hud_hidden = !s_photo.hud_hidden;
+            nv2a_set_hide_hud(s_photo.hud_hidden);
+        }
+        if ((b && !s_photo.b_was) || (back && !s_photo.back_was)) photo_leave("B or Back");
+        s_photo.a_was = a; s_photo.b_was = b; s_photo.y_was = y; s_photo.back_was = back;
+    }
+    /* The game sees an idle pad (the packet number still moves). */
+    memset(&s->Gamepad, 0, sizeof s->Gamepad);
+    return 1;
+}
+/* Each game frame, with the camera just published. 1 when photo mode set it. */
+static int photo_frame(uint8_t *m, uint32_t cam, uint32_t mode, float dt)
+{
+    float *e = (float *)(m + cam + 0x44), *t = (float *)(m + cam + 0x5C);
+    float f[3], r[3], cp, sp;
+    if (s_photo.on && (mode == 12 || mode == 14)) photo_leave("an event");
+    if (s_photo.want && !s_photo.on) {
+        float v[3] = { t[0] - e[0], t[1] - e[1], t[2] - e[2] };
+        s_photo.want = 0;
+        if (mode == 12 || mode == 14) return 0;
+        s_photo.on = 1;
+        s_photo.help = 1;
+        s_photo.hud_hidden = 0;
+        s_photo.back_was = 1;          /* the Back that started it does not end it */
+        s_photo.a_was = s_photo.b_was = s_photo.y_was = 1;
+        memcpy(s_photo.pos, e, 12);
+        s_photo.yaw = atan2f(v[0], v[2]);
+        s_photo.pitch = atan2f(v[1], sqrtf(v[0] * v[0] + v[2] * v[2]));
+        photo_show_help();
+        fprintf(stderr, "[PHOTO] on, at %.1f %.1f %.1f\n", e[0], e[1], e[2]);
+    }
+    s_photo.want = 0;
+    if (!s_photo.on) return 0;
+    s_photo.yaw += s_photo.rx * PHOTO_YAW * dt;
+    s_photo.pitch += s_photo.ry * PHOTO_PITCH * dt;
+    if (s_photo.pitch > 1.45f) s_photo.pitch = 1.45f;
+    if (s_photo.pitch < -1.45f) s_photo.pitch = -1.45f;
+    cp = cosf(s_photo.pitch); sp = sinf(s_photo.pitch);
+    f[0] = sinf(s_photo.yaw) * cp; f[1] = sp; f[2] = cosf(s_photo.yaw) * cp;
+    r[0] = cosf(s_photo.yaw); r[1] = 0.0f; r[2] = -sinf(s_photo.yaw);   /* the right of (x, z) is (z, -x) */
+    {
+        int i;
+        for (i = 0; i < 3; i++)
+            s_photo.pos[i] += (f[i] * s_photo.ly + r[i] * s_photo.lx) * PHOTO_SPEED * dt;
+        s_photo.pos[1] += (s_photo.rt - s_photo.lt) * PHOTO_RISE * dt;
+        memcpy(s_rcam.game_eye, e, 12);
+        memcpy(s_rcam.game_tgt, t, 12);
+        memcpy(e, s_photo.pos, 12);
+        for (i = 0; i < 3; i++) t[i] = s_photo.pos[i] + f[i] * 40.0f;
+        memcpy(s_rcam.our_eye, e, 12);
+        memcpy(s_rcam.our_tgt, t, 12);
+    }
+    s_rcam.game_hd = s_rcam.our_hd = *(int32_t *)(m + cam + 0x228);
+    s_rcam.cam = cam;
+    s_rcam.applied = 1;
+    s_rcam.photo = 1;
+    s_rcam.yaw = s_rcam.pitch = 0.0f;
+    return 1;
+}
+
 static void rcam_note_pad(XBOX_INPUT_STATE *s)
 {
+    if (photo_note_pad(s)) { s_rcam.rx = s_rcam.ry = 0.0f; s_rcam.lt = 0; return; }
     float x = (float)s->Gamepad.sThumbRX / 32767.0f, y = (float)s->Gamepad.sThumbRY / 32767.0f;
     float mag = sqrtf(x * x + y * y);
     if (mag < RCAM_DEAD) {
@@ -4233,6 +4385,11 @@ static void rcam_restore(uint8_t *m, uint32_t cam)
     if (cam != s_rcam.cam || cam < 0x10000u || cam + 0x240u >= (64u << 20)) return;
     e = (float *)(m + cam + 0x44);
     hd = (int32_t *)(m + cam + 0x228);
+    if (s_rcam.photo) {
+        float *t = (float *)(m + cam + 0x5C);
+        if (!memcmp(t, s_rcam.our_tgt, sizeof s_rcam.our_tgt)) memcpy(t, s_rcam.game_tgt, sizeof s_rcam.game_tgt);
+        s_rcam.photo = 0;
+    }
     if (memcmp(e, s_rcam.our_eye, sizeof s_rcam.our_eye) != 0) {
         if (rcam_log_on())
             fprintf(stderr, "[RCAM] t=%.2f the eye was moved by something else: turn dropped\n", jsrf_now());
@@ -4289,6 +4446,7 @@ static void rcam_apply(uint8_t *m, uint32_t cam)
         fixed = f ? atof(f) * 3.14159265358979 / 180.0 : -1.0e8;
     }
     mode = c[0x208 / 4];
+    if (photo_frame(m, cam, mode, dt)) { s_rcam.active_until = 0.0; return; }
     how = rcam_mode();
     ok = how > 0 && mode != 12 && mode != 14;
     s_rcam.active_until = ok ? now + 0.25 : 0.0;
@@ -4585,3 +4743,181 @@ void sub_0014C410(void)
     MEMWF(g_ecx + 8, g_xmm6.f[0]);                                       /* movss */
     g_esp += 4;                                                          /* ret */
 }
+
+/* ---- Draw distance: more of the map's areas drawn ---------------------------
+ *
+ * Buildings appear as you get near them -- on the console too: it is the
+ * game's own draw distance. A map is split into areas (up to 256). Every
+ * frame sub_0006A970 sets, in the bitset at 0x20C6C8 (8 words of the object
+ * at 0x20C6C0), the areas whose volume holds the camera plus those each of
+ * them lists as visible; the map's draw passes skip every area whose bit is
+ * clear. Found by Miggas in JSRF-Recomp (its v198-v201, MIT): the map is at
+ * +4 of that object (its areas at +4, their count at +8), an area record is
+ * 0x154 bytes with its visible list at +0x98 and the count at +0x9C; and his
+ * "hops" -- the game's own set, widened twice through those lists -- reaches
+ * far ahead without crossing to the far end of a looping map, where drawing
+ * every area shows a copy of a street in the sky (Dogenzaka Hill).
+ *
+ * Here: for the length of three of the draw passes (sub_0006B6A0,
+ * sub_0006B8F0, sub_0006C360; sub_0006BA80, the backdrop's, is left to the
+ * game, as in his default) the bitset holds the widened set, and the game's
+ * own is put back after, so objects, collision and triggers keep the game's
+ * areas -- only the drawing changes. Areas no list names (the garage's
+ * invisible walls) are never added. Only on the maps listed, as the cost is
+ * a draw call per piece added: by default Skyscraper District, where the
+ * towers and satellite dishes on the way to 99th Street popped in worst.
+ *
+ * A map is known by an ID worked out from its area layout (his: FNV-1a over
+ * the area count and every area's first 18 words), logged when it loads:
+ * "[AREAS] map ID xxxx".
+ *   RECOMP_DRAW_AREAS=game (or 0)    the game's areas everywhere, as on the Xbox
+ *   RECOMP_DRAW_AREAS=hops<N>         N steps (default 2)
+ *   RECOMP_DRAW_AREAS_MAPS=ID,ID|all  the maps it applies to
+ *   JSRF_AREAS_LOG=1                  every 2 s: the game's count and the drawn count
+ */
+extern void sub_0006B6A0_gen(void);
+extern void sub_0006B8F0_gen(void);
+extern void sub_0006C360_gen(void);
+#define AREA_OBJ 0x20C6C0u
+#define AREA_REC 0x154u
+#define AREA_MAPS_DEFAULT "07FC"        /* Skyscraper District (Stg34): 30 areas */
+static int areas_guest_ok(uint32_t a, uint32_t len)
+{
+    return a >= 0x10000u && a + len >= a && a + len < (64u << 20);
+}
+static int areas_hops(void)
+{
+    static int hops = -1;
+    if (hops < 0) {
+        const char *e = getenv("RECOMP_DRAW_AREAS");
+        hops = 2;
+        if (e && *e) {
+            if (!strncmp(e, "hops", 4)) hops = e[4] ? atoi(e + 4) : 2;
+            else hops = 0;                         /* game, 0, off */
+        }
+        if (hops > 16) hops = 16;
+        if (hops < 0) hops = 0;
+        fprintf(stderr, "[AREAS] draw distance: %s\n", hops ? "more areas on the maps listed" :
+                "the game's own areas (RECOMP_DRAW_AREAS)");
+    }
+    return hops;
+}
+static int areas_log_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("JSRF_AREAS_LOG") ? 1 : 0;
+    return on;
+}
+static int areas_map_listed(uint32_t id)
+{
+    const char *e = getenv("RECOMP_DRAW_AREAS_MAPS");
+    if (!e) e = AREA_MAPS_DEFAULT;
+    if (!strcmp(e, "all")) return 1;
+    while (*e) {
+        char *end;
+        unsigned long v = strtoul(e, &end, 16);
+        if (end == e) { e++; continue; }
+        if (v == id) return 1;
+        e = end;
+    }
+    return 0;
+}
+/* The current map: its areas, their count, its ID, the areas some list names,
+ * and whether it is one of the maps listed. Worked out again when the map
+ * object, its area table, the count or the first area's first word change. */
+static struct {
+    uint32_t map, areas, n, a0, id;
+    uint32_t drawable[8];
+    int listed;
+} s_amap;
+static int areas_map(uint32_t *areas_out, uint32_t *n_out)
+{
+    uint32_t map = MEM32(AREA_OBJ + 4), areas, n, i, j, q;
+    if (!areas_guest_ok(map, 12)) return 0;
+    areas = MEM32(map + 4);
+    n = MEM32(map + 8);
+    if (!n || n > 256 || !areas_guest_ok(areas, n * AREA_REC)) return 0;
+    if (map != s_amap.map || areas != s_amap.areas || n != s_amap.n || MEM32(areas) != s_amap.a0) {
+        uint32_t h = 2166136261u, cnt = 0;
+        s_amap.map = map; s_amap.areas = areas; s_amap.n = n; s_amap.a0 = MEM32(areas);
+        memset(s_amap.drawable, 0, sizeof s_amap.drawable);
+        for (i = 0; i < n; i++) {
+            uint32_t a = areas + i * AREA_REC, list = MEM32(a + 0x98), c = MEM32(a + 0x9C);
+            if (!c || c > 256 || !areas_guest_ok(list, c * 4u)) continue;
+            for (j = 0; j < c; j++) {
+                uint32_t v = MEM32(list + 4 * j);
+                if (v < 256) s_amap.drawable[v >> 5] |= 1u << (v & 31);
+            }
+        }
+        h = (h ^ n) * 16777619u;
+        for (i = 0; i < n; i++)
+            for (q = 0; q < 18; q++)
+                h = (h ^ MEM32(areas + i * AREA_REC + 4 * q)) * 16777619u;
+        s_amap.id = ((h >> 16) ^ h) & 0xFFFFu;
+        s_amap.listed = areas_map_listed(s_amap.id);
+        for (i = 0; i < 8; i++) cnt += (uint32_t)__builtin_popcount(s_amap.drawable[i]);
+        fprintf(stderr, "[AREAS] map ID %04X: %u areas, %u drawn by some view; draw distance %s\n",
+                s_amap.id, n, cnt, s_amap.listed && areas_hops() ? "widened" : "the game's");
+    }
+    *areas_out = areas; *n_out = n;
+    return 1;
+}
+/* The widened set for this frame (worked out at the first pass of a frame). */
+static uint32_t s_area_wide[8];
+static uint32_t s_area_wide_flip = ~0u;
+static int areas_prepare(void)
+{
+    uint32_t areas, n, cur[8], nxt[8], i, j, k, flip;
+    int hops = areas_hops(), step;
+    if (!hops || !areas_map(&areas, &n) || !s_amap.listed) return 0;
+    flip = nv2a_gl_flips();
+    if (flip == s_area_wide_flip) return 1;
+    s_area_wide_flip = flip;
+    for (k = 0; k < 8; k++) cur[k] = MEM32(AREA_OBJ + 8 + 4 * k);
+    for (step = 0; step < hops; step++) {
+        memcpy(nxt, cur, sizeof nxt);
+        for (i = 0; i < n; i++) {
+            uint32_t a = areas + i * AREA_REC, list, c;
+            if (!(cur[i >> 5] & (1u << (i & 31)))) continue;
+            list = MEM32(a + 0x98); c = MEM32(a + 0x9C);
+            if (!c || c > 256 || !areas_guest_ok(list, c * 4u)) continue;
+            for (j = 0; j < c; j++) {
+                uint32_t v = MEM32(list + 4 * j);
+                if (v < 256) nxt[v >> 5] |= 1u << (v & 31);
+            }
+        }
+        if (!memcmp(nxt, cur, sizeof cur)) break;
+        memcpy(cur, nxt, sizeof cur);
+    }
+    for (k = 0; k < 8; k++)
+        s_area_wide[k] = (cur[k] & s_amap.drawable[k]) | MEM32(AREA_OBJ + 8 + 4 * k);
+    if (areas_log_on()) {
+        static double last;
+        double now = pad_now();
+        if (now - last >= 2.0) {
+            unsigned g = 0, w = 0;
+            last = now;
+            for (k = 0; k < 8; k++) {
+                g += (unsigned)__builtin_popcount(MEM32(AREA_OBJ + 8 + 4 * k));
+                w += (unsigned)__builtin_popcount(s_area_wide[k]);
+            }
+            fprintf(stderr, "[AREAS] t=%.1f map %04X: the game's %u areas, drawn %u (hops%d)\n",
+                    now, s_amap.id, g, w, hops);
+        }
+    }
+    return 1;
+}
+static void area_pass(void (*gen)(void))
+{
+    uint32_t keep[8], k;
+    if (!areas_prepare()) { gen(); return; }
+    for (k = 0; k < 8; k++) {
+        keep[k] = MEM32(AREA_OBJ + 8 + 4 * k);
+        MEM32(AREA_OBJ + 8 + 4 * k) = s_area_wide[k];
+    }
+    gen();
+    for (k = 0; k < 8; k++) MEM32(AREA_OBJ + 8 + 4 * k) = keep[k];
+}
+void sub_0006B6A0(void) { area_pass(sub_0006B6A0_gen); }
+void sub_0006B8F0(void) { area_pass(sub_0006B8F0_gen); }
+void sub_0006C360(void) { area_pass(sub_0006C360_gen); }

@@ -91,6 +91,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <math.h>
 #include <time.h>
 #include <stddef.h>
@@ -1462,6 +1463,7 @@ static void nv_window_set_rstick_camera(int mode)
 static volatile int g_sdl_want_rcam = -1;
 void nv_window_request_rstick_camera(int mode);
 void nv_window_request_rstick_camera(int mode) { g_sdl_want_rcam = mode == 2 ? 2 : mode ? 1 : 0; }
+void nv_window_request_photo(void);           /* photo mode's help panel, below */
 
 /* The keyboard as a gamepad -- the same layout as the Mac's, by key POSITION
  * (scancodes), so W A S D on QWERTY is Z Q S D on AZERTY:
@@ -1819,7 +1821,7 @@ static void sdl_set_rstick_camera(int mode)
  */
 #include <SDL2/SDL_syswm.h>
 enum { MENU_RES1 = 101, MENU_FULL = 111, MENU_PIC1 = 112, MENU_SMAA = 120, MENU_MSAA1 = 121,
-       MENU_RCAM = 130, MENU_RCAMT = 131 };
+       MENU_RCAM = 130, MENU_RCAMT = 131, MENU_PHOTO = 132 };
 static HWND  g_menu_hwnd;
 static HMENU g_menu_bar, g_menu_video, g_menu_res, g_menu_aa, g_menu_pic, g_menu_controls;
 
@@ -1898,6 +1900,8 @@ static void sdl_menu_init(void)
     if ((g_menu_controls = CreatePopupMenu()) != NULL) {
         AppendMenuW(g_menu_controls, MF_STRING, MENU_RCAM, L"Camera on the &Right Stick\tF7");
         AppendMenuW(g_menu_controls, MF_STRING, MENU_RCAMT, L"Camera on the Right Stick (&Tracking)");
+        AppendMenuW(g_menu_controls, MF_SEPARATOR, 0, NULL);
+        AppendMenuW(g_menu_controls, MF_STRING, MENU_PHOTO, L"&Photo Mode\t(hold Back / Esc)");
         AppendMenuW(g_menu_bar, MF_POPUP, (UINT_PTR)g_menu_controls, L"&Controls");
     }
     SDL_EventState(SDL_SYSWMEVENT, SDL_ENABLE);
@@ -1936,6 +1940,8 @@ static void sdl_menu_command(unsigned id)
         sdl_pick_smaa(!g_smaa_want);
     } else if (id >= MENU_MSAA1 && id < MENU_MSAA1 + 4) {
         sdl_pick_msaa(1 << (id - MENU_MSAA1));
+    } else if (id == MENU_PHOTO) {
+        nv_window_request_photo();
     } else if (id == MENU_RCAM || id == MENU_RCAMT) {
         /* The one that is on, chosen again, turns it off. */
         int want = id == MENU_RCAMT ? 2 : 1;
@@ -1943,6 +1949,146 @@ static void sdl_menu_command(unsigned id)
     }
 }
 #endif
+
+/* ---- Photo mode's help panel ----------------------------------------------
+ * The text photo mode asks for (port/recomp_manual.c), drawn over the frame
+ * in the window's corner: lines of a small 5x7 font of this file's own,
+ * rasterised into a texture when the text changes and blitted -- scaled up a
+ * whole number of times, kept sharp -- just before the swap. No program, no
+ * blending: the panel is opaque, dark, with the title in the HUD's green. */
+static const struct { char c; unsigned char rows[7]; } k_help_font[] = {
+    { ' ', { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 } },
+    { '(', { 0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02 } },
+    { ')', { 0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08 } },
+    { ',', { 0x00, 0x00, 0x00, 0x00, 0x0C, 0x04, 0x08 } },
+    { '-', { 0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00 } },
+    { '.', { 0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C } },
+    { '/', { 0x01, 0x01, 0x02, 0x04, 0x08, 0x10, 0x10 } },
+    { '0', { 0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E } },
+    { '1', { 0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E } },
+    { '2', { 0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F } },
+    { '3', { 0x1E, 0x01, 0x01, 0x0E, 0x01, 0x01, 0x1E } },
+    { '4', { 0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02 } },
+    { '5', { 0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E } },
+    { '6', { 0x0E, 0x10, 0x10, 0x1E, 0x11, 0x11, 0x0E } },
+    { '7', { 0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08 } },
+    { '8', { 0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E } },
+    { '9', { 0x0E, 0x11, 0x11, 0x0F, 0x01, 0x01, 0x0E } },
+    { ':', { 0x00, 0x0C, 0x0C, 0x00, 0x0C, 0x0C, 0x00 } },
+    { 'A', { 0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11 } },
+    { 'B', { 0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E } },
+    { 'C', { 0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E } },
+    { 'D', { 0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E } },
+    { 'E', { 0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F } },
+    { 'F', { 0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10 } },
+    { 'G', { 0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F } },
+    { 'H', { 0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11 } },
+    { 'I', { 0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E } },
+    { 'J', { 0x07, 0x02, 0x02, 0x02, 0x02, 0x12, 0x0C } },
+    { 'K', { 0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11 } },
+    { 'L', { 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F } },
+    { 'M', { 0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11 } },
+    { 'N', { 0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11 } },
+    { 'O', { 0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E } },
+    { 'P', { 0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10 } },
+    { 'Q', { 0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D } },
+    { 'R', { 0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11 } },
+    { 'S', { 0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E } },
+    { 'T', { 0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04 } },
+    { 'U', { 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E } },
+    { 'V', { 0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04 } },
+    { 'W', { 0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0A } },
+    { 'X', { 0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11 } },
+    { 'Y', { 0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04 } },
+    { 'Z', { 0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F } },
+
+};
+static SDL_SpinLock g_help_lock;
+static char g_help_text[640];
+static volatile int g_help_serial;
+static volatile int g_photo_request;
+void nv_window_photo_help(const char *text);
+void nv_window_photo_help(const char *text)
+{
+    SDL_AtomicLock(&g_help_lock);
+    snprintf(g_help_text, sizeof g_help_text, "%s", text ? text : "");
+    g_help_serial++;
+    SDL_AtomicUnlock(&g_help_lock);
+}
+/* Photo Mode from a menu (Windows) or the Android app's settings. */
+void nv_window_request_photo(void);
+void nv_window_request_photo(void) { g_photo_request = 1; }
+int nv_window_take_photo_request(void);
+int nv_window_take_photo_request(void) { int r = g_photo_request; g_photo_request = 0; return r; }
+
+typedef struct { GLuint tex, fbo; int serial, w, h, has; } HelpPanel;
+static const unsigned char *help_glyph(char c)
+{
+    size_t i;
+    for (i = 0; i < sizeof k_help_font / sizeof k_help_font[0]; i++)
+        if (k_help_font[i].c == c) return k_help_font[i].rows;
+    return k_help_font[0].rows;                       /* ' ' */
+}
+/* With the window's framebuffer bound for drawing (ww x wh). */
+static void help_panel_draw(HelpPanel *hp, int ww, int wh)
+{
+    int serial = g_help_serial, s, x0, y0;
+    if (serial != hp->serial) {
+        char text[sizeof g_help_text];
+        int lines = 0, cols = 0, len = 0, i, row, w, h;
+        const char *p;
+        uint8_t *px;
+        SDL_AtomicLock(&g_help_lock);
+        memcpy(text, g_help_text, sizeof text);
+        serial = g_help_serial;
+        SDL_AtomicUnlock(&g_help_lock);
+        hp->serial = serial;
+        hp->has = text[0] != 0;
+        if (!hp->has) return;
+        for (p = text; ; p++) {
+            if (*p == '\n' || !*p) { lines++; if (len > cols) cols = len; len = 0; if (!*p) break; }
+            else len++;
+        }
+        w = cols * 6 + 9; h = lines * 10 + 7;        /* 6x10 cells, a 4-pixel margin */
+        px = (uint8_t *)calloc((size_t)w * h, 4);
+        if (!px) { hp->has = 0; return; }
+        for (i = 0; i < w * h; i++) { px[4 * i] = 16; px[4 * i + 1] = 16; px[4 * i + 2] = 20; px[4 * i + 3] = 255; }
+        row = 0; len = 0;
+        for (p = text; *p; p++) {
+            const unsigned char *g;
+            int gx, gy;
+            if (*p == '\n') { row++; len = 0; continue; }
+            g = help_glyph((char)toupper((unsigned char)*p));
+            for (gy = 0; gy < 7; gy++)
+                for (gx = 0; gx < 5; gx++) {
+                    int X = 4 + len * 6 + gx, Y = 4 + row * 10 + gy, o;
+                    if (!(g[gy] & (0x10 >> gx))) continue;
+                    o = 4 * ((h - 1 - Y) * w + X);    /* the texture's first row is the bottom */
+                    px[o] = row ? 235 : 190; px[o + 1] = row ? 235 : 240; px[o + 2] = row ? 235 : 40;
+                }
+            len++;
+        }
+        if (!hp->tex) { glGenTextures(1, &hp->tex); glGenFramebuffers(1, &hp->fbo); }
+        glBindTexture(GL_TEXTURE_2D, hp->tex);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, hp->fbo);
+        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, hp->tex, 0);
+        free(px);
+        hp->w = w; hp->h = h;
+    }
+    if (!hp->has || ww <= 0 || wh <= 0) return;
+    s = wh / 300; if (s < 1) s = 1;
+    while (s > 1 && hp->w * s > ww - 16) s--;
+    x0 = 8 * s; y0 = 8 * s;                           /* the bottom-left corner */
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, hp->fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    glBlitFramebuffer(0, 0, hp->w, hp->h, x0, y0, x0 + hp->w * s, y0 + hp->h * s,
+                      GL_COLOR_BUFFER_BIT, GL_NEAREST);
+}
 
 /* The frame, fitted into the window between black bars: a widened scene at
  * 16:9 (the 640x480 surface holds a 16:9 view squeezed), anything else at its
@@ -1975,6 +2121,7 @@ static void sdl_present(GLuint src_fbo, int sw, int sh)
     glBlitFramebuffer(0, 0, sw, sh,
                       (ww - dw) / 2, (wh - dh) / 2, (ww - dw) / 2 + dw, (wh - dh) / 2 + dh,
                       GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    { static HelpPanel hp; help_panel_draw(&hp, ww, wh); }
     SDL_GL_SwapWindow(g_window);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)rfb);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)dfb);
@@ -2230,6 +2377,7 @@ static int SDLCALL pres_main(void *arg)
                         "presenter\n", told, w, h, ww, wh, dw, dh);
             }
         }
+        { static HelpPanel hp; help_panel_draw(&hp, ww, wh); }
         SDL_GL_SwapWindow(g_window);
         glFinish();                     /* the swap done: when the display took it */
         t = mono_now();
@@ -4670,6 +4818,10 @@ static uint32_t tcache_content_of(const TexStage *t)
 }
 /* The sheet's tex_content: the same in every mission measured (City Rush,
  * Dogenzaka Hill, the Fortified Residential Zone), wherever it is loaded. */
+/* Photo mode's "HUD off" (port/recomp_manual.c). */
+static volatile int g_hide_hud;
+void nv2a_set_hide_hud(int hide);
+void nv2a_set_hide_hud(int hide) { g_hide_hud = hide; }
 #ifndef WIDE_HUD_SHEET
 #define WIDE_HUD_SHEET 0x35732389u
 #endif
@@ -5600,6 +5752,9 @@ static void do_draw_body(void)
     if (fan_expand == 1) out_n = (n / 4) * 6;
     if (fan_expand == 2) out_n = (n >= 4) ? ((n - 2) / 2) * 6 : 0;
     if (!out_n) { g_drop[DROP_SHORT]++; return; }
+    /* Photo mode with the HUD hidden (nv2a_set_hide_hud): the HUD's pieces,
+     * all from its one sheet (wide_hud_sheet), are not drawn. */
+    if (g_hide_hud && S.clip_w == 640 && S.clip_h == 480 && wide_hud_sheet(&S.tex[0])) return;
 
     /*
      * The vertex layout, cut down to what this draw actually needs.

@@ -119,6 +119,10 @@ MIT -- from JSRF-Recomp, by Miggas
   port/recomp_manual.c's sub_0014C410 (the brake sparks and smoke) is this
   project's own code, after his finding that that one rsqrtss needs the
   console's value.
+  Its draw distance in Skyscraper District (the map's areas widened through
+  their visible lists) is this project's own code too, after his research:
+  where the game keeps its areas and their lists, and the idea of widening
+  them a few steps rather than drawing them all.
 
   Licensed under the MIT License; the full text, with his copyright notice,
   is in LICENSES/MIT-JSRF-Recomp.txt.

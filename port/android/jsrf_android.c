@@ -268,6 +268,15 @@ Java_com_jumatt_jsrfunleashed_JsrfActivity_nativeSetRstickCamera(JNIEnv *env, jc
     nv_window_request_rstick_camera((int)mode);
 }
 
+/* Photo mode, from the settings (port/recomp_manual.c; the request is
+ * nv2a_gl.c's, with SDL). */
+void nv_window_request_photo(void);
+JNIEXPORT void JNICALL Java_com_jumatt_jsrfunleashed_JsrfActivity_nativePhotoMode(JNIEnv *env, jclass cls)
+{
+    (void)env; (void)cls;
+    nv_window_request_photo();
+}
+
 /* A line for the log, from the Java side. */
 JNIEXPORT void JNICALL
 Java_com_jumatt_jsrfunleashed_JsrfActivity_nativeLog(JNIEnv *env, jclass cls, jstring line)

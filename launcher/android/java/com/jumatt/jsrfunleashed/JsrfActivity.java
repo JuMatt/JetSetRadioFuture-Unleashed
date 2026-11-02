@@ -31,6 +31,7 @@ public class JsrfActivity extends SDLActivity
     static native void nativeSetWidescreen(boolean on);
     static native int nativeRstickCamera();            /* 0 off, 1 the camera, 2 tracking */
     static native void nativeSetRstickCamera(int mode);
+    static native void nativePhotoMode();
     static native String nativeVersion();
     static native void nativeLog(String line);
 
@@ -175,6 +176,7 @@ public class JsrfActivity extends SDLActivity
             "On-screen controls: " + (touch ? "shown" : "hidden"),
             "Resolution: " + scale + "x",
             "Camera on the right stick: " + (rcam == 2 ? "tracking" : rcam != 0 ? "on" : "off"),
+            "Photo mode",
             "Controls",
         };
         mPad.reset();
@@ -193,6 +195,9 @@ public class JsrfActivity extends SDLActivity
                     break;
                 case 3:
                     pickRstickCamera(rcam);
+                    break;
+                case 4:
+                    nativePhotoMode();
                     break;
                 default:
                     showControls();
@@ -244,6 +249,9 @@ public class JsrfActivity extends SDLActivity
                 + "turns the camera around you and it eases back behind you when let go; "
                 + "L trigger puts it straight behind at once. Set to tracking, it only looks "
                 + "around: you keep going the way you were.\n\n"
+                + "Photo mode (the settings, or hold Back on a controller): move the camera freely with "
+                + "the sticks, the triggers lower and raise it, Y hides the HUD, A the help, B goes back "
+                + "to the game.\n\n"
                 + "A keyboard: WASD (by position) moves, arrows the camera, Space jump, E spray, "
                 + "Enter Start, Esc Back.\n\n"
                 + "A new resolution is used the next time the game starts.")
