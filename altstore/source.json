@@ -27,6 +27,15 @@
       },
       "versions": [
         {
+          "version": "0.6.7",
+          "buildVersion": "0.6.7",
+          "date": "2026-11-04T13:32:14Z",
+          "localizedDescription": "Vibration, as on the console: a controller vibrates as the game asks, and with the on-screen controls the iPhone itself. Turn it off in the settings.",
+          "downloadURL": "https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/download/v0.6.7/JSRF-Unleashed-iOS.ipa",
+          "size": 13406655,
+          "minOSVersion": "15.0"
+        },
+        {
           "version": "0.6.6",
           "buildVersion": "0.6.6",
           "date": "2026-11-02T15:38:42Z",
