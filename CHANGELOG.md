@@ -10,6 +10,28 @@ its version. Downloads are on the
 [Releases](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases)
 page.
 
+## 0.6.7 — 4 November 2026
+
+Vibration, as on the console. Every platform is new in 0.6.7.
+
+- **Vibration on every platform.** The game drives the Xbox pad's two
+  motors — a heavy one and a light one — and those now reach whatever you
+  play with. On the Mac and iPhone, a controller's own haptics through Core
+  Haptics (DualSense, DualShock 4, Xbox Series; macOS 11 and iOS 14 on): one
+  long continuous pattern turned up and down as the game asks, its strength
+  the stronger motor and its sharpness the light motor's share. On Windows,
+  Linux and Android, the controller's motors through SDL, now with a
+  DualSense or DualShock 4 over Bluetooth too (SDL's extended reports, which
+  stay on until the controller is switched off; `JSRF_PS_RUMBLE=0` leaves
+  them off), and a long rumble no longer stops after a second. Playing with
+  the on-screen controls, the iPhone (its Taptic Engine) or the Android phone
+  vibrates itself.
+- **It can be turned off:** **Controls › Vibration** on the Mac and Windows,
+  **Vibration** in the settings on iPhone and Android, `vibration=0` in the
+  settings file on Linux.
+- Tested on an iPhone. Built and checked
+  for every platform; Windows, Linux and Android not run.
+
 ## 0.6.6 — 2 November 2026
 
 A map selector. Every platform is new in 0.6.6.
