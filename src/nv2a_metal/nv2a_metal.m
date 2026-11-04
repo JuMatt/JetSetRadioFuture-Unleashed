@@ -475,6 +475,69 @@ static uint32_t mtl_tex_new(uint32_t w, uint32_t h, const void *rgba, const Nv2a
     return hnd;
 }
 
+/* DXT as the title stored it (tex_new_dxt), where the GPU samples BC1-3
+ * itself: no decoding on the CPU. Every Apple silicon Mac does; an iPhone or
+ * iPad only where supportsBCTextureCompression says so (iOS 16.4 on), and
+ * elsewhere the front half decodes them as before. A size not a whole number
+ * of blocks, and a chain the device would have to make itself, are left to
+ * the front half too. RECOMP_MTL_DXT=0: always decoded. */
+static int mtl_bc_ok(void)
+{
+    static int ok = -1;
+    if (ok < 0) {
+        const char *v = getenv("RECOMP_MTL_DXT");
+        ok = 0;
+        if (!(v && v[0] == '0')) {
+            if (@available(macOS 11.0, iOS 16.4, *)) ok = g_dev && g_dev.supportsBCTextureCompression ? 1 : 0;
+        }
+        fprintf(stderr, "  [MTL] DXT textures: %s\n", ok ? "sampled as they are (BC)"
+                : (v && v[0] == '0') ? "decoded (RECOMP_MTL_DXT=0)" : "decoded (this GPU has no BC formats)");
+    }
+    return ok;
+}
+static uint32_t mtl_tex_new_dxt(uint32_t w, uint32_t h, int dxt, const void *blocks,
+                                const Nv2aSampler *s)
+{
+    uint32_t hnd;
+    MTLPixelFormat pf;
+    NSUInteger bsz, levels, l, wl, hl;
+    const uint8_t *p;
+    id<MTLTexture> t;
+    if (!blocks || !w || !h || (w & 3) || (h & 3) || (s->mip && s->levels < 2) || !mtl_bc_ok()) return 0;
+    if (dxt == 1)      { pf = MTLPixelFormatBC1_RGBA; bsz = 8; }
+    else if (dxt == 3) { pf = MTLPixelFormatBC2_RGBA; bsz = 16; }
+    else if (dxt == 5) { pf = MTLPixelFormatBC3_RGBA; bsz = 16; }
+    else return 0;
+    hnd = tex_slot();
+    if (!hnd) return 0;
+    @autoreleasepool {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf
+                                                                                      width:w height:h
+                                                                                  mipmapped:s->mip ? YES : NO];
+        if (s->mip && s->levels < td.mipmapLevelCount) td.mipmapLevelCount = s->levels;
+        td.usage = MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModeShared;
+        t = [g_dev newTextureWithDescriptor:td];
+        if (!t) return 0;
+        levels = s->mip ? [t mipmapLevelCount] : 1;
+        p = (const uint8_t *)blocks;
+        for (l = 0, wl = w, hl = h; l < levels; l++) {
+            NSUInteger bw = (wl + 3) / 4, bh = (hl + 3) / 4;
+            [t replaceRegion:MTLRegionMake2D(0, 0, wl, hl) mipmapLevel:l
+                   withBytes:p bytesPerRow:bw * bsz];
+            p += bw * bh * bsz;
+            wl = wl > 1 ? wl / 2 : 1;
+            hl = hl > 1 ? hl / 2 : 1;
+        }
+        g_tex[hnd - 1].tex = t;
+        g_tex[hnd - 1].smp = sampler_for(s);
+        g_tex[hnd - 1].w = w; g_tex[hnd - 1].h = h;
+        g_tex[hnd - 1].used = 1;
+    }
+    g_n_tex++;
+    return hnd;
+}
+
 static void mtl_tex_free(uint32_t hnd)
 {
     int u;
@@ -522,6 +585,8 @@ destinationBytesPerImage:(NSUInteger)w * h * 4];
 static int mtl_tex_read(uint32_t hnd, uint32_t w, uint32_t h, void *bgra)
 {
     if (!tex_ok(hnd) || !bgra) return 0;
+    { MTLPixelFormat pf = g_tex[hnd - 1].tex.pixelFormat;   /* BC blocks are not texels */
+      if (pf == MTLPixelFormatBC1_RGBA || pf == MTLPixelFormatBC2_RGBA || pf == MTLPixelFormatBC3_RGBA) return 0; }
     return read_texture(g_tex[hnd - 1].tex, MTLRegionMake2D(0, 0, w, h), 1, 0, (uint8_t *)bgra);
 }
 
@@ -2207,7 +2272,7 @@ static const Nv2aGfx g_metal = {
     mtl_samples_max, mtl_samples,
     mtl_zrev,
     mtl_gpu_ms,
-    NULL,                       /* tex_new_dxt: DXT decoded in the front half */
+    mtl_tex_new_dxt,            /* DXT as they are, where the GPU takes BC */
 };
 
 const Nv2aGfx *nv2a_gfx_metal(void) { return &g_metal; }

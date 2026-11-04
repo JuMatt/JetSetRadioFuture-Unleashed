@@ -424,8 +424,8 @@ typedef struct Nv2aGfx {
      * it: w x h texels in 4x4 blocks, and with `s->levels` the rest of the
      * chain, each level's blocks after the last's. Sampled as tex_new's.
      * 0 where the device does not take them as they are, and the front half
-     * decodes them for tex_new instead. NULL where the backend has none
-     * (Metal, today). */
+     * decodes them for tex_new instead (Metal: where the GPU has BC
+     * formats). NULL where the backend has none. */
     uint32_t (*tex_new_dxt)(uint32_t w, uint32_t h, int dxt, const void *blocks,
                             const Nv2aSampler *s);
 } Nv2aGfx;

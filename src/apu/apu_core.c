@@ -532,12 +532,23 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
  * instead of repeating sound, and the frames are made up at once when it
  * clears. 0 = the wall clock, as before.
  */
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+#if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
+/* A phone or tablet: a level's first frame can take 50 ms or more there
+ * (textures, shaders), long enough to empty 40 ms -- heard as a stutter on
+ * entering a map. Twice as much there; the latency it adds is not felt. */
+#define APU_RING_MS_DEFAULT 80
+#else
+#define APU_RING_MS_DEFAULT 40
+#endif
 static int ring_target_frames(void)
 {
     static int t = -1;
     if (t < 0) {
         const char *v = getenv("RECOMP_APU_RING_MS");
-        int ms = v ? atoi(v) : 40;
+        int ms = v ? atoi(v) : APU_RING_MS_DEFAULT;
         t = ms > 0 ? ms * 48 : 0;
     }
     return t;

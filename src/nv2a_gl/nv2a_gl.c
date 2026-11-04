@@ -3642,6 +3642,75 @@ static int decode_texels(uint32_t color, const uint8_t *src, uint32_t w, uint32_
 #undef ROWS
     return 1;
 }
+/* A DXT level, block rows by0..by1, into RGBA8 (decode_level). */
+typedef struct {
+    const uint8_t *src; uint8_t *rgba;
+    uint32_t color, w, h, bw, bb, by0, by1;
+} DxtRows;
+static void dxt_decode_rows(const DxtRows *j)
+{
+    uint32_t bx, by, k;
+    for (by = j->by0; by < j->by1; by++)
+        for (bx = 0; bx < j->bw; bx++) {
+            uint32_t px[16];
+            d3d8_dxt_decode_block(j->src + ((size_t)by * j->bw + bx) * j->bb, j->color, px);
+            for (k = 0; k < 16; k++) {
+                uint32_t x = bx * 4 + (k & 3u), y = by * 4 + (k >> 2), argb = px[k];
+                uint8_t *o;
+                if (x >= j->w || y >= j->h) continue;
+                if (g_upload_bias_bg) argb ^= 0x00008080u;
+                o = j->rgba + ((size_t)y * j->w + x) * 4;
+                o[0] = (uint8_t)(argb >> 16);
+                o[1] = (uint8_t)(argb >> 8);
+                o[2] = (uint8_t)argb;
+                o[3] = (uint8_t)(argb >> 24);
+            }
+        }
+}
+/* Where the GPU does not take DXT as it is (an iPhone without BC, most
+ * Android GPUs), a map's first frame decodes a few dozen textures at once
+ * -- tens of milliseconds, heard as a stutter. A big level is shared out
+ * among up to four threads, by block rows; a small one is not worth it.
+ * RECOMP_DXT_THREADS=1: one thread, as before. */
+#if !defined(_WIN32)
+#include <pthread.h>
+#include <unistd.h>
+static void *dxt_rows_thread(void *p) { dxt_decode_rows((const DxtRows *)p); return NULL; }
+#endif
+static void dxt_decode_rows_parallel(const DxtRows *all)
+{
+#if !defined(_WIN32)
+    static int nthr = -1;
+    uint32_t rows = all->by1 - all->by0;
+    if (nthr < 0) {
+        const char *v = getenv("RECOMP_DXT_THREADS");
+        long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+        nthr = v ? atoi(v) : (ncpu >= 4 ? 4 : ncpu >= 2 ? 2 : 1);
+        if (nthr < 1) nthr = 1;
+        if (nthr > 8) nthr = 8;
+    }
+    if (nthr > 1 && rows * all->bw >= 1024 && rows >= (uint32_t)nthr) {
+        DxtRows part[8];
+        pthread_t th[8];
+        int started[8] = {0}, i;
+        for (i = 0; i < nthr; i++) {
+            part[i] = *all;
+            part[i].by0 = all->by0 + rows * (uint32_t)i / (uint32_t)nthr;
+            part[i].by1 = all->by0 + rows * (uint32_t)(i + 1) / (uint32_t)nthr;
+        }
+        for (i = 1; i < nthr; i++)
+            started[i] = pthread_create(&th[i], NULL, dxt_rows_thread, &part[i]) == 0;
+        dxt_decode_rows(&part[0]);
+        for (i = 1; i < nthr; i++) {
+            if (started[i]) pthread_join(th[i], NULL);
+            else dxt_decode_rows(&part[i]);    /* no thread: done here */
+        }
+        return;
+    }
+#endif
+    dxt_decode_rows(all);
+}
+
 static int decode_level(uint32_t color, const uint8_t *src, uint32_t w, uint32_t h,
                         uint32_t pitch, uint8_t *rgba)
 {
@@ -3658,24 +3727,11 @@ static int decode_level(uint32_t color, const uint8_t *src, uint32_t w, uint32_t
          * A block at a time: decoded per texel, every block was decoded
          * sixteen times -- 4 ms a texture, and the 49 a new area brings at
          * once were a 200 ms stall in the middle of play. */
-        uint32_t bw = (w + 3) / 4, bh = (h + 3) / 4, bb = d3d8_format_dxt_block_bytes(color);
-        uint32_t bx, by, k;
-        for (by = 0; by < bh; by++)
-            for (bx = 0; bx < bw; bx++) {
-                uint32_t px[16];
-                d3d8_dxt_decode_block(src + ((size_t)by * bw + bx) * bb, color, px);
-                for (k = 0; k < 16; k++) {
-                    uint32_t x = bx * 4 + (k & 3u), y = by * 4 + (k >> 2), argb = px[k];
-                    uint8_t *o;
-                    if (x >= w || y >= h) continue;
-                    if (g_upload_bias_bg) argb ^= 0x00008080u;
-                    o = rgba + ((size_t)y * w + x) * 4;
-                    o[0] = (uint8_t)(argb >> 16);
-                    o[1] = (uint8_t)(argb >> 8);
-                    o[2] = (uint8_t)argb;
-                    o[3] = (uint8_t)(argb >> 24);
-                }
-            }
+        DxtRows j;
+        j.src = src; j.color = color; j.w = w; j.h = h; j.rgba = rgba;
+        j.bw = (w + 3) / 4; j.bb = d3d8_format_dxt_block_bytes(color);
+        j.by0 = 0; j.by1 = (h + 3) / 4;
+        dxt_decode_rows_parallel(&j);
         return 1;
     }
     return decode_texels(color, src, w, h, pitch, rgba);
@@ -4166,8 +4222,10 @@ static uint32_t upload_texture_inner(const TexStage *t)
     /* Until the new texture exists the slot holds nothing. */
     tcache_drop((uint32_t)slot);
 
-    /* DXT as it is, where the device takes it (tex_dxt_direct). */
-    if (fmt_is_dxt(t->color) && tex_dxt_direct(&smp)) {
+    /* DXT as it is, where the device takes it (tex_dxt_direct); one smaller
+     * than a block, or not a whole number of them, decoded (Metal's BC
+     * formats want whole blocks), without giving up on the rest. */
+    if (fmt_is_dxt(t->color) && !(w & 3) && !(h & 3) && tex_dxt_direct(&smp)) {
         tex = G->tex_new_dxt(w, h, t->color == 0x0C ? 1 : t->color == 0x0E ? 3 : 5, src, &smp);
         if (tex) {
             uint32_t l, wl = w, hl = h;
