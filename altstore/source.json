@@ -27,6 +27,15 @@
       },
       "versions": [
         {
+          "version": "0.6.8",
+          "buildVersion": "0.6.8",
+          "date": "2026-11-05T10:06:00Z",
+          "localizedDescription": "No more stutter when a map starts: textures go to the graphics chip as they are, and more sound is kept in hand.",
+          "downloadURL": "https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/download/v0.6.8/JSRF-Unleashed-iOS.ipa",
+          "size": 13412333,
+          "minOSVersion": "15.0"
+        },
+        {
           "version": "0.6.7",
           "buildVersion": "0.6.7",
           "date": "2026-11-04T13:32:14Z",
