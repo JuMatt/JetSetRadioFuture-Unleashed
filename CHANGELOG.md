@@ -10,6 +10,31 @@ its version. Downloads are on the
 [Releases](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases)
 page.
 
+## 0.6.8 — 5 November 2026
+
+No more stutter when a map starts. Every platform is new in 0.6.8.
+
+- **Map loads no longer stutter.** A map's first frame uploads a few dozen
+  new textures at once, nearly all of them DXT-compressed. On the Mac and
+  iPhone (Metal) every one was decompressed on the processor first: on an
+  iPhone 16 Pro entering Shibuya Terminal that froze one frame for 51 ms, and
+  the sound stuttered for a moment; on an M2 Pro, 48 and 79 ms. Metal now
+  hands them to the GPU as they are (BC1, BC2, BC3) wherever the GPU has
+  those formats — every Apple silicon Mac, and iPhones and iPads that report
+  it — as OpenGL already did on Windows and Linux. Measured on the Mac: no
+  texture stall at all on entering Shibuya Terminal, and the same picture.
+  `RECOMP_MTL_DXT=0`: decompressed as before.
+- **Where textures still have to be decompressed** (an iPhone without those
+  formats, most Android GPUs), a big one is now shared out among up to four
+  processor cores: about 40% less time on a map load (`RECOMP_DXT_THREADS=1`:
+  one core, as before).
+- **More sound in hand on iPhone and Android:** 80 ms buffered ahead of the
+  speaker instead of 40, so a long frame no longer drains it audibly
+  (`RECOMP_APU_RING_MS` still sets it).
+- Tested on a Mac (Shibuya Terminal, compressed textures on and off, the
+  picture compared). The iPhone, Android, Windows and Linux: built and
+  checked, not run.
+
 ## 0.6.7 — 4 November 2026
 
 Vibration, as on the console. Every platform is new in 0.6.7.
