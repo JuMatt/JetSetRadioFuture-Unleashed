@@ -26,6 +26,14 @@
 #include <stddef.h>
 #include <math.h>
 static double jsrf_now(void);   /* defined further down */
+static uint32_t jct_begin_call(void);
+static void jct_sample(unsigned kind, unsigned phase, uint32_t self, uint32_t frame, uint32_t call);
+static void jct_note_pad(int16_t lx, int16_t ly, int16_t rx, int16_t ry, uint8_t lt, uint8_t lb);
+static void jct_delivered_pad(int16_t lx, int16_t ly, int16_t rx, int16_t ry, uint8_t lt, uint8_t lb);
+static void jct_pad_failed(void);
+static void jct_request_rail_capture(void);
+static void jcx_pad_failed(void);
+static void jcx_forget(void);
 
 #if defined(_WIN32)
 /* No pwrite on Windows: a seek and a write do the same for the one writer here. */
@@ -2755,8 +2763,12 @@ void sub_001C3E14(void)
     XBOX_INPUT_STATE s;
     static uint16_t last_btn; static uint8_t last_a;
     if ((h & 0xFFFF0000u) != XPP_HANDLE_BASE || !st) { g_eax = 0x57; g_esp += 12; return; }
-    if (!pad_read(h & 3, &s)) { g_eax = 0x48F; g_esp += 12; return; }   /* ERROR_DEVICE_NOT_CONNECTED */
-    if ((h & 3) == 0) rcam_note_pad(&s);
+    if (!pad_read(h & 3, &s)) { if ((h & 3) == 0) { jct_pad_failed(); jcx_pad_failed(); } g_eax = 0x48F; g_esp += 12; return; }   /* ERROR_DEVICE_NOT_CONNECTED */
+    if ((h & 3) == 0) {
+        jct_note_pad(s.Gamepad.sThumbLX, s.Gamepad.sThumbLY, s.Gamepad.sThumbRX, s.Gamepad.sThumbRY, s.Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER], s.Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK]);
+        rcam_note_pad(&s);
+        jct_delivered_pad(s.Gamepad.sThumbLX, s.Gamepad.sThumbLY, s.Gamepad.sThumbRX, s.Gamepad.sThumbRY, s.Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER], s.Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK]);
+    }
     *(uint32_t *)(m + st) = s.dwPacketNumber;
     *(uint16_t *)(m + st + 4) = s.Gamepad.wButtons;
     memcpy(m + st + 6, s.Gamepad.bAnalogButtons, 8);
@@ -4518,9 +4530,11 @@ static int photo_frame(uint8_t *m, uint32_t cam, uint32_t mode, float dt)
     return 1;
 }
 
+#include "jsrf_camera_experiment.inc"
 static void rcam_note_pad(XBOX_INPUT_STATE *s)
 {
-    if (picker_note_pad(s) || photo_note_pad(s)) { s_rcam.rx = s_rcam.ry = 0.0f; s_rcam.lt = 0; return; }
+    if (picker_note_pad(s) || photo_note_pad(s)) { jcx_pad_failed(); s_rcam.rx = s_rcam.ry = 0.0f; s_rcam.lt = 0; return; }
+    if (jcx_enabled()) jcx_note_pad(s);
     float x = (float)s->Gamepad.sThumbRX / 32767.0f, y = (float)s->Gamepad.sThumbRY / 32767.0f;
     float mag = sqrtf(x * x + y * y);
     if (mag < RCAM_DEAD) {
@@ -4582,6 +4596,7 @@ static void rcam_restore(uint8_t *m, uint32_t cam)
         if (rcam_log_on())
             fprintf(stderr, "[RCAM] t=%.2f the eye was moved by something else: turn dropped\n", jsrf_now());
         s_rcam.yaw = s_rcam.pitch = 0.0f;
+        jcx_forget();
         return;
     }
     memcpy(e, s_rcam.game_eye, sizeof s_rcam.game_eye);
@@ -4634,7 +4649,8 @@ static void rcam_apply(uint8_t *m, uint32_t cam)
         fixed = f ? atof(f) * 3.14159265358979 / 180.0 : -1.0e8;
     }
     mode = c[0x208 / 4];
-    if (photo_frame(m, cam, mode, dt)) { s_rcam.active_until = 0.0; return; }
+    if (photo_frame(m, cam, mode, dt)) { jcx_forget(); s_rcam.active_until = 0.0; return; }
+    if (jcx_apply(m, cam, dt)) return;
     how = rcam_mode();
     ok = how > 0 && mode != 12 && mode != 14;
     s_rcam.active_until = ok ? now + 0.25 : 0.0;
@@ -4744,6 +4760,7 @@ void sub_000A5070(void)
     uint32_t cam = g_ecx;
     if (on < 0) on = getenv("JSRF_CAM_LOG") != NULL;
     s_rcam_frames++;
+    jct_sample(3, 0, cam, s_rcam_frames, jct_begin_call());
     rcam_restore((uint8_t *)(uintptr_t)m, cam);     /* the game's own eye, for its update */
     sub_000A5070_gen();
     if (cam >= 0x10000u && cam + 0x240u < lim)
@@ -4822,7 +4839,10 @@ void sub_000A28B0(void)
     if (s_world_frozen) s_rcam_frames++;   /* its update, which counts the frames, is held */
     rcam_restore(m, cam);
     sub_000A28B0_gen();
+    uint32_t trace_call = jct_begin_call();
+    jct_sample(3, 1, cam, s_rcam_frames, trace_call);
     rcam_apply(m, cam);
+    jct_sample(3, 2, cam, s_rcam_frames, trace_call);
 }
 /* The publish walk (sub_00011D00, from the scene tick at 0x12547 and from
  * itself): while the world is frozen it is left out, and only the camera's
@@ -5129,3 +5149,28 @@ static void area_pass(void (*gen)(void))
 void sub_0006B6A0(void) { area_pass(sub_0006B6A0_gen); }
 void sub_0006B8F0(void) { area_pass(sub_0006B8F0_gen); }
 void sub_0006C360(void) { area_pass(sub_0006C360_gen); }
+
+/* Read-only diagnostics plus opt-in experiment; wrappers remain visible to
+ * manual_scan.py and CMake. Flag off always invokes the unmodified bodies. */
+#define JSRF_CAMERA_HOST_TRACE 1
+#include "jsrf_camera_trace.inc"
+#include "jsrf_camera_native_build.inc"
+extern void sub_0008B200_gen(void);
+void sub_0008B200(void)
+{
+    uint32_t trace_self = g_ecx;
+    uint32_t trace_call = jct_begin_call();
+    jct_sample(1, 0, trace_self, s_rcam_frames, trace_call);
+    sub_0008B200_gen(); /* LT/LB and target lock retain native semantics. */
+    jct_sample(1, 1, trace_self, s_rcam_frames, trace_call);
+}
+extern void sub_000A76E0_gen(void);
+void sub_000A76E0(void)
+{
+    uint32_t trace_self = g_ecx;
+    uint32_t trace_call = jct_begin_call();
+    jct_sample(2, 0, trace_self, s_rcam_frames, trace_call);
+    jcx_prepare_input(trace_self);
+    if (jcx_enabled()) jcx_native_input(); else sub_000A76E0_gen();
+    jct_sample(2, 1, trace_self, s_rcam_frames, trace_call);
+}
