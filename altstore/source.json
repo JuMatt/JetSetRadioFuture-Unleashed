@@ -27,6 +27,15 @@
       },
       "versions": [
         {
+          "version": "0.6.9",
+          "buildVersion": "0.6.9",
+          "date": "2026-11-07T18:19:34Z",
+          "localizedDescription": "Vibration as on the console (both motors, at the right strength), and in photo mode no spray can stays stuck to the screen.",
+          "downloadURL": "https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases/download/v0.6.9/JSRF-Unleashed-iOS.ipa",
+          "size": 13411339,
+          "minOSVersion": "15.0"
+        },
+        {
           "version": "0.6.8",
           "buildVersion": "0.6.8",
           "date": "2026-11-05T10:06:00Z",
