@@ -163,8 +163,12 @@ int nv_gc_poll(unsigned port, unsigned short *buttons,
  * stronger of the two motors, sharpness how much of it is the light one.
  * With no controller, an iPhone's own Taptic Engine does the same while the
  * on-screen controls are in use. Built at the first call that needs it, torn
- * down when its controller goes; a failure is said once and not retried for
- * that controller. */
+ * down when its controller goes. A controller without haptics is said once
+ * and left alone; any other failure is tried again, after 1, 2, 4... up to 30
+ * seconds. A DualSense on a Mac answered the first request of a session with
+ * "Couldn't communicate with a helper application" -- the system's haptics
+ * helper not ready yet -- and until 0.6.9 that one failure was final: no
+ * vibration at all until the game was started again. */
 #import <CoreHaptics/CoreHaptics.h>
 #include <TargetConditionals.h>
 
@@ -172,7 +176,21 @@ int nv_gc_poll(unsigned port, unsigned short *buttons,
 static CHHapticEngine *g_rb_engine[RUMBLE_SLOTS] API_AVAILABLE(macos(10.15), ios(13.0));
 static id g_rb_player[RUMBLE_SLOTS];
 static const void *g_rb_owner[RUMBLE_SLOTS];
-static int   g_rb_failed[RUMBLE_SLOTS], g_rb_running[RUMBLE_SLOTS];
+static int   g_rb_failed[RUMBLE_SLOTS], g_rb_running[RUMBLE_SLOTS];   /* failed: for good (no haptics) */
+static int    g_rb_tries[RUMBLE_SLOTS];       /* failures in a row that are worth another try */
+static double g_rb_next[RUMBLE_SLOTS];        /* not before this (CFAbsoluteTime) */
+
+/* A failure worth another try: when, and said for the first few. */
+static void rumble_retry_later(int s, const char *what, NSError *err)
+{
+    double wait = g_rb_tries[s] >= 5 ? 30.0 : (double)(1 << g_rb_tries[s]);
+    g_rb_tries[s]++;
+    g_rb_next[s] = CFAbsoluteTimeGetCurrent() + wait;
+    if (g_rb_tries[s] <= 6)
+        fprintf(stderr, "[RUMBLE] %s: %s -- tried again in %.0f s\n", what,
+                err ? [[err localizedDescription] UTF8String] : "?", wait);
+    fflush(stderr);
+}
 static float g_rb_level[RUMBLE_SLOTS], g_rb_sharp[RUMBLE_SLOTS];
 
 static GCController *controller_for(unsigned port)
@@ -203,6 +221,7 @@ static int rumble_ready(int s, GCController *c) API_AVAILABLE(macos(10.15), ios(
     CHHapticEngine *e;
     if (g_rb_player[s]) return 1;
     if (g_rb_failed[s]) return 0;
+    if (g_rb_tries[s] && CFAbsoluteTimeGetCurrent() < g_rb_next[s]) return 0;
     e = nil;
     if (c) {
         if (@available(macOS 11.0, iOS 14.0, *)) {
@@ -227,9 +246,7 @@ static int rumble_ready(int s, GCController *c) API_AVAILABLE(macos(10.15), ios(
         e.stoppedHandler = ^(CHHapticEngineStoppedReason r) { (void)r; g_rb_running[slot] = 0; g_rb_level[slot] = -1.0f; };
     }
     if (![e startAndReturnError:&err]) {
-        g_rb_failed[s] = 1;
-        fprintf(stderr, "[RUMBLE] the haptic engine did not start: %s\n", err ? [[err localizedDescription] UTF8String] : "?");
-        fflush(stderr);
+        rumble_retry_later(s, "the haptic engine did not start", err);
         return 0;
     }
     {
@@ -238,19 +255,36 @@ static int rumble_ready(int s, GCController *c) API_AVAILABLE(macos(10.15), ios(
         CHHapticEvent *ev = [[CHHapticEvent alloc] initWithEventType:CHHapticEventTypeHapticContinuous
                                                          parameters:@[in, sh] relativeTime:0 duration:30.0];
         CHHapticPattern *p = [[CHHapticPattern alloc] initWithEvents:@[ev] parameters:@[] error:&err];
-        id<CHHapticAdvancedPatternPlayer> pl = p ? [e createAdvancedPlayerWithPattern:p error:&err] : nil;
-        if (!pl) {
-            g_rb_failed[s] = 1;
-            fprintf(stderr, "[RUMBLE] no pattern player: %s\n", err ? [[err localizedDescription] UTF8String] : "?");
-            fflush(stderr);
+        id<CHHapticAdvancedPatternPlayer> pl = nil;
+        id<CHHapticPatternPlayer> plain = nil;
+        if (c) {
+            /* A game controller gets a plain player. On the Mac (a DualSense,
+             * macOS 26) the GameController haptics service makes no advanced
+             * one -- "Couldn't communicate with a helper application", every
+             * time, and the engine is no good after that ("Client not
+             * registered") -- while a plain one plays, and takes the same
+             * intensity and sharpness changes. A plain player does not loop:
+             * one hour of vibration, started again whenever it is asked for
+             * anew. */
+            CHHapticEvent *ev1 = [[CHHapticEvent alloc] initWithEventType:CHHapticEventTypeHapticContinuous
+                                                              parameters:@[in, sh] relativeTime:0 duration:3600.0];
+            CHHapticPattern *p1 = [[CHHapticPattern alloc] initWithEvents:@[ev1] parameters:@[] error:&err];
+            plain = p1 ? [e createPlayerWithPattern:p1 error:&err] : nil;
+        } else {
+            pl = p ? [e createAdvancedPlayerWithPattern:p error:&err] : nil;   /* the phone's own: it loops */
+            if (pl) pl.loopEnabled = YES;
+        }
+        if (!pl && !plain) {
+            rumble_retry_later(s, "no pattern player", err);
             [e stopWithCompletionHandler:nil];
             return 0;
         }
-        pl.loopEnabled = YES;
         g_rb_engine[s] = e;
-        g_rb_player[s] = pl;
+        g_rb_player[s] = pl ? (id)pl : (id)plain;
     }
-    fprintf(stderr, "[RUMBLE] %s: haptics ready\n", c ? (c.vendorName ? [c.vendorName UTF8String] : "the controller") : "this device");
+    fprintf(stderr, "[RUMBLE] %s: haptics ready%s\n", c ? (c.vendorName ? [c.vendorName UTF8String] : "the controller") : "this device",
+            g_rb_tries[s] ? " (after a failed try)" : "");
+    g_rb_tries[s] = 0;
     fflush(stderr);
     return 1;
 }
@@ -276,6 +310,7 @@ int nv_gc_rumble(unsigned port, float lo, float hi, int allow_device)
                 rumble_drop((int)port);
                 g_rb_owner[port] = owner;
                 g_rb_failed[port] = 0;
+                g_rb_tries[port] = 0;
             }
             if (!c && g_rb_engine[port]) { rumble_drop((int)port); g_rb_owner[port] = NULL; }
             if (s != 4 && g_rb_engine[4] && g_rb_running[4]) {   /* a controller took over from the device */
