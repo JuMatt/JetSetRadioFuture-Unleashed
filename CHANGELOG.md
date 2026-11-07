@@ -10,6 +10,44 @@ its version. Downloads are on the
 [Releases](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases)
 page.
 
+## 0.6.9 — 7 November 2026
+
+Vibration as the console had it, and photo mode put right: the whole HUD
+hides on Windows and Linux, and no spray can stays stuck to the screen. Every
+platform is new in 0.6.9.
+
+- **Vibration, as on the Xbox.** Two mistakes between the game and the pad:
+  - The two motor speeds were read two bytes too early in the request the
+    game hands to the controller. What reached the pad as the left motor was
+    always 0, the game's left motor arrived as the right (the small, light
+    one), and the game's right motor never arrived at all. Hence the reports
+    of feeling a car crash and nothing else.
+  - The game gives its rumble library strengths from 0 to 65535 where it
+    expects 0 to 10000. On the console the processor's 32-bit arithmetic
+    wraps, and that wrap is the rumble players felt; the recompiled code
+    didn't wrap the same way, so full strength came out at about half and a
+    fading rumble as noise. It is now worked out exactly as on the console.
+- **Photo mode, Windows and Linux: Y (L on a keyboard) hides the whole HUD**
+  — the health bar, the spray-can counter, the gauge — and in widescreen
+  the HUD sits at the screen's edges again instead of in the middle 4:3.
+  Both find the HUD by recognising its texture from a fingerprint measured on
+  a Mac; since 0.6.2 Windows and Linux computed that fingerprint with a
+  faster method that gives other values, so the HUD was never recognised
+  there. The fingerprint is now made the same way on every machine. Thanks to
+  the players who reported it with a video.
+- **Photo mode: no more spray can stuck to the screen.** A can you have just
+  picked up flies to the counter, and the game places it from the camera —
+  pinned to the screen like the HUD, though not part of it. Frozen there, it
+  hung in front of whatever the photo camera turned to. Once the camera turns,
+  anything that stays pinned to the screen that way is now left out of the
+  picture (the HUD itself still comes and goes with Y).
+  `RECOMP_PHOTO_PINNED=0`: as before.
+- Tested on a Mac (Shibuya Terminal: every rumble request the game makes
+  logged and checked against the console's arithmetic; photo mode right after
+  picking up a can, HUD on and off, the camera turned) and on Linux (the
+  HUD's texture recognised, its pieces moved to the screen's edge in
+  widescreen).
+
 ## 0.6.8 — 5 November 2026
 
 No more stutter when a map starts. Every platform is new in 0.6.8.
