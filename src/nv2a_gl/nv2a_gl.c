@@ -1013,6 +1013,7 @@ static struct {
     uint32_t offset, format, w, h, pitch, hash;
     uint32_t levels;        /* of the title's mipmap chain uploaded (tex_title_levels) */
     uint32_t content;       /* every byte of it, hashed (see tcache_verify) */
+    uint32_t sheet;         /* a 256x256 DXT3's bytes, hashed alike on every machine (wide_hud_sheet) */
     uint32_t drawn;         /* the frame it was last looked up in */
     uint32_t last_draw;     /* when this entry was last looked up */
     uint32_t tex;           /* the device's texture */
@@ -3836,6 +3837,7 @@ static uint32_t upload_texture(const TexStage *t)
     return r;
 }
 static uint64_t vc_hash(const void *data, size_t n, uint64_t seed);   /* the vertex cache's, below */
+static uint64_t vc_hash_plain(const void *data, size_t n, uint64_t seed);
 /* The bytes a texture's decode reads from its base level. */
 static uint32_t tex_bytes(uint32_t color, uint32_t w, uint32_t h)
 {
@@ -4387,6 +4389,13 @@ made:
     g_tcache[slot].bias = g_upload_bias_bg;
     g_tcache[slot].va = va; g_tcache[slot].serial = contig_serial(va);
     g_tcache[slot].content = tex_content(t->color, h, t->pitch, src, bytes);
+    /* The one kind of texture told by a constant (wide_hud_sheet): its bytes
+     * hashed as on the Mac, where the constant was measured. */
+    g_tcache[slot].sheet = 0;
+    if (t->color == 0x0E && w == 256 && h == 256) {
+        uint64_t sh = vc_hash_plain(src, bytes, t->color);
+        g_tcache[slot].sheet = (uint32_t)(sh ^ (sh >> 32));
+    }
     g_tcache[slot].drawn = S.flips;
     g_tcache[slot].last_draw = S.draws;
     return tex;
@@ -4915,9 +4924,15 @@ static int wide_hud_on(void)
     if (on < 0) { const char *v = getenv("RECOMP_WIDE_HUD"); on = !(v && v[0] == '0'); }
     return on;
 }
-/* The content hash (tex_content) of the texture a stage is bound to, from
- * the texture cache: 0 if it has not been made yet. */
-static uint32_t tcache_content_of(const TexStage *t)
+/* The sheet hash (the texture cache's .sheet: a 256x256 DXT3's bytes, hashed
+ * with vc_hash_plain on every machine) of the texture a stage is bound to: 0
+ * if it has not been made yet, or is no such texture.
+ *
+ * It was the content hash (tex_content) until 0.6.8, and that one is made with
+ * the wider hash on x86-64 since 0.6.2: on Windows and Linux the sheet was
+ * never recognised -- the HUD stayed in the middle 4:3 of a wide screen, and
+ * photo mode's "HUD off" left it all on screen. */
+static uint32_t tcache_sheet_of(const TexStage *t)
 {
     uint32_t key = (t->offset ^ (t->width << 16) ^ (t->height << 4) ^ t->color) * 2246822519u, i;
     for (i = 0; i < TEX_CACHE; i++) {
@@ -4925,14 +4940,105 @@ static uint32_t tcache_content_of(const TexStage *t)
         if (!g_tcache[k].used) break;
         if (g_tcache[k].tex && g_tcache[k].offset == t->offset && g_tcache[k].format == t->color
             && g_tcache[k].w == t->width && g_tcache[k].h == t->height)
-            return g_tcache[k].content;
+            return g_tcache[k].sheet;
     }
     return 0;
 }
-/* The sheet's tex_content: the same in every mission measured (City Rush,
+/* The sheet's hash: the same in every mission measured (City Rush,
  * Dogenzaka Hill, the Fortified Residential Zone), wherever it is loaded. */
 /* Photo mode's "HUD off" (port/recomp_manual.c). */
 static volatile int g_hide_hud;
+static uint32_t g_tskip_tex, g_tskip_frame; static int g_tskip_k = -1, g_tskip_n, g_tskip_bit = -1;
+static uint32_t g_tidx, g_tidx_frame, g_tidx_cur;
+
+/* ---- photo mode: what is pinned to the screen -----------------------------
+ *
+ * A spray can the player has just picked up flies to the counter at the top
+ * right, and the game works out where it is from the camera -- it is drawn
+ * pinned to the screen, like the HUD, though from the can's own texture, so
+ * hiding the HUD's sheet leaves it there. With the world held still and the
+ * photo camera turned, it stayed where it was on the screen, a can hanging in
+ * front of whatever the camera looked at.
+ *
+ * Told by its transform: a fixed-function draw's composite matrix (model x
+ * view x projection) changes with the camera for anything in the world, and
+ * not for something pinned to the screen. So the frame photo mode starts on
+ * is recorded -- each fixed-function draw, by what it draws (texture, vertex
+ * array, count, primitive) and its matrix -- and once the photo camera has
+ * turned away from where it started, a draw found there with the very same
+ * matrix is left out. Turned, not moved: the sky keeps its matrix when the
+ * camera only moves, since it goes with the camera, and is not to vanish. The
+ * HUD's own pieces stay with the HUD (Y). RECOMP_PHOTO_PINNED=0: as before. */
+#define PIN_N 1024
+static uint64_t g_pin[PIN_N];
+static uint32_t g_pin_rec_frame = 0xFFFFFFFFu;
+static int g_pin_on, g_pin_turned, g_pin_n, g_pin_left;
+void nv2a_photo_pinned(int on);
+void nv2a_photo_pinned(int on)
+{
+    static int allowed = -1;
+    if (allowed < 0) { const char *e = getenv("RECOMP_PHOTO_PINNED"); allowed = !(e && e[0] == '0'); }
+    if (on && !allowed) return;
+    if (!on && g_pin_left) fprintf(stderr, "[PHOTO] %d draws pinned to the screen left out\n", g_pin_left);
+    memset(g_pin, 0, sizeof g_pin);
+    g_pin_on = on; g_pin_turned = 0; g_pin_n = 0; g_pin_left = 0;
+    g_pin_rec_frame = on ? S.frames + 1 : 0xFFFFFFFFu;
+}
+void nv2a_photo_turned(int turned);
+void nv2a_photo_turned(int turned) { g_pin_turned = turned; }
+static uint64_t pin_key(void)
+{
+    uint64_t h = vc_hash_plain(&S.u.ff_mat[0][0], sizeof S.u.ff_mat, 0x5049u);
+    uint32_t what[5];
+    what[0] = S.tex[0].enabled ? S.tex[0].offset : 0;
+    what[1] = S.attr[0].offset;
+    what[2] = S.inline_count ? S.inline_count : S.idx_count;
+    what[3] = S.prim;
+    what[4] = S.attr[0].stride;
+    h = vc_hash_plain(what, sizeof what, h);
+    return h ? h : 1;
+}
+/* 1: this draw is to be left out. Records it on the first frame. */
+static int pin_check(void)
+{
+    uint64_t k = pin_key();
+    uint32_t i, j;
+    if (S.frames == g_pin_rec_frame) {
+        if (g_pin_n >= PIN_N / 2) return 0;
+        for (i = 0; i < PIN_N; i++) {
+            j = (uint32_t)(k + i) & (PIN_N - 1);
+            if (g_pin[j] == k) return 0;
+            if (!g_pin[j]) { g_pin[j] = k; g_pin_n++; return 0; }
+        }
+        return 0;
+    }
+    if (!g_pin_turned || S.frames < g_pin_rec_frame) return 0;
+    for (i = 0; i < PIN_N; i++) {
+        j = (uint32_t)(k + i) & (PIN_N - 1);
+        if (!g_pin[j]) return 0;
+        if (g_pin[j] == k) {
+            if (g_pin_left < 4 || (g_pin_left & 255) == 0)
+                fprintf(stderr, "[PHOTO] pinned to the screen, left out: frame %u, %u vertices, texture %08X\n",
+                        S.frames, S.inline_count ? S.inline_count : S.idx_count,
+                        S.tex[0].enabled ? S.tex[0].offset : 0);
+            g_pin_left++;
+            return 1;
+        }
+    }
+    return 0;
+}
+void nv2a_gl_test_skip_bit(int bit);
+void nv2a_gl_test_skip_bit(int bit)
+{
+    g_tskip_bit = bit;
+    fprintf(stderr, "  [GL] test: 3D draws with bit %d of their place in the frame left out\n", bit);
+}
+void nv2a_gl_test_skip(uint32_t tex, int k);
+void nv2a_gl_test_skip(uint32_t tex, int k)
+{
+    g_tskip_tex = tex; g_tskip_k = k;
+    fprintf(stderr, "  [GL] test: draw %d of texture %08X left out\n", k, tex);
+}
 void nv2a_set_hide_hud(int hide);
 void nv2a_set_hide_hud(int hide) { g_hide_hud = hide; }
 #ifndef WIDE_HUD_SHEET
@@ -4951,7 +5057,7 @@ static int wide_hud_sheet(const TexStage *t)
         mode = (v && v[0] == '@') ? 1 : 0;
         want = v ? (uint32_t)strtoul(v + mode, NULL, 16) : WIDE_HUD_SHEET;
     }
-    c = tcache_content_of(t);
+    c = tcache_sheet_of(t);
     hit = mode ? t->offset == want : (c != 0 && c == want);
     for (i = 0; i < nsaid; i++) if (said[i] == (t->offset ^ c)) break;
     if (i == nsaid && nsaid < 8) {
@@ -5089,14 +5195,21 @@ static uint64_t vc_rotl(uint64_t x, int r) { return (x << r) | (x >> (64 - r)); 
  * From NV2A_HASH_MIN bytes on x86-64, the wider one in nv2a_hash.h. */
 static uint64_t vc_hash(const void *data, size_t n, uint64_t seed)
 {
+#if defined(NV2A_HASH_WIDE)
+    if (n >= NV2A_HASH_MIN) return nv2a_hash_wide(data, n, seed);
+#endif
+    return vc_hash_plain(data, n, seed);
+}
+/* vc_hash's own loop, on every machine. The wider hash on x86-64 gives other
+ * values -- fine for a hash compared with others made in the same run, not
+ * for one compared with a constant (wide_hud_sheet's, measured on a Mac). */
+static uint64_t vc_hash_plain(const void *data, size_t n, uint64_t seed)
+{
     const uint64_t P1 = 0x9E3779B185EBCA87ull, P2 = 0xC2B2AE3D27D4EB4Full,
                    P3 = 0x165667B19E3779F9ull;
     const uint8_t *p = (const uint8_t *)data;
     uint64_t a = seed + P1 + P2, b = seed + P2, c = seed, d = seed - P1, h, w;
     size_t len = n;
-#if defined(NV2A_HASH_WIDE)
-    if (n >= NV2A_HASH_MIN) return nv2a_hash_wide(data, n, seed);
-#endif
     while (n >= 32) {
         uint64_t w0, w1, w2, w3;
         memcpy(&w0, p, 8); memcpy(&w1, p + 8, 8);
@@ -5868,6 +5981,19 @@ static void do_draw_body(void)
     /* Photo mode with the HUD hidden (nv2a_set_hide_hud): the HUD's pieces,
      * all from its one sheet (wide_hud_sheet), are not drawn. */
     if (g_hide_hud && S.clip_w == 640 && S.clip_h == 480 && wide_hud_sheet(&S.tex[0])) return;
+    /* Test only (nv2a_gl_test_skip): the k-th draw of a frame from one texture left out. */
+    /* Test only: each draw's place in the frame, counted before anything is
+     * left out (so leaving some out moves no other), for nv2a_gl_test_skip_bit. */
+    if (S.frames != g_tidx_frame) { g_tidx_frame = S.frames; g_tidx = 0; }
+    g_tidx_cur = g_tidx++;
+    if (g_tskip_bit >= 0 && g_pcache[slot].inputs != 0x1F9B && ((g_tidx_cur >> g_tskip_bit) & 1)) return;
+    if (g_pin_on && S.xf_mode == NV2A_XF_MODE_FIXED && g_pcache[slot].inputs != 0x1F9B
+        && !(S.tex[0].enabled && S.clip_w == 640 && S.clip_h == 480 && wide_hud_sheet(&S.tex[0]))
+        && pin_check()) return;
+    if (g_tskip_k >= 0 && S.tex[0].enabled && S.tex[0].offset == g_tskip_tex) {
+        if (S.frames != g_tskip_frame) { g_tskip_frame = S.frames; g_tskip_n = 0; }
+        if (g_tskip_n++ == g_tskip_k) return;
+    }
 
     /*
      * The vertex layout, cut down to what this draw actually needs.
@@ -6901,9 +7027,10 @@ static void do_draw_body(void)
               char line[1400]; int len = 0;
               if (bump) bump_said++;
               len += snprintf(line + len, sizeof line - len,
-                      "[PASS] f%u d%u surf %08X %ux%u prim %u n %u modes %05X blend %d %X/%X ztest %d cm %08X comb %08X |",
-                      S.frames, S.draws, S.color_offset, S.clip_w, S.clip_h, S.prim,
+                      "[PASS] f%u d%u sp %u surf %08X %ux%u prim %u n %u in %X a0 %d xf %u modes %05X blend %d %X/%X ztest %d cm %08X comb %08X |",
+                      S.frames, S.draws, g_tidx_cur, S.color_offset, S.clip_w, S.clip_h, S.prim,
                       S.inline_count ? S.inline_count : S.idx_count,
+                      g_pcache[slot].inputs, g_pcache[slot].uses_a0 ? 1 : 0, (unsigned)S.xf_mode,
                       S.shader_stage_prog, S.blend_enable, S.blend_src, S.blend_dst,
                       S.depth_test, S.color_mask, S.psh.control);
               for (k = 0; k < 4; k++) {

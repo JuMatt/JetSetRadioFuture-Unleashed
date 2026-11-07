@@ -1539,7 +1539,10 @@ static void teleport_step(float *chw)
  * per-pass log when the first boost starts. */
 extern void nv2a_gl_dump_burst(int shots, int every);
 extern void nv2a_gl_trace_frames(int n);
+extern void nv2a_gl_test_skip(uint32_t tex, int k);
+extern void nv2a_gl_test_skip_bit(int bit);
 extern uint32_t nv2a_gl_flips(void);
+static volatile int s_can_pickups;   /* cans the player picked up (test_hooks_step) */
 static void test_hooks_step(uint8_t *ch)
 {
     static int cans_state = -1; static double cans_t; static int cans_n;
@@ -1558,6 +1561,12 @@ static void test_hooks_step(uint8_t *ch)
         fprintf(stderr, "[CANS] t=%.1f cans %d -> %d\n", pad_now(), (int)cw[0xFA0 / 4], cans_n);
         cw[0xFA0 / 4] = (uint32_t)cans_n;
     }
+    { static int cans_was = -1; int now_cans = (int)cw[0xFA0 / 4];
+      if (cans_was >= 0 && now_cans > cans_was) {
+          s_can_pickups++;
+          fprintf(stderr, "[CANS] t=%.2f picked up: %d -> %d\n", pad_now(), cans_was, now_cans);
+      }
+      cans_was = now_cans; }
     timer = cw[0xE60 / 4];
     if (timer != last_timer && (timer == 0 || last_timer == 0)) {
         if (timer) boosts++;
@@ -2771,13 +2780,67 @@ void sub_001C3E14(void)
 }
 /* XInputSetState(h, feedback) */
 int nv_window_pref_vibration(void);   /* the window or the app: on by default */
+/* The DirectInput layer's SetProperty (0x1E3828's slot 6): how the game asks
+ * for rumble -- two magnitudes, 0..10000, into the device's +0x47C/+0x47E,
+ * which its Poll (sub_00167180) hands to XInputSetState when they change.
+ * JSRF_RUMBLE_LOG=1: every call that carries them, with the game's return
+ * addresses on the stack, so a missing rumble can be told from one the game
+ * never asked for. */
+extern void sub_001678F0_gen(void);
+void sub_001678F0(void)
+{
+    static int log = -1;
+    uint8_t *m = (uint8_t *)g_xbox_mem_offset;
+    uint32_t dev = GARG(1), prop = GARG(2), ph = GARG(3);
+    if (log < 0) log = getenv("JSRF_RUMBLE_LOG") ? 1 : 0;
+    sub_001678F0_gen();
+    /* The rumble property (0x1E1874, a 0x18-byte DIPROPDWORD pair): each
+     * magnitude goes through imul by 0xFFFF and a divide by 10000 (multiply
+     * by 0x68DB8BAD, sar 12). The game passes 0..65535, not 0..10000, so on
+     * the console the 32-bit product wraps -- and that wrap is what its rumble
+     * is made of. In C that imul is a signed overflow, which the compiler is
+     * free to treat as impossible: it kept the full product instead, and a
+     * full-strength 65535 came out as 36267 rather than 65523, a fade as
+     * noise. Done again here as the processor does it. */
+    if (g_eax == 0 && prop == 0x001E1874u && ph && *(uint32_t *)(m + ph) == 0x18) {
+        uint32_t i;
+        for (i = 0; i < 2; i++) {
+            uint32_t v = *(uint32_t *)(m + ph + 0x10 + 4 * i);
+            int32_t e = (int32_t)(v * 0xFFFFu);
+            int32_t hi = (int32_t)(((int64_t)0x68DB8BAD * (int64_t)e) >> 32);
+            hi >>= 12;
+            hi += (int32_t)((uint32_t)hi >> 31);
+            *(uint16_t *)(m + dev + 0x47C + 2 * i) = (uint16_t)hi;
+        }
+    }
+    if (log && ph && *(uint32_t *)(m + ph) == 0x18) {
+        char who[96]; int n = 0, k; uint32_t sp = g_esp - 16;   /* the caller's frame, after ret 12 */
+        who[0] = 0;
+        for (k = 0; k < 48 && n < 4; k++) {
+            uint32_t v = *(uint32_t *)(m + sp + 4 * k);
+            if (v >= 0x11000u && v < 0x150000u)
+                { snprintf(who + strlen(who), sizeof who - strlen(who), " %06X", v); n++; }
+        }
+        fprintf(stderr, "[RUMBLE] t=%.2f SetProperty dev %08X prop %08X: %u %u -> device %u %u |%s\n",
+                jsrf_now(), dev, prop, *(uint32_t *)(m + ph + 0x10), *(uint32_t *)(m + ph + 0x14),
+                *(uint16_t *)(m + dev + 0x47C), *(uint16_t *)(m + dev + 0x47E), who);
+    }
+}
 void sub_001C3E85(void)
 {
     uint32_t fb = GARG(2); uint8_t *m = (uint8_t *)g_xbox_mem_offset;
     if (fb) {
         uint32_t ev = *(uint32_t *)(m + fb + 4);
         *(uint32_t *)(m + fb) = 0;                    /* Header.dwStatus = ERROR_SUCCESS */
-        XBOX_VIBRATION v = { *(uint16_t *)(m + fb + 0x40), *(uint16_t *)(m + fb + 0x42) };
+        /* XINPUT_FEEDBACK: a 0x42-byte header (dwStatus, hEvent, 58 reserved
+         * bytes), then the two motors. The game's own input layer writes them
+         * there as one dword (sub_00167180: [feedback+0x42] from the device's
+         * +0x47C, the left motor in its low half). Until 0.6.8 they were read
+         * at +0x40 and +0x42 -- a reserved word, always 0, as the left motor,
+         * and the game's left motor as the right: whatever the game asked of
+         * its right (small, fast) motor never reached the pad, and only the
+         * big hits, which use the left, were felt. */
+        XBOX_VIBRATION v = { *(uint16_t *)(m + fb + 0x42), *(uint16_t *)(m + fb + 0x44) };
         /* Vibration off in the settings or the menu: the motors are asked
          * to stop, whatever the game says. JSRF_RUMBLE_LOG=1: each change. */
         if (!nv_window_pref_vibration()) v.wLeftMotorSpeed = v.wRightMotorSpeed = 0;
@@ -2785,7 +2848,8 @@ void sub_001C3E85(void)
           if (log < 0) log = getenv("JSRF_RUMBLE_LOG") ? 1 : 0;
           if (log && (v.wLeftMotorSpeed != l0 || v.wRightMotorSpeed != h0)) {
               l0 = v.wLeftMotorSpeed; h0 = v.wRightMotorSpeed;
-              fprintf(stderr, "[RUMBLE] t=%.2f port %u: left %u right %u\n", jsrf_now(), GARG(1) & 3, l0, h0);
+              fprintf(stderr, "[RUMBLE] t=%.2f port %u: left %u right %u (from %08X; +0x40 %u)\n", jsrf_now(),
+                      GARG(1) & 3, l0, h0, MEM32(g_esp), *(uint16_t *)(m + fb + 0x40));
           } }
         xbox_InputSetState(GARG(1) & 3, &v);
         if (ev) { static int once; if (!once++) fprintf(stderr, "[PAD] XInputSetState with hEvent=%08X (not signalled)\n", ev); }
@@ -4382,6 +4446,8 @@ static uint32_t s_rcam_frames;
  * into the picture's window with SDL). */
 void nv_window_photo_help(const char *text);      /* NULL: none */
 void nv2a_set_hide_hud(int hide);
+void nv2a_photo_pinned(int on);
+void nv2a_photo_turned(int turned);
 int  nv_window_take_photo_request(void);          /* a menu's Photo Mode, once */
 #define PHOTO_HOLD   0.8       /* seconds of Back to start it */
 #define PHOTO_SPEED  110.0f    /* units a second at full stick */
@@ -4404,7 +4470,7 @@ static struct {
     uint16_t btn_was;
     uint8_t  a_was, b_was, y_was;
     float    lx, ly, rx, ry, lt, rt;
-    float    pos[3], yaw, pitch;
+    float    pos[3], yaw, pitch, yaw0, pitch0;
     int      help, hud_hidden;
 } s_photo;
 static float photo_axis(int16_t v)
@@ -4422,6 +4488,7 @@ static void photo_leave(const char *why)
     if (!s_photo.on) return;
     s_photo.on = 0;
     s_world_frozen = 0;
+    nv2a_photo_pinned(0);
     if (s_photo.hud_hidden) nv2a_set_hide_hud(0);
     s_photo.hud_hidden = 0;
     photo_show_help();
@@ -4467,10 +4534,66 @@ static int photo_note_pad(XBOX_INPUT_STATE *s)
     return 1;
 }
 /* Each game frame, with the camera just published. 1 when photo mode set it. */
+/* JSRF_PHOTO_ON_CAN=<s> (test only): photo mode <s> seconds after the first can
+ * is picked up -- with that can on its way to the counter -- then a picture
+ * at 0.2 s, the HUD off and a picture at 0.8 s, the camera turned from 0.8 s
+ * to 1.6 s and a picture at 2 s (RECOMP_GL_DUMP_FB). The pad's sticks are
+ * left out meanwhile. */
+static void photo_can_test(float dt)
+{
+    static int on = -1, step; static double t, delay, since;
+    if (on < 0) { const char *e = getenv("JSRF_PHOTO_ON_CAN"); on = e ? 1 : 0; delay = e ? atof(e) : 0; }
+    if (!on || (step >= 6 + 2 * 6 && step < 99) || step >= 121) return;
+    if (step == 0) { if (s_can_pickups) since += dt;
+                     if (s_can_pickups && since >= delay) { s_photo.want = 1; step = 1; t = 0;
+                       fprintf(stderr, "[PHOTOTEST] a can picked up %.2f s ago: photo mode\n", since); } return; }
+    if (!s_photo.on) return;
+    t += dt;
+    s_photo.lx = s_photo.ly = s_photo.ry = s_photo.lt = s_photo.rt = 0.0f;   /* the script's sticks: not the camera's */
+    s_photo.rx = (step == 4 || step == 5) && t < 1.6 ? 0.8f : 0.0f;
+    if (step == 1 && t >= 0.2) { nv2a_gl_dump_burst(1, 1); step = 2;
+                                 fprintf(stderr, "[PHOTOTEST] picture: HUD on\n"); }
+    else if (step == 2 && t >= 0.4) { s_photo.hud_hidden = 1; nv2a_set_hide_hud(1); s_photo.help = 0;
+                                      photo_show_help(); step = 3; }
+    else if (step == 3 && t >= 0.8) { nv2a_gl_dump_burst(1, 1); step = 4;
+                                      if (getenv("JSRF_PHOTO_TRACE")) nv2a_gl_trace_frames(1);
+                                      fprintf(stderr, "[PHOTOTEST] picture: HUD off\n"); }
+    else if (step == 4 && t >= 1.0) step = 5;
+    else if (step == 5 && t >= 2.0) { nv2a_gl_dump_burst(1, 1); step = 6;
+                                      fprintf(stderr, "[PHOTOTEST] picture: HUD off, turned\n"); }
+    /* JSRF_PHOTO_SKIP_TEX=<hex>: then the 1st..6th draw from that texture
+     * left out in turn, a picture of each. */
+    else if (step >= 6) {
+        static uint32_t tex; static int init; static double at;
+        static int bits;
+        if (!init) { const char *e = getenv("JSRF_PHOTO_SKIP_TEX"); init = 1; tex = e ? (uint32_t)strtoul(e, 0, 16) : 0;
+                     bits = getenv("JSRF_PHOTO_SKIP_BITS") ? 1 : 0;
+                     if (!tex && !bits) step = 99; at = t; if (bits) step = 100; }
+        /* JSRF_PHOTO_SKIP_BITS=1: instead, ten pictures, each with the 3D draws
+         * whose place in the frame has bit 0..9 set left out, then the frame's
+         * draws traced: which pictures lose something tells which draw it is. */
+        if (step >= 100 && step < 120) {
+            int i = (step - 100) / 2;
+            if (((step - 100) & 1) == 0 && t >= at + 0.3) { nv2a_gl_test_skip_bit(i); step++; at = t; }
+            else if (((step - 100) & 1) == 1 && t >= at + 0.3) {
+                nv2a_gl_dump_burst(1, 1); step++; at = t;
+                fprintf(stderr, "[PHOTOTEST] picture: bit %d left out\n", i);
+                if (step == 120) { nv2a_gl_test_skip_bit(-1); }
+            }
+            return;
+        }
+        if (step == 120 && t >= at + 0.3) { nv2a_gl_trace_frames(3); step = 121; return; }
+        if (step >= 99) return;
+        if (((step - 6) & 1) == 0 && t >= at + 0.3) { nv2a_gl_test_skip(tex, (step - 6) / 2); step++; at = t; }
+        else if (((step - 6) & 1) == 1 && t >= at + 0.3) { nv2a_gl_dump_burst(1, 1); step++; at = t;
+            fprintf(stderr, "[PHOTOTEST] picture: draw %d of %08X left out\n", (step - 7) / 2, tex); }
+    }
+}
 static int photo_frame(uint8_t *m, uint32_t cam, uint32_t mode, float dt)
 {
     float *e = (float *)(m + cam + 0x44), *t = (float *)(m + cam + 0x5C);
     float f[3], r[3], cp, sp;
+    photo_can_test(dt);
     if (s_photo.on && (mode == 12 || mode == 14)) photo_leave("an event");
     if (s_photo.want && !s_photo.on) {
         float v[3] = { t[0] - e[0], t[1] - e[1], t[2] - e[2] };
@@ -4486,6 +4609,8 @@ static int photo_frame(uint8_t *m, uint32_t cam, uint32_t mode, float dt)
         memcpy(s_photo.pos, e, 12);
         s_photo.yaw = atan2f(v[0], v[2]);
         s_photo.pitch = atan2f(v[1], sqrtf(v[0] * v[0] + v[2] * v[2]));
+        s_photo.yaw0 = s_photo.yaw; s_photo.pitch0 = s_photo.pitch;
+        if (s_world_frozen) nv2a_photo_pinned(1);   /* what is pinned to the screen: see nv2a_gl.c */
         photo_show_help();
         fprintf(stderr, "[PHOTO] on, at %.1f %.1f %.1f\n", e[0], e[1], e[2]);
     }
@@ -4495,6 +4620,7 @@ static int photo_frame(uint8_t *m, uint32_t cam, uint32_t mode, float dt)
     s_photo.pitch += s_photo.ry * PHOTO_PITCH * dt;
     if (s_photo.pitch > 1.45f) s_photo.pitch = 1.45f;
     if (s_photo.pitch < -1.45f) s_photo.pitch = -1.45f;
+    nv2a_photo_turned(fabsf(s_photo.yaw - s_photo.yaw0) > 0.02f || fabsf(s_photo.pitch - s_photo.pitch0) > 0.02f);
     cp = cosf(s_photo.pitch); sp = sinf(s_photo.pitch);
     f[0] = sinf(s_photo.yaw) * cp; f[1] = sp; f[2] = cosf(s_photo.yaw) * cp;
     r[0] = cosf(s_photo.yaw); r[1] = 0.0f; r[2] = -sinf(s_photo.yaw);   /* the right of (x, z) is (z, -x) */
@@ -4749,7 +4875,7 @@ void sub_000A5070(void)
     if (cam >= 0x10000u && cam + 0x240u < lim)
         s_cam_mode_now = ((const uint32_t *)(m + cam))[0x208 / 4];
     { static int hooks = -1;
-      if (hooks < 0) hooks = (getenv("JSRF_CANS") || getenv("JSRF_BOOST_DUMP")) ? 1 : 0;
+      if (hooks < 0) hooks = (getenv("JSRF_CANS") || getenv("JSRF_BOOST_DUMP") || getenv("JSRF_PHOTO_ON_CAN")) ? 1 : 0;
       if (hooks && cam >= 0x10000u && cam + 0x240u < lim) {
           uint32_t who = ((const uint32_t *)(m + cam))[0x24 / 4];
           if (who >= 0x10000u && who + 0x1000u < lim)
