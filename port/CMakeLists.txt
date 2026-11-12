@@ -49,6 +49,50 @@ endif()
 # levels above the generated code goes on the include path.
 get_filename_component(JSRF_GEN_ROOT "${JSRF_GEN_DIR}/../.." ABSOLUTE)
 
+# Derive the small input wrapper locally; never check generated game code in.
+# This also handles an external JSRF_GEN_DIR and fresh _gen wrapper names.
+find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
+set(JSRF_CAMERA_NATIVE_INCLUDE "${CMAKE_CURRENT_BINARY_DIR}/jsrf_camera_native_build.inc")
+add_custom_command(
+    OUTPUT "${JSRF_CAMERA_NATIVE_INCLUDE}"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/prepare_camera_native.py"
+            --gen-dir "${JSRF_GEN_DIR}" --output "${JSRF_CAMERA_NATIVE_INCLUDE}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/prepare_camera_native.py"
+            "${JSRF_GEN_DIR}/recomp_0002.c"
+    COMMENT "Verifying native input preimage and deriving the private camera wrapper"
+    VERBATIM
+)
+add_custom_target(jsrf_camera_native DEPENDS "${JSRF_CAMERA_NATIVE_INCLUDE}")
+
+option(JSRF_CAMERA_TESTS "Build persistent-camera offline regression tests" OFF)
+if(JSRF_CAMERA_TESTS)
+    enable_testing()
+    add_executable(camera_intent_test tests/camera_intent_test.c)
+    if(NOT WIN32)
+        target_link_libraries(camera_intent_test PRIVATE m)
+    endif()
+    add_test(NAME camera_intent COMMAND camera_intent_test)
+    if(WIN32)
+        add_executable(camera_bridge_test tests/camera_bridge_test.c)
+        target_include_directories(camera_bridge_test PRIVATE "${JSRF_REPO}/src")
+        add_executable(camera_trace_test tests/camera_trace_test.c)
+        add_test(NAME camera_bridge COMMAND camera_bridge_test)
+        add_test(NAME camera_trace COMMAND camera_trace_test "${CMAKE_CURRENT_BINARY_DIR}/camera-trace-fixture.csv")
+        add_test(NAME camera_trace_arm COMMAND camera_trace_test "${CMAKE_CURRENT_BINARY_DIR}/camera-trace-arm.csv" "${CMAKE_CURRENT_BINARY_DIR}/camera-trace-arm.marker")
+        add_test(NAME camera_trace_rail COMMAND camera_trace_test "${CMAKE_CURRENT_BINARY_DIR}/camera-trace-rail.csv" "${CMAKE_CURRENT_BINARY_DIR}/camera-trace-rail.marker" rail)
+    endif()
+    # Fixtures use assert for both verification and checked setup calls.
+    foreach(_camera_test camera_intent_test camera_bridge_test camera_trace_test)
+        if(TARGET ${_camera_test})
+            if(MSVC)
+                target_compile_options(${_camera_test} PRIVATE /UNDEBUG)
+            else()
+                target_compile_options(${_camera_test} PRIVATE -UNDEBUG)
+            endif()
+        endif()
+    endforeach()
+endif()
+
 set(JSRF_VERSION "" CACHE STRING "Version (default: git describe)")
 if(NOT JSRF_VERSION)
     find_package(Git QUIET)
@@ -213,11 +257,13 @@ endif()
 target_compile_definitions(jsrf_recomp PRIVATE JSRF_VERSION="${JSRF_VERSION}")
 target_link_libraries(jsrf_recomp PRIVATE xboxrecomp)
 target_include_directories(jsrf_recomp PRIVATE
+    "${CMAKE_CURRENT_BINARY_DIR}"
     "${CMAKE_CURRENT_SOURCE_DIR}"
     "${JSRF_GEN_ROOT}"
     "${JSRF_GEN_DIR}"
     "${JSRF_REPO}/include"
 )
+add_dependencies(jsrf_recomp jsrf_camera_native)
 if(WIN32 AND XBOXRECOMP_WIN_GL)
     # The icon, a manifest (UTF-8 file names, a sharp window on a high-DPI
     # screen) and version information, shared with the launcher
