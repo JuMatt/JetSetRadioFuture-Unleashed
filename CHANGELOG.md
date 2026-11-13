@@ -10,6 +10,34 @@ its version. Downloads are on the
 [Releases](https://github.com/JuMatt/JetSetRadioFuture-Unleashed/releases)
 page.
 
+## 0.6.10 — 13 November 2026
+
+Vibration on a controller on the Mac, and a better map selector. Every
+platform is new in 0.6.10.
+
+- **A DualSense (or any controller with haptics) now vibrates on the Mac.**
+  macOS refuses the kind of vibration player the port used for controllers —
+  "Couldn't communicate with a helper application", every time — and that one
+  refusal was final for the session, so a controller on the Mac never
+  vibrated. Controllers now get the plain kind, which macOS plays, with the
+  same strength changes; the iPhone's own vibration is unchanged. And a
+  vibration failure is no longer final: tried again after 1, 2, 4… up to 30
+  seconds. (As on the console, the game itself only vibrates when you take a
+  hit — a car, the police — checked against xemu.)
+- **The map selector has the garage**, entered as the game does, through its
+  character select.
+- **99th Street and Dogenzaka Hill without a gang race at the exit.** The
+  selector's maps are the after-story ones, where a rival gang's race sits
+  beside some of them, started by skating into its spot — on 99th Street the
+  Immortals', right by the way back to the garage. Those two maps now load
+  their chapter 6 version, which has none.
+- **No more menu text left over a map.** Choosing a map while the garage's
+  character select was open left its names and stat bars drawn over the next
+  map; the selector now waits until you are back in play.
+- Tested on a Mac: a DualSense vibrating in the game; the garage, 99th Street
+  asked for during the character select, then Dogenzaka Hill, every load
+  clean.
+
 ## 0.6.9 — 7 November 2026
 
 Vibration as the console had it, and photo mode put right: the whole HUD
