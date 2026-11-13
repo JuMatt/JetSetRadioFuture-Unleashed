@@ -2143,8 +2143,12 @@ void sub_00051FC0(void)
           if (r) want = r;
           if (flow != seen_flow || st != seen_st) { seen_flow = flow; seen_st = st; seen_t = pad_now(); }
           /* in play (15, or 31 just past the title), for a second at least
-           * (a flow can pass through 15 on its way), never the title's own */
-          if (want && (st == 15 || st == 31) && mi != 0x5Au && pad_now() - seen_t >= 1.0) {
+           * (a flow can pass through 15 on its way), never the title's own,
+           * nor a garage screen (missions 94..99 of a chapter: the character
+           * select and the like) -- left from one, its text and bars stayed
+           * drawn over the next map; the request waits until play */
+          if (want && (st == 15 || st == 31) && mi != 0x5Au
+              && !((mi & 0xFFFFu) >= 94u && (mi & 0xFFFFu) <= 99u) && pad_now() - seen_t >= 1.0) {
               photo_leave("a map was chosen");
               fprintf(stderr, "[MAP] t=%.1f flow %08X: state %u mission %08X -> mission %08X\n",
                       pad_now(), flow, st, *(uint32_t *)(m + flow + 0x58), want);
